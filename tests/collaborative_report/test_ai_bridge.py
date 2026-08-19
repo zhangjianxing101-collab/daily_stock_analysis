@@ -1,6 +1,10 @@
 import importlib
 import inspect
+import logging
+import os
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 from types import MappingProxyType, ModuleType, SimpleNamespace
 from unittest.mock import Mock
@@ -9,6 +13,57 @@ import pytest
 
 
 OBSERVED_AT = datetime(2026, 8, 19, 8, 0, tzinfo=timezone.utc)
+
+
+class _ChildResult:
+    code = "600519"
+    success = True
+    analysis_summary = "safe conclusion"
+    action = "hold"
+    action_label = "持有"
+    operation_advice = "继续观察"
+    confidence_level = "中"
+    news_summary = "safe"
+    risk_warning = "safe"
+    fundamental_analysis = "safe"
+    current_price = 9876.54
+    change_pct = 1.2
+    data_sources = "market"
+
+    def get_core_conclusion(self):
+        return self.analysis_summary
+
+
+class _NoisyChildPipeline:
+    def run(self, **kwargs):
+        def provider_thread():
+            logging.getLogger().error(
+                "贵州茅台 600519 price=9876.54 https://provider.example token=secret user@example.com"
+            )
+            print("raw exception 600519 token=secret", file=sys.stderr)
+
+        thread = threading.Thread(target=provider_thread)
+        thread.start()
+        thread.join()
+        return [_ChildResult()]
+
+
+def _noisy_child_pipeline_factory():
+    return _NoisyChildPipeline()
+
+
+def _crashing_child_pipeline_factory():
+    os._exit(7)
+
+
+class _SlowChildPipeline:
+    def run(self, **kwargs):
+        time.sleep(5)
+        return []
+
+
+def _slow_child_pipeline_factory():
+    return _SlowChildPipeline()
 
 
 def result(code: str, *, success: bool = True, conclusion: str | None = None, **overrides):
@@ -57,7 +112,6 @@ def test_enrich_codes_exact_signature_deduplicates_and_calls_pipeline_once() -> 
         merge_notification=False,
         current_time=OBSERVED_AT,
         save_report=False,
-        privacy_safe=True,
     )
     assert output.name == "ai"
     assert output.status == "ok"
@@ -222,15 +276,64 @@ def test_pipeline_exception_is_sanitized_in_full_result_report() -> None:
     assert "token.example" not in serialized
 
 
-def test_collaborative_bridge_enables_pipeline_privacy_safe_mode() -> None:
-    from src.collaborative_report.ai_bridge import enrich_codes
+def test_production_bridge_uses_isolated_worker_not_parent_pipeline(monkeypatch) -> None:
+    import src.collaborative_report.ai_bridge as ai_bridge
 
-    pipeline = Mock()
-    pipeline.run.return_value = []
+    isolated = Mock(return_value=[])
+    factory = Mock(side_effect=AssertionError("must run only in child"))
+    monkeypatch.setattr(ai_bridge, "_run_isolated_pipeline", isolated)
+    monkeypatch.setattr(ai_bridge, "create_pipeline", factory)
 
-    enrich_codes(["600519"], pipeline, observed_at=OBSERVED_AT)
+    output = ai_bridge.enrich_codes(["600519"], observed_at=OBSERVED_AT)
 
-    assert pipeline.run.call_args.kwargs["privacy_safe"] is True
+    isolated.assert_called_once_with(["600519"], OBSERVED_AT)
+    factory.assert_not_called()
+    assert output.status == "partial"
+
+
+def test_isolated_child_discards_nested_provider_logs_and_returns_safe_projection(caplog, capsys) -> None:
+    from src.collaborative_report.ai_bridge import _run_isolated_pipeline
+
+    with caplog.at_level(logging.DEBUG):
+        projected = _run_isolated_pipeline(
+            ["600519"],
+            OBSERVED_AT,
+            pipeline_factory=_noisy_child_pipeline_factory,
+            timeout_seconds=5,
+        )
+
+    captured = capsys.readouterr()
+    parent_output = caplog.text + captured.out + captured.err
+    for private in (
+        "600519",
+        "贵州茅台",
+        "9876.54",
+        "provider.example",
+        "secret",
+        "user@example.com",
+        "raw exception",
+    ):
+        assert private not in parent_output
+    assert projected[0]["code"] == "600519"
+    assert set(projected[0]) == {"code", "projection", "success"}
+
+
+@pytest.mark.parametrize(
+    ("factory", "timeout"),
+    [(_crashing_child_pipeline_factory, 5), (_slow_child_pipeline_factory, 0.05)],
+)
+def test_isolated_child_crash_and_timeout_are_categorical(factory, timeout) -> None:
+    from src.collaborative_report.ai_bridge import IsolatedPipelineError, _run_isolated_pipeline
+
+    with pytest.raises(IsolatedPipelineError) as error:
+        _run_isolated_pipeline(
+            ["600519"],
+            OBSERVED_AT,
+            pipeline_factory=factory,
+            timeout_seconds=timeout,
+        )
+
+    assert str(error.value) in {"ai_child_failed", "ai_child_timeout"}
 
 
 def test_empty_valid_codes_skip_with_immutable_payload_and_fixed_warning(monkeypatch) -> None:
@@ -279,7 +382,6 @@ def test_candidate_objects_are_not_accepted_or_mutated() -> None:
         merge_notification=False,
         current_time=OBSERVED_AT,
         save_report=False,
-        privacy_safe=True,
     )
 
 

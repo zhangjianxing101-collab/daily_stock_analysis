@@ -2,19 +2,30 @@
 
 from __future__ import annotations
 
-import smtplib
 from dataclasses import dataclass
 from typing import Any, Sequence
 
 from tenacity import Retrying, retry_if_exception_type, stop_after_attempt, wait_exponential
 
+from src.notification_sender.email_sender import (
+    EmailAuthenticationFailure,
+    EmailDeliveryAmbiguous,
+    EmailPermanentPreAcceptanceFailure,
+    EmailTransientPreAcceptanceFailure,
+)
 
-class DeliveryError(RuntimeError):
-    """Raised when a collaborative report cannot be delivered."""
+
+class DeliveryNotAcceptedError(RuntimeError):
+    """SMTP definitely did not accept the message."""
+
+    def __init__(self, *, retryable: bool, stage: str) -> None:
+        super().__init__("delivery_not_accepted")
+        self.retryable = retryable
+        self.stage = stage
 
 
-class _RetryableDeliveryError(RuntimeError):
-    pass
+class DeliveryInDoubtError(RuntimeError):
+    """SMTP acceptance may have occurred, so automatic retry is forbidden."""
 
 
 @dataclass(frozen=True)
@@ -24,7 +35,6 @@ class DeliveryResult:
     subject: str
 
 
-_NETWORK_EXCEPTIONS = (smtplib.SMTPException, OSError, TimeoutError, ConnectionError)
 DEFAULT_RETRY_WAIT = wait_exponential(multiplier=2, min=2, max=4)
 
 
@@ -44,7 +54,7 @@ def send_with_retry(
     retrying = Retrying(
         stop=stop_after_attempt(3),
         wait=wait_strategy if wait_strategy is not None else DEFAULT_RETRY_WAIT,
-        retry=retry_if_exception_type(_RetryableDeliveryError),
+        retry=retry_if_exception_type(EmailTransientPreAcceptanceFailure),
         reraise=True,
     )
     try:
@@ -52,17 +62,17 @@ def send_with_retry(
             with attempt:
                 attempts += 1
                 try:
-                    sent = email_sender.send_html_email(
+                    email_sender.send_html_email_strict(
                         html_content,
                         text_content,
                         subject,
                         receivers=list(receivers) if receivers is not None else None,
                         timeout_seconds=timeout_seconds,
                     )
-                except _NETWORK_EXCEPTIONS as exc:
-                    raise _RetryableDeliveryError("email delivery failed") from exc
-                if not sent:
-                    raise _RetryableDeliveryError("email delivery failed")
-    except _RetryableDeliveryError as exc:
-        raise DeliveryError(f"email delivery failed after {attempts} attempts") from exc
+                except EmailDeliveryAmbiguous as exc:
+                    raise DeliveryInDoubtError("delivery_in_doubt") from exc
+                except (EmailAuthenticationFailure, EmailPermanentPreAcceptanceFailure) as exc:
+                    raise DeliveryNotAcceptedError(retryable=False, stage=exc.stage) from exc
+    except EmailTransientPreAcceptanceFailure as exc:
+        raise DeliveryNotAcceptedError(retryable=True, stage=exc.stage) from exc
     return DeliveryResult(sent=True, attempts=attempts, subject=subject)

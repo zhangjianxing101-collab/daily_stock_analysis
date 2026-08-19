@@ -40,6 +40,11 @@ from src.notification_sender import (
     WechatSender,
     WECHAT_IMAGE_MAX_BYTES,
 )
+from src.notification_sender.email_sender import (
+    EmailAuthenticationFailure,
+    EmailDeliveryAmbiguous,
+    EmailTransientPreAcceptanceFailure,
+)
 
 
 def _config(**overrides):
@@ -975,6 +980,31 @@ class TestEmailSender(unittest.TestCase):
     def test_send_html_returns_false_when_not_configured(self):
         sender = EmailSender(_config())
         self.assertFalse(sender.send_html_email("<p>body</p>", "body", "subject"))
+
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_strict_html_send_classifies_auth_rejection_as_definite(self, mock_smtp_ssl):
+        sender = EmailSender(_config(email_sender="a@qq.com", email_password="p"))
+        mock_smtp_ssl.return_value.login.side_effect = smtplib.SMTPAuthenticationError(535, b"no")
+
+        with self.assertRaises(EmailAuthenticationFailure):
+            sender.send_html_email_strict("<p>body</p>", "body", "subject")
+
+        mock_smtp_ssl.return_value.send_message.assert_not_called()
+
+    @mock.patch("smtplib.SMTP_SSL", side_effect=OSError("connect secret"))
+    def test_strict_html_send_classifies_connect_failure_as_safe_transient(self, _mock_smtp_ssl):
+        sender = EmailSender(_config(email_sender="a@qq.com", email_password="p"))
+
+        with self.assertRaises(EmailTransientPreAcceptanceFailure):
+            sender.send_html_email_strict("<p>body</p>", "body", "subject")
+
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_strict_html_send_classifies_send_message_exception_as_ambiguous(self, mock_smtp_ssl):
+        sender = EmailSender(_config(email_sender="a@qq.com", email_password="p"))
+        mock_smtp_ssl.return_value.send_message.side_effect = OSError("accepted maybe")
+
+        with self.assertRaises(EmailDeliveryAmbiguous):
+            sender.send_html_email_strict("<p>body</p>", "body", "subject")
 
     def test_empty_receivers_fall_back_to_configured_sender_without_smtp(self):
         sender = EmailSender(

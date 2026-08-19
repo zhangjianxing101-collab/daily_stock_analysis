@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+import json
+import logging
+import multiprocessing
+import os
 from collections.abc import Iterable, Mapping
 from datetime import datetime, timezone
 from types import MappingProxyType
@@ -11,6 +15,7 @@ from .models import ModuleResult
 
 
 _EMPTY_PAYLOAD = MappingProxyType({})
+DEFAULT_AI_CHILD_TIMEOUT_SECONDS = 300.0
 _PROJECTED_FIELDS = (
     "action",
     "action_label",
@@ -71,6 +76,97 @@ def create_pipeline():
     return StockAnalysisPipeline(config=get_config())
 
 
+class IsolatedPipelineError(RuntimeError):
+    """Categorical production child failure without provider detail."""
+
+
+def _json_safe_projection(value: Mapping[str, Any]) -> dict[str, Any]:
+    return json.loads(json.dumps(dict(value), ensure_ascii=False, default=str))
+
+
+def _isolated_pipeline_child(connection, codes, observed_at, pipeline_factory) -> None:
+    devnull = os.open(os.devnull, os.O_WRONLY)
+    try:
+        os.dup2(devnull, 1)
+        os.dup2(devnull, 2)
+        logging.disable(logging.CRITICAL)
+        pipeline = pipeline_factory()
+        results = pipeline.run(
+            stock_codes=list(codes),
+            send_notification=False,
+            merge_notification=False,
+            current_time=observed_at,
+            save_report=False,
+        )
+        projected: list[dict[str, Any]] = []
+        for result in results:
+            if result is None:
+                continue
+            code = getattr(result, "code", None)
+            if not isinstance(code, str):
+                continue
+            success = bool(getattr(result, "success", False))
+            item: dict[str, Any] = {"code": code, "success": success, "projection": None}
+            if success:
+                try:
+                    item["projection"] = _json_safe_projection(_project(result))
+                except Exception:
+                    item["projection"] = None
+            projected.append(item)
+        connection.send({"ok": True, "results": projected})
+    except BaseException:
+        try:
+            connection.send({"ok": False, "error": "ai_child_failed"})
+        except Exception:
+            pass
+    finally:
+        connection.close()
+        os.close(devnull)
+
+
+def _run_isolated_pipeline(
+    codes: list[str],
+    observed_at: datetime,
+    *,
+    pipeline_factory=create_pipeline,
+    timeout_seconds: float = DEFAULT_AI_CHILD_TIMEOUT_SECONDS,
+) -> list[dict[str, Any]]:
+    """Run production AI in a spawned process with all child output discarded."""
+
+    multiprocessing.freeze_support()
+    context = multiprocessing.get_context("spawn")
+    receiver, sender = context.Pipe(duplex=False)
+    process = context.Process(
+        target=_isolated_pipeline_child,
+        args=(sender, tuple(codes), observed_at, pipeline_factory),
+        name="collaborative-ai-worker",
+    )
+    process.start()
+    sender.close()
+    try:
+        if not receiver.poll(timeout_seconds):
+            if process.is_alive():
+                process.terminate()
+                process.join(timeout=2)
+                raise IsolatedPipelineError("ai_child_timeout")
+            raise IsolatedPipelineError("ai_child_failed")
+        try:
+            payload = receiver.recv()
+        except (EOFError, OSError):
+            raise IsolatedPipelineError("ai_child_failed") from None
+        if not isinstance(payload, dict) or payload.get("ok") is not True:
+            raise IsolatedPipelineError("ai_child_failed")
+        results = payload.get("results")
+        if not isinstance(results, list):
+            raise IsolatedPipelineError("ai_child_failed")
+        return results
+    finally:
+        receiver.close()
+        if process.is_alive():
+            process.terminate()
+        process.join(timeout=2)
+
+
 def enrich_codes(
     codes: Iterable[str],
     pipeline=None,
@@ -94,15 +190,16 @@ def enrich_codes(
         )
 
     try:
-        active_pipeline = create_pipeline() if pipeline is None else pipeline
-        results = active_pipeline.run(
-            stock_codes=unique_codes,
-            send_notification=False,
-            merge_notification=False,
-            current_time=timestamp,
-            save_report=False,
-            privacy_safe=True,
-        )
+        if pipeline is None:
+            results = _run_isolated_pipeline(unique_codes, timestamp)
+        else:
+            results = pipeline.run(
+                stock_codes=unique_codes,
+                send_notification=False,
+                merge_notification=False,
+                current_time=timestamp,
+                save_report=False,
+            )
         requested = set(unique_codes)
         successful: dict[str, Mapping[str, Any]] = {}
         unsuccessful: set[str] = set()
@@ -110,14 +207,24 @@ def enrich_codes(
         for result in results:
             if result is None:
                 continue
-            code = getattr(result, "code", None)
+            isolated_result = isinstance(result, dict) and set(result) == {
+                "code", "projection", "success"
+            }
+            code = result.get("code") if isolated_result else getattr(result, "code", None)
             if code not in requested or code in successful:
                 continue
             try:
-                if not bool(getattr(result, "success", False)):
+                success = result.get("success") if isolated_result else getattr(result, "success", False)
+                if not bool(success):
                     unsuccessful.add(code)
                     continue
-                successful[code] = _project(result)
+                if isolated_result:
+                    projection = result.get("projection")
+                    if not isinstance(projection, dict):
+                        raise ValueError
+                    successful[code] = _freeze(projection)
+                else:
+                    successful[code] = _project(result)
             except Exception:
                 projection_failed.add(code)
 

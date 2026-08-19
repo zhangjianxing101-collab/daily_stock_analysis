@@ -21,7 +21,7 @@ import pandas as pd
 from .ai_bridge import enrich_codes
 from .backtest import backtest_breakout, backtest_swing
 from .gold import analyze_gold
-from .mailer import send_with_retry
+from .mailer import DeliveryInDoubtError, DeliveryNotAcceptedError, send_with_retry
 from .market_data import MarketDataGateway, MarketDataset
 from .models import Candidate, ModuleResult, Position, ReportMode
 from .report import RenderedReport, render_report
@@ -42,6 +42,7 @@ _PRICE_CONFLICT_WARNING_CODE = "snapshot_daily_close_conflict"
 _PRICE_CONFLICT_CANDIDATE_WARNING = "价格来源冲突，仅供观望"
 _UNTRUSTED_SNAPSHOT_CANDIDATE_WARNING = "快照权威性不足，仅供观望"
 _SNAPSHOT_AUTHORITY_WARNING_CODE = "snapshot_timestamp_untrusted"
+_SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING = "快照来源时间不可用，所有建议仅供观察"
 _REPORT_KEY_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})-(premarket|postmarket)")
 _POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=4)
 _PREMARKET_MAX_SOURCE_AGE = timedelta(days=4)
@@ -52,15 +53,21 @@ class FinalState(str, Enum):
     TEST_SENT = "test_sent"
     DUPLICATE_SKIP = "duplicate_skip"
     NON_TRADING_DAY_SKIP = "non_trading_day_skip"
+    OPERATOR_ACTION_REQUIRED = "operator_action_required"
     HARD_FAILURE = "hard_failure"
 
 
-class _DeliveryConfigurationError(RuntimeError):
-    pass
+class _DeliveryConfigurationError(DeliveryNotAcceptedError):
+    def __init__(self, _message: str = "") -> None:
+        super().__init__(retryable=False, stage="configuration")
+        self.args = ("email configuration unavailable",)
 
 
-class _DeliveryNotAcceptedError(RuntimeError):
-    """Signals that SMTP acceptance definitively did not occur."""
+class _DeliveryNotAcceptedError(DeliveryNotAcceptedError):
+    """Backward-compatible injected safe-preacceptance failure for runner tests."""
+
+    def __init__(self, _message: str = "") -> None:
+        super().__init__(retryable=True, stage="preacceptance")
 
 
 class DeliveryStateError(RuntimeError):
@@ -73,6 +80,15 @@ class DeliveryState(str, Enum):
     SENT = "sent"
     IN_DOUBT = "in_doubt"
     FAILED = "failed"
+
+
+@dataclass(frozen=True)
+class DeliveryRecord:
+    report_key: str
+    state: DeliveryState
+    claim_id: str
+    transitioned_at: datetime
+    attempt_id: str | None
 
 
 @dataclass(frozen=True)
@@ -143,7 +159,7 @@ class LocalDeliveryLedger:
             state = DeliveryState(payload["state"])
         except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
             raise DeliveryStateError("delivery state unavailable") from exc
-        if set(payload) != {"claim_id", "report_key", "state", "transitioned_at"}:
+        if set(payload) != {"attempt_id", "claim_id", "report_key", "state", "transitioned_at"}:
             raise DeliveryStateError("delivery state unavailable")
         if payload.get("report_key") != report_key:
             raise DeliveryStateError("delivery state unavailable")
@@ -156,12 +172,31 @@ class LocalDeliveryLedger:
             raise DeliveryStateError("delivery state unavailable") from None
         if transitioned_at.tzinfo is None or transitioned_at.utcoffset() is None:
             raise DeliveryStateError("delivery state unavailable")
+        attempt_id = payload.get("attempt_id")
+        if attempt_id is not None and (
+            not isinstance(attempt_id, str) or re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None
+        ):
+            raise DeliveryStateError("delivery state unavailable")
+        if state is DeliveryState.SENT and attempt_id is None:
+            raise DeliveryStateError("delivery state unavailable")
         return payload
 
     def status(self, report_key: str) -> DeliveryState | None:
+        record = self.record(report_key)
+        return record.state if record else None
+
+    def record(self, report_key: str) -> DeliveryRecord | None:
         with self._locked():
             payload = self._read(report_key)
-        return DeliveryState(payload["state"]) if payload else None
+        if payload is None:
+            return None
+        return DeliveryRecord(
+            report_key=str(payload["report_key"]),
+            state=DeliveryState(payload["state"]),
+            claim_id=str(payload["claim_id"]),
+            transitioned_at=datetime.fromisoformat(str(payload["transitioned_at"])),
+            attempt_id=payload.get("attempt_id"),
+        )
 
     def _write(
         self,
@@ -169,11 +204,13 @@ class LocalDeliveryLedger:
         state: DeliveryState,
         claim_id: str,
         transitioned_at: datetime,
+        attempt_id: str | None,
     ) -> None:
         if transitioned_at.tzinfo is None or transitioned_at.utcoffset() is None:
             raise DeliveryStateError("delivery state timestamp unavailable")
         payload = {
             "claim_id": claim_id,
+            "attempt_id": attempt_id,
             "report_key": report_key,
             "state": state.value,
             "transitioned_at": transitioned_at.isoformat(),
@@ -184,14 +221,20 @@ class LocalDeliveryLedger:
             mode=0o600,
         )
 
-    def claim(self, report_key: str, claimed_at: datetime) -> str | None:
+    def claim(
+        self,
+        report_key: str,
+        claimed_at: datetime,
+        *,
+        attempt_id: str | None = None,
+    ) -> str | None:
         key = _canonical_report_key(report_key)
         with self._locked():
             payload = self._read(key)
             if payload is not None and DeliveryState(payload["state"]) is not DeliveryState.FAILED:
                 return None
             claim_id = uuid.uuid4().hex
-            self._write(key, DeliveryState.CLAIMED, claim_id, claimed_at)
+            self._write(key, DeliveryState.CLAIMED, claim_id, claimed_at, attempt_id)
             return claim_id
 
     def _transition(
@@ -201,6 +244,7 @@ class LocalDeliveryLedger:
         expected: set[DeliveryState],
         target: DeliveryState,
         transitioned_at: datetime,
+        attempt_id: str | None = None,
     ) -> None:
         key = _canonical_report_key(report_key)
         with self._locked():
@@ -211,16 +255,40 @@ class LocalDeliveryLedger:
                 or DeliveryState(payload["state"]) not in expected
             ):
                 raise DeliveryStateError("delivery state transition rejected")
-            self._write(key, target, claim_id, transitioned_at)
+            selected_attempt = attempt_id if attempt_id is not None else payload.get("attempt_id")
+            if target is DeliveryState.SENT and selected_attempt is None:
+                raise DeliveryStateError("sent state requires finalized attempt")
+            self._write(key, target, claim_id, transitioned_at, selected_attempt)
 
     def begin_sending(self, report_key: str, claim_id: str, at: datetime) -> None:
         self._transition(report_key, claim_id, {DeliveryState.CLAIMED}, DeliveryState.SENDING, at)
 
-    def mark_sent(self, report_key: str, claim_id: str, at: datetime) -> None:
-        self._transition(report_key, claim_id, {DeliveryState.SENDING}, DeliveryState.SENT, at)
+    def mark_sent(self, report_key: str, claim_id: str, at: datetime, *, attempt_id: str) -> None:
+        self._transition(
+            report_key,
+            claim_id,
+            {DeliveryState.SENDING},
+            DeliveryState.SENT,
+            at,
+            attempt_id,
+        )
 
-    def mark_in_doubt(self, report_key: str, claim_id: str, at: datetime) -> None:
-        self._transition(report_key, claim_id, {DeliveryState.SENDING}, DeliveryState.IN_DOUBT, at)
+    def mark_in_doubt(
+        self,
+        report_key: str,
+        claim_id: str,
+        at: datetime,
+        *,
+        attempt_id: str | None = None,
+    ) -> None:
+        self._transition(
+            report_key,
+            claim_id,
+            {DeliveryState.SENDING},
+            DeliveryState.IN_DOUBT,
+            at,
+            attempt_id,
+        )
 
     def mark_failed(self, report_key: str, claim_id: str, at: datetime) -> None:
         self._transition(
@@ -231,7 +299,14 @@ class LocalDeliveryLedger:
             at,
         )
 
-    def reconcile(self, report_key: str, target: DeliveryState, at: datetime) -> None:
+    def reconcile(
+        self,
+        report_key: str,
+        target: DeliveryState,
+        at: datetime,
+        *,
+        attempt_id: str | None = None,
+    ) -> None:
         if target not in {DeliveryState.FAILED, DeliveryState.SENT}:
             raise DeliveryStateError("invalid reconciliation target")
         key = _canonical_report_key(report_key)
@@ -243,7 +318,28 @@ class LocalDeliveryLedger:
                 DeliveryState.IN_DOUBT,
             }:
                 raise DeliveryStateError("delivery state reconciliation rejected")
-            self._write(key, target, str(payload["claim_id"]), at)
+            selected_attempt = attempt_id if attempt_id is not None else payload.get("attempt_id")
+            if target is DeliveryState.SENT and selected_attempt is None:
+                raise DeliveryStateError("sent state requires finalized attempt")
+            action = "reconcile_sent" if target is DeliveryState.SENT else "reconcile_failed"
+            self._append_audit(key, action, at)
+            self._write(key, target, str(payload["claim_id"]), at, selected_attempt)
+
+    def _append_audit(self, report_key: str, action: str, at: datetime) -> None:
+        if at.tzinfo is None or at.utcoffset() is None:
+            raise DeliveryStateError("audit timestamp unavailable")
+        audit_path = _contained_path(self.root, ".delivery-ledger", "audit.jsonl")
+        descriptor = os.open(audit_path, os.O_CREAT | os.O_APPEND | os.O_WRONLY, 0o600)
+        try:
+            line = json.dumps(
+                {"action": action, "report_key": report_key, "timestamp": at.isoformat()},
+                sort_keys=True,
+            ) + "\n"
+            os.write(descriptor, line.encode("utf-8"))
+            os.fsync(descriptor)
+        finally:
+            os.close(descriptor)
+        _fsync_directory(audit_path.parent)
 
 
 @dataclass(frozen=True)
@@ -290,6 +386,7 @@ class RunnerDependencies:
     ledger_factory: Callable[[Path | str], Any] = LocalDeliveryLedger
     artifact_writer: Callable[..., ArtifactPaths] | None = None
     artifact_finalizer: Callable[..., ArtifactPaths] | None = None
+    artifact_publisher: Callable[..., None] | None = None
 
 
 def _production_mail_sender(rendered: RenderedReport, *, test_email: bool = False) -> Any:
@@ -694,17 +791,6 @@ def _write_report_artifact_attempt(
         staging.replace(attempt)
         _fsync_directory(report_root)
         _fsync_directory(attempts)
-        pointer = {
-            "attempt": attempt_id,
-            "html": f"attempts/{attempt_id}/report.html",
-            "manifest": f"attempts/{attempt_id}/manifest.json",
-            "text": f"attempts/{attempt_id}/report.txt",
-        }
-        _atomic_write(
-            index_path,
-            json.dumps(pointer, sort_keys=True) + "\n",
-            mode=0o600,
-        )
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
         raise
@@ -714,6 +800,115 @@ def _write_report_artifact_attempt(
         attempt / "manifest.json",
         index_path,
         attempt_id,
+    )
+
+
+def _artifact_paths_for_attempt(
+    output_dir: Path | str,
+    *,
+    report_key: str,
+    attempt_id: str,
+    test_email: bool,
+) -> ArtifactPaths:
+    key = _canonical_report_key(report_key)
+    if re.fullmatch(r"[0-9a-f]{32}", attempt_id) is None:
+        raise ValueError("invalid artifact attempt")
+    root = Path(output_dir)
+    channel = "test" if test_email else "production"
+    attempt = _contained_path(root, channel, key, "attempts", attempt_id)
+    paths = ArtifactPaths(
+        attempt / "report.html",
+        attempt / "report.txt",
+        attempt / "manifest.json",
+        _contained_path(root, channel, key, "current.json"),
+        attempt_id,
+    )
+    if not all(path.is_file() for path in (paths.html_path, paths.text_path, paths.manifest_path)):
+        raise ValueError("artifact attempt unavailable")
+    return paths
+
+
+def publish_report_artifacts(
+    output_dir: Path | str,
+    *,
+    report_key: str,
+    paths: ArtifactPaths,
+    test_email: bool = False,
+) -> None:
+    """Atomically publish a validated immutable attempt as the canonical pointer."""
+
+    if paths.attempt_id is None:
+        raise ValueError("artifact attempt unavailable")
+    expected = _artifact_paths_for_attempt(
+        output_dir,
+        report_key=report_key,
+        attempt_id=paths.attempt_id,
+        test_email=test_email,
+    )
+    if (paths.html_path, paths.text_path, paths.manifest_path) != (
+        expected.html_path,
+        expected.text_path,
+        expected.manifest_path,
+    ):
+        raise ValueError("artifact path mismatch")
+    try:
+        manifest = json.loads(paths.manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("artifact manifest unavailable") from None
+    final_state = manifest.get("final_state") if isinstance(manifest, dict) else None
+    if manifest.get("report_key") != report_key or final_state not in {
+        FinalState.SENT.value,
+        FinalState.TEST_SENT.value,
+        "prepared",
+    }:
+        raise ValueError("artifact manifest identity invalid")
+    pointer = {
+        "attempt": paths.attempt_id,
+        "final_state": final_state,
+        "html": f"attempts/{paths.attempt_id}/report.html",
+        "manifest": f"attempts/{paths.attempt_id}/manifest.json",
+        "text": f"attempts/{paths.attempt_id}/report.txt",
+    }
+    _atomic_write(
+        expected.index_path,
+        json.dumps(pointer, sort_keys=True) + "\n",
+        mode=0o600,
+    )
+
+
+def finalize_prepared_artifact(
+    output_dir: Path | str,
+    *,
+    report_key: str,
+    attempt_id: str,
+    final_state: FinalState,
+    test_email: bool = False,
+) -> ArtifactPaths:
+    """Create a new immutable finalized attempt from a prepared attempt."""
+
+    prepared = _artifact_paths_for_attempt(
+        output_dir,
+        report_key=report_key,
+        attempt_id=attempt_id,
+        test_email=test_email,
+    )
+    try:
+        manifest = json.loads(prepared.manifest_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise ValueError("artifact manifest unavailable") from None
+    if not isinstance(manifest, dict) or manifest.get("report_key") != report_key:
+        raise ValueError("artifact manifest identity invalid")
+    manifest["final_state"] = final_state.value
+    return write_report_artifacts(
+        output_dir,
+        report_key=report_key,
+        rendered=RenderedReport(
+            subject="reconciled report",
+            html=prepared.html_path.read_text(encoding="utf-8"),
+            text=prepared.text_path.read_text(encoding="utf-8"),
+        ),
+        manifest=manifest,
+        test_email=test_email,
     )
 
 
@@ -810,6 +1005,25 @@ def _failure(error_code: str, *, report_key: str = "unavailable", modules=None, 
     )
 
 
+def _operator_required(
+    error_code: str,
+    *,
+    report_key: str,
+    modules=None,
+    paths=None,
+) -> RunResult:
+    return RunResult(
+        exit_code=EXIT_FAILURE,
+        final_state=FinalState.OPERATOR_ACTION_REQUIRED,
+        report_key=report_key,
+        modules=modules or {},
+        html_path=paths.html_path if paths else None,
+        text_path=paths.text_path if paths else None,
+        manifest_path=paths.manifest_path if paths else None,
+        error_code=error_code,
+    )
+
+
 def _session_identity_is_valid(session: ReportSession, mode: ReportMode) -> bool:
     timestamp = session.now_shanghai
     return (
@@ -851,11 +1065,47 @@ def run_report(
             return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
         try:
             ledger = active.ledger_factory(output_dir)
-            delivery_state = ledger.status(session.report_key)
+            delivery_record = ledger.record(session.report_key)
         except Exception:
             return _failure("delivery_state_unavailable", report_key=session.report_key)
-        if delivery_state not in {None, DeliveryState.FAILED}:
+        if delivery_record is not None and delivery_record.state is DeliveryState.SENT:
+            try:
+                recovered_paths = _artifact_paths_for_attempt(
+                    output_dir,
+                    report_key=session.report_key,
+                    attempt_id=delivery_record.attempt_id,
+                    test_email=False,
+                )
+                (active.artifact_publisher or publish_report_artifacts)(
+                    output_dir,
+                    report_key=session.report_key,
+                    paths=recovered_paths,
+                    test_email=False,
+                )
+            except Exception:
+                return _operator_required(
+                    "sent_artifact_repair_required",
+                    report_key=session.report_key,
+                )
+            return RunResult(
+                EXIT_SUCCESS,
+                FinalState.DUPLICATE_SKIP,
+                session.report_key,
+                {},
+                recovered_paths.html_path,
+                recovered_paths.text_path,
+                recovered_paths.manifest_path,
+            )
+        if delivery_record is not None and delivery_record.state in {
+            DeliveryState.CLAIMED,
+            DeliveryState.SENDING,
+        }:
             return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
+        if delivery_record is not None and delivery_record.state is DeliveryState.IN_DOUBT:
+            return _operator_required(
+                "delivery_reconciliation_required",
+                report_key=session.report_key,
+            )
 
     try:
         settings = active.settings_loader()
@@ -864,6 +1114,7 @@ def run_report(
 
     artifact_writer = active.artifact_writer or write_report_artifacts
     artifact_finalizer = active.artifact_finalizer or write_report_artifacts
+    artifact_publisher = active.artifact_publisher or publish_report_artifacts
     try:
         expected_session = active.data_session_resolver(
             normalized_mode,
@@ -911,6 +1162,8 @@ def run_report(
         market_warnings = snapshot.warnings
         if not snapshot_source_is_authoritative:
             market_warnings = (*market_warnings, _SNAPSHOT_AUTHORITY_WARNING_CODE)
+            if snapshot.source_timestamp is None:
+                market_warnings = (*market_warnings, _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING)
         modules["market"] = ModuleResult(
             "market",
             "ok" if snapshot_source_is_authoritative else "partial",
@@ -1186,9 +1439,19 @@ def run_report(
     claim_id: str | None = None
     if not test_email:
         try:
-            claim_id = ledger.claim(session.report_key, session.now_shanghai)
+            claim_id = ledger.claim(
+                session.report_key,
+                session.now_shanghai,
+                attempt_id=paths.attempt_id,
+            )
             if claim_id is None:
-                return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
+                current = ledger.record(session.report_key)
+                if current is not None and current.state is DeliveryState.SENT:
+                    return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
+                return _operator_required(
+                    "delivery_reconciliation_required",
+                    report_key=session.report_key,
+                )
             ledger.begin_sending(session.report_key, claim_id, session.now_shanghai)
         except Exception:
             return _failure(
@@ -1202,39 +1465,48 @@ def run_report(
         delivery_result = active.mail_sender(rendered, test_email=test_email)
         if delivery_result is False:
             raise RuntimeError("delivery result unavailable")
-    except _DeliveryConfigurationError:
+    except DeliveryNotAcceptedError as exc:
         if claim_id is not None:
             try:
                 ledger.mark_failed(session.report_key, claim_id, session.now_shanghai)
             except Exception:
                 pass
-        return _failure("configuration_invalid", report_key=session.report_key, modules=modules, paths=paths)
-    except _DeliveryNotAcceptedError:
+        error_code = "configuration_invalid" if isinstance(exc, _DeliveryConfigurationError) else "delivery_failed"
+        return _failure(error_code, report_key=session.report_key, modules=modules, paths=paths)
+    except DeliveryInDoubtError:
         if claim_id is not None:
             try:
-                ledger.mark_failed(session.report_key, claim_id, session.now_shanghai)
+                ledger.mark_in_doubt(
+                    session.report_key,
+                    claim_id,
+                    session.now_shanghai,
+                    attempt_id=paths.attempt_id,
+                )
             except Exception:
                 pass
-        return _failure("delivery_failed", report_key=session.report_key, modules=modules, paths=paths)
+        return _operator_required(
+            "delivery_reconciliation_required",
+            report_key=session.report_key,
+            modules=modules,
+            paths=paths,
+        )
     except Exception:
         if claim_id is not None:
             try:
-                ledger.mark_in_doubt(session.report_key, claim_id, session.now_shanghai)
+                ledger.mark_in_doubt(
+                    session.report_key,
+                    claim_id,
+                    session.now_shanghai,
+                    attempt_id=paths.attempt_id,
+                )
             except Exception:
                 pass
-        return _failure("delivery_failed", report_key=session.report_key, modules=modules, paths=paths)
-
-    if claim_id is not None:
-        try:
-            ledger.mark_sent(session.report_key, claim_id, session.now_shanghai)
-        except Exception:
-            try:
-                ledger.mark_in_doubt(session.report_key, claim_id, session.now_shanghai)
-            except Exception:
-                pass
-            modules["delivery_state"] = ModuleResult(
-                "delivery_state", "partial", session.now_shanghai, {}, ("delivery_ledger_update_failed",)
-            )
+        return _operator_required(
+            "delivery_reconciliation_required",
+            report_key=session.report_key,
+            modules=modules,
+            paths=paths,
+        )
 
     manifest = dict(
         manifest,
@@ -1243,7 +1515,7 @@ def run_report(
         warning_codes=_warning_codes(modules),
     )
     try:
-        paths = artifact_finalizer(
+        final_paths = artifact_finalizer(
             output_dir,
             report_key=session.report_key,
             rendered=rendered,
@@ -1251,9 +1523,64 @@ def run_report(
             test_email=test_email,
         )
     except Exception:
+        if claim_id is not None:
+            try:
+                ledger.mark_in_doubt(
+                    session.report_key,
+                    claim_id,
+                    session.now_shanghai,
+                    attempt_id=paths.attempt_id,
+                )
+            except Exception:
+                pass
+            return _operator_required(
+                "delivery_reconciliation_required",
+                report_key=session.report_key,
+                modules=modules,
+                paths=paths,
+            )
         modules["delivery_state"] = ModuleResult(
             "delivery_state", "partial", session.now_shanghai, {}, ("manifest_finalize_failed",)
         )
+        final_paths = paths
+
+    if claim_id is not None:
+        try:
+            ledger.mark_sent(
+                session.report_key,
+                claim_id,
+                session.now_shanghai,
+                attempt_id=final_paths.attempt_id,
+            )
+        except Exception:
+            try:
+                ledger.mark_in_doubt(
+                    session.report_key,
+                    claim_id,
+                    session.now_shanghai,
+                    attempt_id=final_paths.attempt_id,
+                )
+            except Exception:
+                pass
+            return _operator_required(
+                "delivery_reconciliation_required",
+                report_key=session.report_key,
+                modules=modules,
+                paths=final_paths,
+            )
+
+    try:
+        artifact_publisher(
+            output_dir,
+            report_key=session.report_key,
+            paths=final_paths,
+            test_email=test_email,
+        )
+    except Exception:
+        modules["delivery_state"] = ModuleResult(
+            "delivery_state", "partial", session.now_shanghai, {}, ("artifact_pointer_update_failed",)
+        )
+    paths = final_paths
     return RunResult(
         EXIT_SUCCESS,
         final_state,

@@ -48,6 +48,30 @@ SMTP_CONFIGS = {
 }
 
 
+class EmailStrictDeliveryError(RuntimeError):
+    """Base error for the strict SMTP acceptance-aware API."""
+
+    def __init__(self, stage: str) -> None:
+        super().__init__(stage)
+        self.stage = stage
+
+
+class EmailPermanentPreAcceptanceFailure(EmailStrictDeliveryError):
+    """Message was definitely not accepted and retrying cannot fix the input/config."""
+
+
+class EmailAuthenticationFailure(EmailPermanentPreAcceptanceFailure):
+    """SMTP authentication was rejected before any send command."""
+
+
+class EmailTransientPreAcceptanceFailure(EmailStrictDeliveryError):
+    """Message was definitely not accepted and a later connection may succeed."""
+
+
+class EmailDeliveryAmbiguous(EmailStrictDeliveryError):
+    """The send command began, so server acceptance can no longer be ruled out."""
+
+
 class EmailSender:
     
     def __init__(self, config: Config):
@@ -236,40 +260,76 @@ class EmailSender:
         receivers: Optional[List[str]] = None,
         timeout_seconds: Optional[float] = None,
     ) -> bool:
-        """Send caller-rendered HTML with a plain-text fallback."""
+        """Compatibility wrapper around the strict acceptance-aware path."""
+        try:
+            self.send_html_email_strict(
+                html_content,
+                text_content,
+                subject,
+                receivers=receivers,
+                timeout_seconds=timeout_seconds,
+            )
+            return True
+        except EmailAuthenticationFailure:
+            logger.error("邮件发送失败：认证错误，请检查邮箱和授权码是否正确")
+        except EmailTransientPreAcceptanceFailure:
+            logger.error("邮件发送失败：SMTP 连接暂不可用")
+        except EmailPermanentPreAcceptanceFailure:
+            logger.error("邮件发送失败：邮件配置或内容无效")
+        except EmailDeliveryAmbiguous:
+            logger.error("邮件发送结果不确定，需要人工核对")
+        return False
+
+    def send_html_email_strict(
+        self,
+        html_content: str,
+        text_content: str,
+        subject: str,
+        receivers: Optional[List[str]] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
+        """Send once and preserve whether SMTP acceptance is still possible."""
         if not self._is_email_configured():
-            logger.warning("邮件配置不完整，跳过推送")
-            return False
+            raise EmailPermanentPreAcceptanceFailure("configuration")
 
         sender = self._email_config['sender']
         password = self._email_config['password']
         selected_receivers = self._email_config['receivers'] if receivers is None else receivers
         if not selected_receivers:
-            logger.warning("收件人列表为空，跳过邮件发送")
-            return False
+            raise EmailPermanentPreAcceptanceFailure("recipients")
         server: Optional[smtplib.SMTP] = None
         try:
-            msg = MIMEMultipart('alternative')
-            msg['Subject'] = Header(subject, 'utf-8')
-            msg['From'] = self._format_sender_address(sender)
-            msg['To'] = ', '.join(selected_receivers)
-            msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
-            msg.attach(MIMEText(html_content, 'html', 'utf-8'))
+            try:
+                msg = MIMEMultipart('alternative')
+                msg['Subject'] = Header(subject, 'utf-8')
+                msg['From'] = self._format_sender_address(sender)
+                msg['To'] = ', '.join(selected_receivers)
+                msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
+                msg.attach(MIMEText(html_content, 'html', 'utf-8'))
+            except Exception:
+                raise EmailPermanentPreAcceptanceFailure("message_build") from None
 
-            server = self._open_server(sender, timeout_seconds)
-            server.login(sender, password)
-            server.send_message(msg)
+            try:
+                server = self._open_server(sender, timeout_seconds)
+            except (OSError, TimeoutError, ConnectionError, smtplib.SMTPException):
+                raise EmailTransientPreAcceptanceFailure("connect_or_starttls") from None
+            except Exception:
+                raise EmailPermanentPreAcceptanceFailure("connection_configuration") from None
+
+            try:
+                server.login(sender, password)
+            except smtplib.SMTPAuthenticationError:
+                raise EmailAuthenticationFailure("authentication") from None
+            except (OSError, TimeoutError, ConnectionError, smtplib.SMTPException):
+                raise EmailTransientPreAcceptanceFailure("login_transport") from None
+            except Exception:
+                raise EmailPermanentPreAcceptanceFailure("login_configuration") from None
+
+            try:
+                server.send_message(msg)
+            except Exception:
+                raise EmailDeliveryAmbiguous("send_message") from None
             logger.info("邮件发送成功，收件人数: %d", len(selected_receivers))
-            return True
-        except smtplib.SMTPAuthenticationError:
-            logger.error("邮件发送失败：认证错误，请检查邮箱和授权码是否正确")
-            return False
-        except smtplib.SMTPConnectError:
-            logger.error("邮件发送失败：无法连接 SMTP 服务器")
-            return False
-        except Exception as exc:
-            logger.error("发送邮件失败: %s", type(exc).__name__)
-            return False
         finally:
             self._close_server(server)
 

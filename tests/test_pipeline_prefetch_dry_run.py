@@ -5,10 +5,7 @@ Regression tests for prefetch behavior in StockAnalysisPipeline.run().
 
 import os
 import sys
-import logging
-import threading
 import unittest
-from concurrent.futures import ThreadPoolExecutor
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
 from unittest.mock import MagicMock, call, patch
@@ -66,80 +63,6 @@ class TestPipelinePrefetchBehavior(unittest.TestCase):
         self.assertIn("2", logged)
         self.assertNotIn("600519", logged)
         self.assertNotIn("000001", logged)
-
-    def test_privacy_safe_run_redacts_all_pipeline_record_content(self):
-        pipeline = self._build_pipeline(process_result=None)
-
-        def emit_private_log(*args, **kwargs):
-            logging.getLogger("src.core.pipeline").warning(
-                "贵州茅台 600519 price=9876.54 user@example.com "
-                "token=super-secret https://provider.example/query?code=600519"
-            )
-            logging.getLogger("provider.client").error(
-                "provider query 贵州茅台 600519 token=other-secret"
-            )
-            return None
-
-        pipeline.process_single_stock = emit_private_log
-        with self.assertLogs(level="INFO") as captured:
-            pipeline.run(
-                stock_codes=["600519"],
-                dry_run=True,
-                send_notification=False,
-                privacy_safe=True,
-            )
-
-        output = "\n".join(captured.output)
-        for private_value in (
-            "贵州茅台",
-            "600519",
-            "9876.54",
-            "user@example.com",
-            "super-secret",
-            "other-secret",
-            "provider.example",
-        ):
-            self.assertNotIn(private_value, output)
-
-    def test_privacy_safe_context_is_concurrent_and_normal_runs_remain_compatible(self):
-        barrier = threading.Barrier(2)
-
-        def build(message):
-            pipeline = self._build_pipeline(process_result=None)
-
-            def emit(*args, **kwargs):
-                barrier.wait(timeout=5)
-                logging.getLogger("src.core.pipeline").warning(message)
-                return None
-
-            pipeline.process_single_stock = emit
-            return pipeline
-
-        private = build("PRIVATE 600519 token=secret-value")
-        normal = build("NORMAL-COMPATIBLE")
-        with self.assertLogs("src.core.pipeline", level="INFO") as captured:
-            with ThreadPoolExecutor(max_workers=2) as executor:
-                safe_future = executor.submit(
-                    private.run,
-                    stock_codes=["600519"],
-                    dry_run=True,
-                    send_notification=False,
-                    privacy_safe=True,
-                )
-                normal_future = executor.submit(
-                    normal.run,
-                    stock_codes=["000001"],
-                    dry_run=True,
-                    send_notification=False,
-                )
-                safe_future.result(timeout=5)
-                normal_future.result(timeout=5)
-
-        output = "\n".join(captured.output)
-        self.assertNotIn("PRIVATE", output)
-        self.assertNotIn("600519", output)
-        self.assertNotIn("secret-value", output)
-        self.assertIn("NORMAL-COMPATIBLE", output)
 
     def test_run_dry_run_counts_existing_data_by_effective_trading_date(self):
         pipeline = self._build_pipeline(process_result=None)

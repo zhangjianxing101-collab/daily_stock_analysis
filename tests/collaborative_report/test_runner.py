@@ -30,6 +30,7 @@ from src.collaborative_report.runner import (
     RunnerDependencies,
     classify_prior_candidates,
     default_dependencies,
+    publish_report_artifacts,
     run_report,
     write_report_artifacts,
 )
@@ -79,6 +80,15 @@ def bars(*, high: float = 10.4, low: float = 10.0, close: float = 10.2) -> pd.Da
 
 def dataset(frame: pd.DataFrame, source: str = "fixture") -> MarketDataset:
     return MarketDataset(frame=frame, source=source, observed_at=NOW)
+
+
+def finalized_attempt(output_dir: Path, report_key: str = "2026-08-19-premarket"):
+    return write_report_artifacts(
+        output_dir,
+        report_key=report_key,
+        rendered=RenderedReport("subject", "html", "text"),
+        manifest={"report_key": report_key, "final_state": "sent"},
+    )
 
 
 class FakeGateway:
@@ -421,9 +431,12 @@ def test_akshare_shape_without_timestamp_attrs_never_uses_snapshot_features_acti
     )
 
     assert result.modules["market"].status == "partial"
+    assert "快照来源时间不可用，所有建议仅供观察" in result.modules["market"].warnings
     assert result.short_term_candidates[0].warning == "快照权威性不足，仅供观望"
     assert CANDIDATE_CODE not in ai_enricher.call_args.args[0]
     risk_evaluator.assert_not_called()
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source_timestamps"]["market"] == "unavailable"
 
 
 def test_inconsistent_session_identity_fails_closed(tmp_path, deps) -> None:
@@ -790,7 +803,7 @@ def test_artifacts_are_atomic_and_private_outputs_are_separate(tmp_path, monkeyp
         tmp_path,
         report_key="2026-08-19-premarket",
         rendered=RenderedReport("subject", "<p>private</p>", "private text"),
-        manifest={"report_key": "2026-08-19-premarket"},
+        manifest={"report_key": "2026-08-19-premarket", "final_state": "sent"},
     )
 
     report_root = tmp_path / "production" / "2026-08-19-premarket"
@@ -802,6 +815,13 @@ def test_artifacts_are_atomic_and_private_outputs_are_separate(tmp_path, monkeyp
     assert stat.S_IMODE(paths.html_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(paths.text_path.stat().st_mode) == 0o600
     assert stat.S_IMODE(paths.html_path.parent.stat().st_mode) == 0o700
+    assert not (report_root / "current.json").exists()
+    publish_report_artifacts(
+        tmp_path,
+        report_key="2026-08-19-premarket",
+        paths=paths,
+        test_email=False,
+    )
     pointer = json.loads((report_root / "current.json").read_text(encoding="utf-8"))
     assert pointer["attempt"] == paths.html_path.parent.name
     assert not list(tmp_path.rglob("*.staging"))
@@ -827,7 +847,16 @@ def test_atomic_pointer_publish_failure_keeps_previous_attempt_coherent(
 ) -> None:
     rendered = RenderedReport("subject", "old", "old")
     first = write_report_artifacts(
-        tmp_path, report_key="2026-08-19-premarket", rendered=rendered, manifest={}
+        tmp_path,
+        report_key="2026-08-19-premarket",
+        rendered=rendered,
+        manifest={"report_key": "2026-08-19-premarket", "final_state": "sent"},
+    )
+    publish_report_artifacts(
+        tmp_path,
+        report_key="2026-08-19-premarket",
+        paths=first,
+        test_email=False,
     )
     original_replace = Path.replace
 
@@ -838,11 +867,17 @@ def test_atomic_pointer_publish_failure_keeps_previous_attempt_coherent(
 
     monkeypatch.setattr(Path, "replace", fail_pointer_publish)
     with pytest.raises(OSError, match="publish failure"):
-        write_report_artifacts(
+        second = write_report_artifacts(
             tmp_path,
             report_key="2026-08-19-premarket",
             rendered=RenderedReport("subject", "new", "new"),
-            manifest={},
+            manifest={"report_key": "2026-08-19-premarket", "final_state": "sent"},
+        )
+        publish_report_artifacts(
+            tmp_path,
+            report_key="2026-08-19-premarket",
+            paths=second,
+            test_email=False,
         )
 
     assert first.html_path.read_text(encoding="utf-8") == "old"
@@ -889,9 +924,12 @@ def test_nontrading_and_duplicate_skip_do_not_load_portfolio_settings(tmp_path, 
     settings_loader = Mock(side_effect=AssertionError("must not load"))
     duplicate_deps = replace(deps, settings_loader=settings_loader)
     ledger = LocalDeliveryLedger(tmp_path)
-    claim = ledger.claim("2026-08-19-premarket", NOW)
+    attempt = finalized_attempt(tmp_path)
+    claim = ledger.claim("2026-08-19-premarket", NOW, attempt_id=attempt.attempt_id)
     ledger.begin_sending("2026-08-19-premarket", claim, NOW)
-    ledger.mark_sent("2026-08-19-premarket", claim, NOW)
+    ledger.mark_sent(
+        "2026-08-19-premarket", claim, NOW, attempt_id=attempt.attempt_id
+    )
 
     duplicate = run_report(ReportMode.PREMARKET, deps=duplicate_deps, output_dir=tmp_path)
     holiday = run_report(
@@ -912,9 +950,12 @@ def test_nontrading_and_duplicate_skip_do_not_load_portfolio_settings(tmp_path, 
 
 def test_test_email_ignores_production_dedupe_and_does_not_write_marker(tmp_path, deps) -> None:
     ledger = LocalDeliveryLedger(tmp_path)
-    claim = ledger.claim("2026-08-19-premarket", NOW)
+    attempt = finalized_attempt(tmp_path)
+    claim = ledger.claim("2026-08-19-premarket", NOW, attempt_id=attempt.attempt_id)
     ledger.begin_sending("2026-08-19-premarket", claim, NOW)
-    ledger.mark_sent("2026-08-19-premarket", claim, NOW)
+    ledger.mark_sent(
+        "2026-08-19-premarket", claim, NOW, attempt_id=attempt.attempt_id
+    )
 
     result = run_report(
         ReportMode.PREMARKET,
@@ -936,8 +977,9 @@ def test_ambiguous_mail_failure_remains_non_resendable_and_never_marks_sent(tmp_
     first = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
     second = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
 
-    assert first.final_state is FinalState.HARD_FAILURE
-    assert second.final_state is FinalState.DUPLICATE_SKIP
+    assert first.final_state is FinalState.OPERATOR_ACTION_REQUIRED
+    assert second.final_state is FinalState.OPERATOR_ACTION_REQUIRED
+    assert second.exit_code == EXIT_FAILURE
     assert mail_sender.call_count == 1
     assert LocalDeliveryLedger(tmp_path).status("2026-08-19-premarket") is DeliveryState.IN_DOUBT
 
@@ -957,23 +999,22 @@ def test_definitive_preacceptance_failure_is_retryable(tmp_path, deps) -> None:
     assert LocalDeliveryLedger(tmp_path).status("2026-08-19-premarket") is DeliveryState.SENT
 
 
-def test_manifest_update_failure_after_send_returns_sent_and_claim_prevents_resend(tmp_path, deps) -> None:
+def test_final_attempt_failure_after_send_requires_reconciliation_and_prevents_resend(tmp_path, deps) -> None:
     artifact_finalizer = Mock(side_effect=OSError("post-send manifest failed"))
     local = replace(deps, artifact_finalizer=artifact_finalizer)
 
     first = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
     second = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
 
-    assert first.final_state is FinalState.SENT
-    assert first.exit_code == EXIT_SUCCESS
-    assert first.modules["delivery_state"].status == "partial"
-    assert second.final_state is FinalState.DUPLICATE_SKIP
+    assert first.final_state is FinalState.OPERATOR_ACTION_REQUIRED
+    assert first.exit_code == EXIT_FAILURE
+    assert second.final_state is FinalState.OPERATOR_ACTION_REQUIRED
     assert deps.mail_sender.call_count == 1
 
 
 def test_ledger_failure_after_send_returns_sent_with_sanitized_partial_status(tmp_path, deps) -> None:
     class FailingFinalizeLedger(LocalDeliveryLedger):
-        def mark_sent(self, report_key, claim_id, sent_at):
+        def mark_sent(self, report_key, claim_id, sent_at, *, attempt_id):
             raise OSError("private marker path")
 
     ledger = FailingFinalizeLedger(tmp_path)
@@ -984,8 +1025,8 @@ def test_ledger_failure_after_send_returns_sent_with_sanitized_partial_status(tm
         output_dir=tmp_path,
     )
 
-    assert result.final_state is FinalState.SENT
-    assert result.modules["delivery_state"].status == "partial"
+    assert result.final_state is FinalState.OPERATOR_ACTION_REQUIRED
+    assert result.exit_code == EXIT_FAILURE
     assert "private marker path" not in json.dumps(result.to_public_dict())
     assert ledger.status("2026-08-19-premarket") is DeliveryState.IN_DOUBT
 
@@ -994,7 +1035,8 @@ def test_ledger_failure_after_send_returns_sent_with_sanitized_partial_status(tm
         deps=replace(deps, ledger_factory=lambda output: ledger),
         output_dir=tmp_path,
     )
-    assert second.final_state is FinalState.DUPLICATE_SKIP
+    assert second.final_state is FinalState.OPERATOR_ACTION_REQUIRED
+    assert second.exit_code == EXIT_FAILURE
     assert deps.mail_sender.call_count == 1
 
 
@@ -1042,6 +1084,80 @@ def test_concurrent_runner_calls_send_at_most_once(tmp_path, deps) -> None:
     assert calls == 1
     assert first_result.final_state is FinalState.SENT
     assert second_result.final_state is FinalState.DUPLICATE_SKIP
+
+
+def test_losing_concurrent_run_cannot_replace_winner_final_pointer(tmp_path, deps) -> None:
+    first_preparing = threading.Event()
+    second_preparing = threading.Event()
+    release_loser = threading.Event()
+    calls = 0
+    lock = threading.Lock()
+
+    def delayed_prepare(*args, **kwargs):
+        nonlocal calls
+        with lock:
+            calls += 1
+            ordinal = calls
+        if ordinal == 1:
+            first_preparing.set()
+            assert second_preparing.wait(timeout=5)
+        elif ordinal == 2:
+            second_preparing.set()
+            assert release_loser.wait(timeout=5)
+        return write_report_artifacts(*args, **kwargs)
+
+    local = replace(
+        deps,
+        artifact_writer=delayed_prepare,
+        artifact_finalizer=write_report_artifacts,
+    )
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        winner = executor.submit(run_report, ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
+        assert first_preparing.wait(timeout=5)
+        loser = executor.submit(run_report, ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
+        winner_result = winner.result(timeout=5)
+        pointer_path = tmp_path / "production" / "2026-08-19-premarket" / "current.json"
+        winner_pointer = pointer_path.read_bytes()
+        release_loser.set()
+        loser_result = loser.result(timeout=5)
+
+    assert winner_result.final_state is FinalState.SENT
+    assert loser_result.final_state is FinalState.DUPLICATE_SKIP
+    assert pointer_path.read_bytes() == winner_pointer
+    assert json.loads(winner_pointer)["final_state"] == "sent"
+    assert deps.mail_sender.call_count == 1
+
+
+def test_sent_preflight_repairs_missing_pointer_after_publish_failure_without_resend(
+    tmp_path, deps
+) -> None:
+    calls = 0
+
+    def fail_once(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError("pointer publish failed")
+        return publish_report_artifacts(*args, **kwargs)
+
+    settings_loader = Mock(side_effect=deps.settings_loader)
+    local = replace(
+        deps,
+        settings_loader=settings_loader,
+        artifact_publisher=fail_once,
+    )
+
+    first = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
+    pointer_path = tmp_path / "production" / "2026-08-19-premarket" / "current.json"
+    assert first.final_state is FinalState.SENT
+    assert not pointer_path.exists()
+
+    second = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
+
+    assert second.final_state is FinalState.DUPLICATE_SKIP
+    assert json.loads(pointer_path.read_text(encoding="utf-8"))["final_state"] == "sent"
+    assert deps.mail_sender.call_count == 1
+    assert settings_loader.call_count == 1
 
 
 def test_corrupt_delivery_state_fails_closed_without_settings_or_send(tmp_path, deps) -> None:
@@ -1164,8 +1280,8 @@ def test_smtp_failure_is_fatal_with_sanitized_result(tmp_path, deps) -> None:
     )
 
     assert result.exit_code == EXIT_FAILURE
-    assert result.final_state is FinalState.HARD_FAILURE
-    assert result.error_code == "delivery_failed"
+    assert result.final_state is FinalState.OPERATOR_ACTION_REQUIRED
+    assert result.error_code == "delivery_reconciliation_required"
     assert result.manifest_path.exists()
     assert "hunter2" not in json.dumps(result.to_public_dict())
 
