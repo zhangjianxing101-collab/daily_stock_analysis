@@ -58,10 +58,33 @@ class MarketDataset:
     source: str
     observed_at: datetime
     warnings: tuple[str, ...] = ()
+    source_timestamp: datetime | None = None
 
     def __post_init__(self) -> None:
         if self.observed_at.tzinfo is None or self.observed_at.utcoffset() is None:
             raise ValueError("observed_at must be timezone-aware")
+        if self.source_timestamp is not None and (
+            self.source_timestamp.tzinfo is None or self.source_timestamp.utcoffset() is None
+        ):
+            raise ValueError("source_timestamp must be timezone-aware")
+
+
+def _snapshot_source_timestamp(raw: pd.DataFrame) -> tuple[datetime | None, tuple[str, ...]]:
+    value = next(
+        (raw.attrs.get(key) for key in ("source_timestamp", "quote_timestamp", "data_timestamp") if raw.attrs.get(key)),
+        None,
+    )
+    if value is None:
+        return None, ("snapshot source timestamp unavailable",)
+    try:
+        timestamp = pd.Timestamp(value)
+        if pd.isna(timestamp):
+            raise ValueError
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("Asia/Shanghai")
+        return timestamp.to_pydatetime(), ()
+    except (TypeError, ValueError, OverflowError):
+        return None, ("snapshot source timestamp unavailable",)
 
 
 def _matching_column(frame: pd.DataFrame, aliases: tuple[str, ...]) -> object | None:
@@ -267,7 +290,14 @@ class MarketDataGateway:
         normalized = normalize_a_share_snapshot(raw)
         if normalized.empty:
             raise ValueError("snapshot provider returned empty data")
-        return MarketDataset(normalized, "akshare.stock_zh_a_spot_em", self._observed_at())
+        source_timestamp, warnings = _snapshot_source_timestamp(raw)
+        return MarketDataset(
+            normalized,
+            "akshare.stock_zh_a_spot_em",
+            self._observed_at(),
+            warnings,
+            source_timestamp,
+        )
 
     def get_daily_bars(self, code: str, expected_session: date, *, days: int = 160) -> MarketDataset:
         try:

@@ -213,7 +213,7 @@ class EmailSender:
             server.login(sender, password)
             server.send_message(msg)
             
-            logger.info(f"邮件发送成功，收件人: {receivers}")
+            logger.info("邮件发送成功，收件人数: %d", len(receivers))
             return True
             
         except smtplib.SMTPAuthenticationError:
@@ -259,7 +259,7 @@ class EmailSender:
             server = self._open_server(sender, timeout_seconds)
             server.login(sender, password)
             server.send_message(msg)
-            logger.info("邮件发送成功，收件人: %s", selected_receivers)
+            logger.info("邮件发送成功，收件人数: %d", len(selected_receivers))
             return True
         except smtplib.SMTPAuthenticationError:
             logger.error("邮件发送失败：认证错误，请检查邮箱和授权码是否正确")

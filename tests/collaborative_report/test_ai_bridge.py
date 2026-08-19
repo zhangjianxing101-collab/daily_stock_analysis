@@ -1,5 +1,6 @@
 import importlib
 import inspect
+import logging
 import sys
 from datetime import datetime, timezone
 from types import MappingProxyType, ModuleType, SimpleNamespace
@@ -219,6 +220,23 @@ def test_pipeline_exception_is_sanitized_in_full_result_report() -> None:
     assert "provider unavailable" not in serialized
     assert "secret" not in serialized
     assert "token.example" not in serialized
+
+
+def test_collaborative_pipeline_logs_redact_requested_stock_codes(caplog) -> None:
+    from src.collaborative_report.ai_bridge import enrich_codes
+
+    class LoggingPipeline:
+        def run(self, **kwargs):
+            logging.getLogger("src.core.pipeline").warning(
+                "processing portfolio code %s", kwargs["stock_codes"][0]
+            )
+            return []
+
+    with caplog.at_level(logging.WARNING):
+        enrich_codes(["600519"], LoggingPipeline(), observed_at=OBSERVED_AT)
+
+    assert "600519" not in caplog.text
+    assert "[redacted-stock]" in caplog.text
 
 
 def test_empty_valid_codes_skip_with_immutable_payload_and_fixed_warning(monkeypatch) -> None:

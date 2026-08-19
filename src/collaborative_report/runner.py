@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
-import hashlib
 import json
 import math
 import os
 import re
+import shutil
+import uuid
 from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import date, datetime
 from enum import Enum
@@ -58,6 +59,31 @@ class ArtifactPaths:
     manifest_path: Path
 
 
+class LocalDeliveryLedger:
+    """Atomic local production-delivery markers keyed by report identity."""
+
+    def __init__(self, output_dir: Path | str) -> None:
+        self.directory = Path(output_dir) / ".delivery-ledger"
+
+    def _path(self, report_key: str) -> Path:
+        return self.directory / f"{report_key}.json"
+
+    def is_sent(self, report_key: str) -> bool:
+        try:
+            payload = json.loads(self._path(report_key).read_text(encoding="utf-8"))
+        except (OSError, UnicodeError, json.JSONDecodeError):
+            return False
+        return payload == {"report_key": report_key, "production_sent": True}
+
+    def mark_sent(self, report_key: str, sent_at: datetime) -> None:
+        del sent_at
+        _atomic_write(
+            self._path(report_key),
+            json.dumps({"report_key": report_key, "production_sent": True}, sort_keys=True) + "\n",
+            mode=0o600,
+        )
+
+
 @dataclass(frozen=True)
 class RunResult:
     exit_code: int
@@ -99,6 +125,9 @@ class RunnerDependencies:
     mail_sender: Callable[..., Any]
     data_session_resolver: Callable[..., date] = report_data_session
     sizing_evaluator: Callable[..., int] = suggested_board_lots
+    ledger_factory: Callable[[Path | str], Any] = LocalDeliveryLedger
+    artifact_writer: Callable[..., ArtifactPaths] | None = None
+    manifest_writer: Callable[[Path, str], None] | None = None
 
 
 def _production_mail_sender(rendered: RenderedReport, *, test_email: bool = False) -> Any:
@@ -107,9 +136,11 @@ def _production_mail_sender(rendered: RenderedReport, *, test_email: bool = Fals
 
     try:
         config = get_config()
-        receivers = tuple(getattr(config, "email_receivers", ()) or ())
-        if not receivers:
+        sender_address = str(getattr(config, "email_sender", "") or "").strip()
+        password = str(getattr(config, "email_password", "") or "").strip()
+        if not sender_address or not password:
             raise ValueError
+        receivers = tuple(getattr(config, "email_receivers", ()) or ())
         sender = EmailSender(config)
     except Exception:
         raise _DeliveryConfigurationError("email configuration unavailable") from None
@@ -118,7 +149,7 @@ def _production_mail_sender(rendered: RenderedReport, *, test_email: bool = Fals
         html_content=rendered.html,
         text_content=rendered.text,
         subject=rendered.subject,
-        receivers=receivers,
+        receivers=receivers or None,
     )
 
 
@@ -237,6 +268,33 @@ def _snapshot_history_conflicts(
     return conflicts
 
 
+def _untrusted_snapshot_codes(
+    snapshot: MarketDataset,
+    histories: Mapping[str, MarketDataset],
+    *,
+    expected_session: date,
+    session: ReportSession,
+    conflict_codes: set[str],
+) -> set[str]:
+    source_timestamp = snapshot.source_timestamp
+    source_is_current = bool(
+        source_timestamp is not None
+        and source_timestamp <= session.now_shanghai
+        and source_timestamp.astimezone(SHANGHAI_TIMEZONE).date() == session.trading_date
+    )
+    if source_is_current:
+        return set(conflict_codes)
+    codes = {str(code) for code in snapshot.frame.get("code", ())}
+    corroborated = {
+        code
+        for code in codes
+        if code in histories
+        and _last_session_bar(histories[code], expected_session) is not None
+        and code not in conflict_codes
+    }
+    return codes - corroborated
+
+
 def _suppress_conflicting_candidates(
     candidates: Sequence[Candidate], conflict_codes: set[str]
 ) -> tuple[Candidate, ...]:
@@ -319,6 +377,8 @@ def _load_prior_state(path: Path | None, session: ReportSession) -> tuple[Mappin
         payload.get("mode") != ReportMode.PREMARKET.value
         or payload.get("trading_date") != expected_date
         or payload.get("report_key") != f"{expected_date}-{ReportMode.PREMARKET.value}"
+        or payload.get("final_state") != FinalState.SENT.value
+        or payload.get("test_email") is not False
         or not isinstance(payload.get("candidate_state"), list)
     ):
         raise ValueError("prior state unavailable")
@@ -346,14 +406,16 @@ def _load_prior_state(path: Path | None, session: ReportSession) -> tuple[Mappin
     return tuple(rows)
 
 
-def _atomic_write(path: Path, content: str) -> None:
+def _atomic_write(path: Path, content: str, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
     temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="") as handle:
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
+        temporary.chmod(mode)
         temporary.replace(path)
     finally:
         try:
@@ -368,24 +430,35 @@ def write_report_artifacts(
     report_key: str,
     rendered: RenderedReport,
     manifest: Mapping[str, Any],
+    test_email: bool = False,
 ) -> ArtifactPaths:
-    """Atomically write private report bodies and the redacted state manifest."""
+    """Stage and atomically publish one coherent report-key artifact directory."""
 
-    directory = Path(output_dir)
-    html_path = directory / "report.html"
-    text_path = directory / "report.txt"
-    manifest_path = directory / "manifest.json"
-    _atomic_write(html_path, rendered.html)
-    _atomic_write(text_path, rendered.text)
-    _atomic_write(
-        manifest_path,
-        json.dumps(dict(manifest), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-    )
-    return ArtifactPaths(html_path, text_path, manifest_path)
-
-
-def _checksum(value: str) -> str:
-    return hashlib.sha256(value.encode("utf-8")).hexdigest()
+    root = Path(output_dir)
+    parent = root / ("test" if test_email else "production")
+    parent.mkdir(parents=True, exist_ok=True)
+    parent.chmod(0o700)
+    final = parent / report_key
+    staging = parent / f".{report_key}.{uuid.uuid4().hex}.staging"
+    backup = parent / f".{report_key}.{uuid.uuid4().hex}.backup"
+    try:
+        staging.mkdir(mode=0o700)
+        _atomic_write(staging / "report.html", rendered.html)
+        _atomic_write(staging / "report.txt", rendered.text)
+        _atomic_write(
+            staging / "manifest.json",
+            json.dumps(dict(manifest), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        )
+        if final.exists():
+            final.replace(backup)
+        staging.replace(final)
+        shutil.rmtree(backup, ignore_errors=True)
+    except Exception:
+        shutil.rmtree(staging, ignore_errors=True)
+        if backup.exists() and not final.exists():
+            backup.replace(final)
+        raise
+    return ArtifactPaths(final / "report.html", final / "report.txt", final / "manifest.json")
 
 
 def _warning_codes(modules: Mapping[str, ModuleResult]) -> list[str]:
@@ -444,7 +517,6 @@ def _redacted_manifest(
         "module_statuses": {name: result.status for name, result in modules.items()},
         "source_timestamps": {name: result.observed_at.isoformat() for name, result in modules.items()},
         "warning_codes": _warning_codes(modules),
-        "checksums": {"html_sha256": _checksum(rendered.html), "text_sha256": _checksum(rendered.text)},
     }
     if session.mode is ReportMode.PREMARKET:
         manifest["candidate_state"] = _candidate_state(candidates, portfolio_codes)
@@ -498,11 +570,6 @@ def run_report(
 
     normalized_mode = ReportMode(mode)
     active = deps or default_dependencies()
-    try:
-        settings = active.settings_loader()
-    except Exception:
-        return _failure("configuration_invalid")
-
     now = active.clock()
     try:
         session = active.session_builder(normalized_mode, now, scheduled=not force)
@@ -513,9 +580,17 @@ def run_report(
         return _failure("report_identity_invalid")
     if not session.is_trading_day:
         return RunResult(EXIT_SUCCESS, FinalState.NON_TRADING_DAY_SKIP, session.report_key, {})
-    if already_sent:
+    ledger = active.ledger_factory(output_dir)
+    if not test_email and (already_sent or ledger.is_sent(session.report_key)):
         return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
 
+    try:
+        settings = active.settings_loader()
+    except Exception:
+        return _failure("configuration_invalid", report_key=session.report_key)
+
+    artifact_writer = active.artifact_writer or write_report_artifacts
+    manifest_writer = active.manifest_writer or _atomic_write
     try:
         expected_session = active.data_session_resolver(
             normalized_mode,
@@ -581,6 +656,18 @@ def run_report(
         if snapshot is not None
         else set()
     )
+    untrusted_codes = (
+        _untrusted_snapshot_codes(
+            snapshot,
+            histories,
+            expected_session=expected_session,
+            session=session,
+            conflict_codes=conflict_codes,
+        )
+        if snapshot is not None
+        else set()
+    )
+    suppressed_codes = conflict_codes | untrusted_codes
     if conflict_codes:
         market = modules["market"]
         modules["market"] = ModuleResult(
@@ -591,6 +678,16 @@ def run_report(
             (*market.warnings, _PRICE_CONFLICT_WARNING_CODE),
         )
         prices = {code: price for code, price in prices.items() if code not in conflict_codes}
+    if untrusted_codes:
+        market = modules["market"]
+        modules["market"] = ModuleResult(
+            market.name,
+            "partial",
+            market.observed_at,
+            market.payload,
+            (*market.warnings, "snapshot_timestamp_untrusted"),
+        )
+        prices = {code: price for code, price in prices.items() if code not in untrusted_codes}
 
     leading: dict[str, str] = {}
     try:
@@ -618,8 +715,8 @@ def run_report(
                 observed_at=session.now_shanghai,
             )
             screening = ScreeningResult(
-                _suppress_conflicting_candidates(screening.short_term, conflict_codes),
-                _suppress_conflicting_candidates(screening.swing, conflict_codes),
+                _suppress_conflicting_candidates(screening.short_term, suppressed_codes),
+                _suppress_conflicting_candidates(screening.swing, suppressed_codes),
                 screening.warnings,
             )
             status = "partial" if history_failures or screening.warnings else "ok"
@@ -671,8 +768,18 @@ def run_report(
         modules["gold"] = _unavailable("gold", session.now_shanghai, "黄金模块暂不可用")
 
     ai_codes = tuple(
-        dict.fromkeys(
+        code
+        for code in dict.fromkeys(
             (*portfolio_codes, *(item.code for item in screening.short_term), *(item.code for item in screening.swing))
+        )
+        if code not in suppressed_codes
+        and not next(
+            (
+                item.warning.strip()
+                for item in (*screening.short_term, *screening.swing)
+                if item.code == code
+            ),
+            "",
         )
     )
     try:
@@ -695,7 +802,11 @@ def run_report(
             portfolio_warnings.append("持仓风险计算不可用")
     modules["portfolio"] = ModuleResult(
         "portfolio",
-        "ok" if len(portfolio_payload) == len(settings.positions) else "unavailable",
+        (
+            "ok"
+            if len(portfolio_payload) == len(settings.positions)
+            else ("partial" if portfolio_payload else "unavailable")
+        ),
         session.now_shanghai,
         portfolio_payload,
         tuple(dict.fromkeys(portfolio_warnings)) or (() if portfolio_payload else ("数据不足，建议观望",)),
@@ -753,16 +864,6 @@ def run_report(
             subject_prefix=_TEST_SUBJECT_PREFIX if test_email else None,
             generated_at=session.now_shanghai,
         )
-    except _DeliveryConfigurationError:
-        failure_manifest = dict(manifest, final_state=FinalState.HARD_FAILURE.value, error_code="configuration_invalid")
-        try:
-            _atomic_write(
-                paths.manifest_path,
-                json.dumps(failure_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-            )
-        except Exception:
-            pass
-        return _failure("configuration_invalid", report_key=session.report_key, modules=modules, paths=paths)
     except Exception:
         return _failure("report_render_failed", report_key=session.report_key, modules=modules)
 
@@ -778,17 +879,20 @@ def run_report(
             portfolio_codes=portfolio_codes,
             test_email=test_email,
         )
-        paths = write_report_artifacts(
+        paths = artifact_writer(
             output_dir,
             report_key=session.report_key,
             rendered=rendered,
             manifest=manifest,
+            test_email=test_email,
         )
     except Exception:
         return _failure("artifact_write_failed", report_key=session.report_key, modules=modules)
 
     try:
         active.mail_sender(rendered, test_email=test_email)
+    except _DeliveryConfigurationError:
+        return _failure("configuration_invalid", report_key=session.report_key, modules=modules, paths=paths)
     except Exception:
         failure_manifest = dict(manifest, final_state=FinalState.HARD_FAILURE.value, error_code="delivery_failed")
         try:
@@ -800,11 +904,29 @@ def run_report(
             pass
         return _failure("delivery_failed", report_key=session.report_key, modules=modules, paths=paths)
 
-    manifest = dict(manifest, final_state=final_state.value)
+    if not test_email:
+        try:
+            ledger.mark_sent(session.report_key, session.now_shanghai)
+        except Exception:
+            modules["delivery_state"] = ModuleResult(
+                "delivery_state", "partial", session.now_shanghai, {}, ("delivery_ledger_update_failed",)
+            )
+
+    manifest = dict(
+        manifest,
+        final_state=final_state.value,
+        module_statuses={name: result.status for name, result in modules.items()},
+        warning_codes=_warning_codes(modules),
+    )
     try:
-        _atomic_write(paths.manifest_path, json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n")
+        manifest_writer(
+            paths.manifest_path,
+            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        )
     except Exception:
-        return _failure("artifact_write_failed", report_key=session.report_key, modules=modules, paths=paths)
+        modules["delivery_state"] = ModuleResult(
+            "delivery_state", "partial", session.now_shanghai, {}, ("manifest_finalize_failed",)
+        )
     return RunResult(
         EXIT_SUCCESS,
         final_state,

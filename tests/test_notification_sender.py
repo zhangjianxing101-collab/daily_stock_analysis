@@ -976,6 +976,13 @@ class TestEmailSender(unittest.TestCase):
         sender = EmailSender(_config())
         self.assertFalse(sender.send_html_email("<p>body</p>", "body", "subject"))
 
+    def test_empty_receivers_fall_back_to_configured_sender_without_smtp(self):
+        sender = EmailSender(
+            _config(email_sender="sender@qq.com", email_password="auth", email_receivers=[])
+        )
+
+        self.assertEqual(sender.get_all_email_receivers(), ["sender@qq.com"])
+
     def test_get_receivers_for_stocks_no_groups_returns_default(self):
         cfg = _config(
             email_sender="a@qq.com",
@@ -1097,6 +1104,23 @@ class TestEmailSender(unittest.TestCase):
 
         msg = mock_smtp_ssl.return_value.send_message.call_args.args[0]
         self.assertEqual(msg["To"], "one@qq.com, two@qq.com")
+
+    @mock.patch("src.notification_sender.email_sender.logger")
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_send_html_email_success_log_contains_count_not_addresses(self, mock_smtp_ssl, mock_logger):
+        cfg = _config(
+            email_sender="private-sender@qq.com",
+            email_password="p",
+            email_receivers=["private-one@qq.com", "private-two@qq.com"],
+        )
+        sender = EmailSender(cfg)
+
+        self.assertTrue(sender.send_html_email("<p>body</p>", "body", "subject"))
+
+        logged = " ".join(str(call) for call in mock_logger.info.call_args_list)
+        self.assertIn("2", logged)
+        self.assertNotIn("private-one@qq.com", logged)
+        self.assertNotIn("private-two@qq.com", logged)
 
     @mock.patch("smtplib.SMTP_SSL")
     def test_send_html_email_rejects_explicit_empty_receivers_before_smtp(self, mock_smtp_ssl):

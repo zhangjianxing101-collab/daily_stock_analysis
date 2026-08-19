@@ -1,9 +1,10 @@
 import json
 import runpy
+import stat
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -21,12 +22,14 @@ from src.collaborative_report.runner import (
     EXIT_SUCCESS,
     SNAPSHOT_DAILY_CLOSE_TOLERANCE,
     FinalState,
+    LocalDeliveryLedger,
     RunnerDependencies,
     classify_prior_candidates,
     default_dependencies,
     run_report,
     write_report_artifacts,
 )
+from src.collaborative_report.runner import _production_mail_sender
 from src.collaborative_report.screener import ScreeningResult, screen_aggressive
 from src.collaborative_report.session import ReportSession, build_report_session, report_data_session
 from src.collaborative_report.settings import CollaborativeSettings
@@ -276,9 +279,17 @@ def test_material_snapshot_history_conflict_forces_watch_and_suppresses_risk_and
     conflict_settings = replace(settings, positions=(Position(CANDIDATE_CODE, 100, 10.0),))
     gateway = FakeGateway()
     gateway.snapshot.frame.loc[gateway.snapshot.frame["code"] == CANDIDATE_CODE, "price"] = 11.0
+    gateway.snapshot = MarketDataset(
+        gateway.snapshot.frame,
+        gateway.snapshot.source,
+        NOW,
+        (),
+        datetime(2026, 8, 18, 15, 0, tzinfo=SHANGHAI),
+    )
     risk_evaluator = Mock(return_value={"状态": "正常"})
     sizing_evaluator = Mock(return_value=100)
 
+    ai_enricher = Mock(return_value=ModuleResult("ai", "ok", NOW, {}))
     result = run_report(
         ReportMode.PREMARKET,
         deps=replace(
@@ -287,6 +298,7 @@ def test_material_snapshot_history_conflict_forces_watch_and_suppresses_risk_and
             gateway=gateway,
             risk_evaluator=risk_evaluator,
             sizing_evaluator=sizing_evaluator,
+            ai_enricher=ai_enricher,
         ),
         output_dir=tmp_path,
     )
@@ -300,6 +312,7 @@ def test_material_snapshot_history_conflict_forces_watch_and_suppresses_risk_and
     assert "snapshot_daily_close_conflict" in manifest["warning_codes"]
     risk_evaluator.assert_not_called()
     sizing_evaluator.assert_not_called()
+    assert CANDIDATE_CODE not in ai_enricher.call_args.args[0]
 
 
 def test_snapshot_history_price_within_tolerance_remains_actionable(tmp_path, deps) -> None:
@@ -337,7 +350,7 @@ def test_inconsistent_session_identity_fails_closed(tmp_path, deps) -> None:
     deps.mail_sender.assert_not_called()
 
 
-def test_duplicate_marker_skips_before_data_and_test_email(tmp_path, deps) -> None:
+def test_external_duplicate_marker_skips_production_before_data(tmp_path, deps) -> None:
     gateway = Mock()
     local = replace(deps, gateway=gateway)
 
@@ -345,7 +358,6 @@ def test_duplicate_marker_skips_before_data_and_test_email(tmp_path, deps) -> No
         ReportMode.PREMARKET,
         deps=local,
         already_sent=True,
-        test_email=True,
         output_dir=tmp_path,
     )
 
@@ -477,6 +489,8 @@ def test_postmarket_ingests_prior_manifest_and_classifies_all_statuses(tmp_path,
                 "trading_date": "2026-08-19",
                 "report_key": "2026-08-19-premarket",
                 "generated_at": "2026-08-19T09:00:00+08:00",
+                "final_state": "sent",
+                "test_email": False,
                 "candidate_state": [
                     {"code": "600001", "name": "触发", "trigger_price": 10.5, "stop_price": 9.8},
                     {"code": "600002", "name": "失效", "trigger_price": 10.5, "stop_price": 9.8},
@@ -527,6 +541,8 @@ def test_prior_state_wrong_session_identity_or_timestamp_degrades_without_guessi
         "trading_date": "2026-08-19",
         "report_key": "2026-08-19-premarket",
         "generated_at": "2026-08-19T09:00:00+08:00",
+        "final_state": "sent",
+        "test_email": False,
         "candidate_state": [
             {"code": "600002", "name": "旧候选", "trigger_price": 10.5, "stop_price": 9.8}
         ],
@@ -559,6 +575,8 @@ def test_prior_candidate_history_is_fetched_once_before_screening(tmp_path, deps
                 "trading_date": "2026-08-19",
                 "report_key": "2026-08-19-premarket",
                 "generated_at": "2026-08-19T01:00:00+00:00",
+                "final_state": "sent",
+                "test_email": False,
                 "candidate_state": [
                     {"code": "600002", "name": "旧候选", "trigger_price": 10.5, "stop_price": 9.8}
                 ],
@@ -601,6 +619,35 @@ def test_missing_or_corrupt_prior_state_is_degradable(tmp_path, deps, content) -
     assert result.exit_code == EXIT_SUCCESS
     assert result.modules["morning_candidates"].status == "unavailable"
     assert "早盘候选状态不可用" in result.modules["morning_candidates"].warnings
+
+
+@pytest.mark.parametrize(
+    ("final_state", "test_email"),
+    [("prepared", False), ("hard_failure", False), ("test_sent", True), ("sent", True)],
+)
+def test_prior_state_must_be_successful_production_delivery(tmp_path, deps, final_state, test_email) -> None:
+    prior = tmp_path / "prior.json"
+    prior.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "mode": "premarket",
+                "trading_date": "2026-08-19",
+                "report_key": "2026-08-19-premarket",
+                "generated_at": "2026-08-19T09:00:00+08:00",
+                "final_state": final_state,
+                "test_email": test_email,
+                "candidate_state": [],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = run_report(
+        ReportMode.POSTMARKET, deps=deps, prior_report=prior, output_dir=tmp_path / "out"
+    )
+
+    assert result.modules["morning_candidates"].status == "unavailable"
 
 
 def test_premarket_manifest_persists_only_nonportfolio_candidate_state(tmp_path, deps, settings) -> None:
@@ -651,11 +698,169 @@ def test_artifacts_are_atomic_and_private_outputs_are_separate(tmp_path, monkeyp
         manifest={"report_key": "2026-08-19-premarket"},
     )
 
+    assert paths.html_path.parent == tmp_path / "production" / "2026-08-19-premarket"
     assert paths.html_path.read_text(encoding="utf-8") == "<p>private</p>"
     assert paths.text_path.read_text(encoding="utf-8") == "private text"
     assert json.loads(paths.manifest_path.read_text(encoding="utf-8"))["report_key"] == "2026-08-19-premarket"
-    assert len(replacements) == 3
-    assert not list(tmp_path.glob("*.tmp"))
+    assert replacements
+    assert stat.S_IMODE(paths.html_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(paths.text_path.stat().st_mode) == 0o600
+    assert stat.S_IMODE(paths.html_path.parent.stat().st_mode) == 0o700
+    assert not list(tmp_path.rglob("*.staging"))
+
+
+def test_artifact_publish_failure_cleans_staging_and_sends_nothing(tmp_path, deps) -> None:
+    def fail_publish(*args, **kwargs):
+        raise OSError("publish failed")
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, artifact_writer=fail_publish),
+        output_dir=tmp_path,
+    )
+
+    assert result.exit_code == EXIT_FAILURE
+    deps.mail_sender.assert_not_called()
+    assert not list(tmp_path.rglob("*.staging"))
+
+
+def test_atomic_directory_publish_failure_restores_previous_artifact_and_cleans_staging(
+    tmp_path, monkeypatch
+) -> None:
+    rendered = RenderedReport("subject", "old", "old")
+    first = write_report_artifacts(
+        tmp_path, report_key="2026-08-19-premarket", rendered=rendered, manifest={}
+    )
+    original_replace = Path.replace
+
+    def fail_staging_publish(self, target):
+        if self.name.endswith(".staging"):
+            raise OSError("publish failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_staging_publish)
+    with pytest.raises(OSError, match="publish failure"):
+        write_report_artifacts(
+            tmp_path,
+            report_key="2026-08-19-premarket",
+            rendered=RenderedReport("subject", "new", "new"),
+            manifest={},
+        )
+
+    assert first.html_path.read_text(encoding="utf-8") == "old"
+    assert not list(tmp_path.rglob("*.staging"))
+    assert not list(tmp_path.rglob("*.backup"))
+
+
+def test_local_ledger_skips_second_production_run_without_boolean(tmp_path, deps) -> None:
+    first = run_report(ReportMode.PREMARKET, deps=deps, output_dir=tmp_path)
+    second = run_report(ReportMode.PREMARKET, deps=deps, output_dir=tmp_path)
+
+    assert first.final_state is FinalState.SENT
+    assert second.final_state is FinalState.DUPLICATE_SKIP
+    assert deps.mail_sender.call_count == 1
+    marker = tmp_path / ".delivery-ledger" / "2026-08-19-premarket.json"
+    assert stat.S_IMODE(marker.stat().st_mode) == 0o600
+
+
+def test_nontrading_and_duplicate_skip_do_not_load_portfolio_settings(tmp_path, deps) -> None:
+    settings_loader = Mock(side_effect=AssertionError("must not load"))
+    duplicate_deps = replace(deps, settings_loader=settings_loader)
+    ledger = LocalDeliveryLedger(tmp_path)
+    ledger.mark_sent("2026-08-19-premarket", NOW)
+
+    duplicate = run_report(ReportMode.PREMARKET, deps=duplicate_deps, output_dir=tmp_path)
+    holiday = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(
+            duplicate_deps,
+            session_builder=lambda mode, current_time, scheduled: ReportSession(
+                mode, NOW, NOW.date(), False, f"2026-08-19-{mode.value}"
+            ),
+        ),
+        output_dir=tmp_path / "holiday",
+    )
+
+    assert duplicate.final_state is FinalState.DUPLICATE_SKIP
+    assert holiday.final_state is FinalState.NON_TRADING_DAY_SKIP
+    settings_loader.assert_not_called()
+
+
+def test_test_email_ignores_production_dedupe_and_does_not_write_marker(tmp_path, deps) -> None:
+    LocalDeliveryLedger(tmp_path).mark_sent("2026-08-19-premarket", NOW)
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=deps,
+        already_sent=True,
+        test_email=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.final_state is FinalState.TEST_SENT
+    assert result.html_path.parent == tmp_path / "test" / "2026-08-19-premarket"
+    assert deps.mail_sender.call_count == 1
+
+
+def test_mail_failure_never_writes_sent_marker(tmp_path, deps) -> None:
+    mail_sender = Mock(side_effect=RuntimeError("smtp failed"))
+    local = replace(deps, mail_sender=mail_sender)
+
+    first = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
+    second = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
+
+    assert first.final_state is FinalState.HARD_FAILURE
+    assert second.final_state is FinalState.HARD_FAILURE
+    assert mail_sender.call_count == 2
+    assert not LocalDeliveryLedger(tmp_path).is_sent("2026-08-19-premarket")
+
+
+def test_manifest_update_failure_after_send_returns_sent_and_ledger_prevents_resend(tmp_path, deps) -> None:
+    manifest_writer = Mock(side_effect=OSError("post-send manifest failed"))
+    local = replace(deps, manifest_writer=manifest_writer)
+
+    first = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
+    second = run_report(ReportMode.PREMARKET, deps=local, output_dir=tmp_path)
+
+    assert first.final_state is FinalState.SENT
+    assert first.exit_code == EXIT_SUCCESS
+    assert first.modules["delivery_state"].status == "partial"
+    assert second.final_state is FinalState.DUPLICATE_SKIP
+    assert deps.mail_sender.call_count == 1
+
+
+def test_ledger_failure_after_send_returns_sent_with_sanitized_partial_status(tmp_path, deps) -> None:
+    ledger = Mock()
+    ledger.is_sent.return_value = False
+    ledger.mark_sent.side_effect = OSError("private marker path")
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, ledger_factory=lambda output: ledger),
+        output_dir=tmp_path,
+    )
+
+    assert result.final_state is FinalState.SENT
+    assert result.modules["delivery_state"].status == "partial"
+    assert "private marker path" not in json.dumps(result.to_public_dict())
+
+
+def test_mail_configuration_failure_is_hard_at_delivery_boundary_without_marker(tmp_path, deps) -> None:
+    from src.collaborative_report.runner import _DeliveryConfigurationError
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(
+            deps,
+            mail_sender=Mock(side_effect=_DeliveryConfigurationError("sender@example.com auth")),
+        ),
+        output_dir=tmp_path,
+    )
+
+    assert result.final_state is FinalState.HARD_FAILURE
+    assert result.error_code == "configuration_invalid"
+    assert not LocalDeliveryLedger(tmp_path).is_sent("2026-08-19-premarket")
+    assert "sender@example.com" not in json.dumps(result.to_public_dict())
 
 
 def test_test_email_prefix_does_not_change_report_identity(tmp_path, deps) -> None:
@@ -699,6 +904,34 @@ def test_settings_privacy_failure_is_closed_without_secret_in_result(tmp_path, d
     assert PORTFOLIO_CODE not in json.dumps(result.to_public_dict())
 
 
+def test_portfolio_status_is_partial_when_only_some_positions_succeed(tmp_path, deps, settings) -> None:
+    second_code = "600002"
+    mixed = replace(settings, positions=(*settings.positions, Position(second_code, 100, 10.0)))
+    gateway = FakeGateway()
+    extra = gateway.snapshot.frame.iloc[[0]].copy()
+    extra["code"] = second_code
+    gateway.snapshot = MarketDataset(
+        pd.concat([gateway.snapshot.frame, extra], ignore_index=True), "fixture", NOW
+    )
+    gateway.histories[second_code] = dataset(bars())
+    risk = Mock(side_effect=[{"状态": "正常"}, ValueError("bad")])
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, settings_loader=lambda: mixed, gateway=gateway, risk_evaluator=risk),
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["portfolio"].status == "partial"
+
+
+def test_redacted_manifest_has_no_private_body_hashes(tmp_path, deps) -> None:
+    result = run_report(ReportMode.PREMARKET, deps=deps, output_dir=tmp_path)
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+
+    assert "checksums" not in manifest
+
+
 def test_default_dependencies_bind_production_collaborative_modules_without_running_them() -> None:
     clock = Mock(return_value=NOW)
 
@@ -718,6 +951,51 @@ def test_default_dependencies_bind_production_collaborative_modules_without_runn
     assert isinstance(production.gateway, MarketDataGateway)
     assert production.gateway._clock is clock
     clock.assert_not_called()
+
+
+def test_production_mail_uses_sender_fallback_when_receivers_empty() -> None:
+    config = type(
+        "Config",
+        (),
+        {"email_sender": "sender@example.com", "email_password": "auth", "email_receivers": []},
+    )()
+    email_sender = Mock()
+    rendered = RenderedReport("subject", "<p>body</p>", "body")
+
+    with (
+        patch("src.config.get_config", return_value=config),
+        patch("src.notification_sender.email_sender.EmailSender", return_value=email_sender),
+        patch("src.collaborative_report.runner.send_with_retry", return_value=True) as send,
+    ):
+        assert _production_mail_sender(rendered) is True
+
+    send.assert_called_once_with(
+        email_sender,
+        html_content=rendered.html,
+        text_content=rendered.text,
+        subject=rendered.subject,
+        receivers=None,
+    )
+
+
+@pytest.mark.parametrize(("sender", "password"), [("", "auth"), ("sender@example.com", "")])
+def test_production_mail_rejects_missing_sender_or_password(sender, password) -> None:
+    from src.collaborative_report.runner import _DeliveryConfigurationError
+
+    config = type(
+        "Config",
+        (),
+        {"email_sender": sender, "email_password": password, "email_receivers": []},
+    )()
+
+    with (
+        patch("src.config.get_config", return_value=config),
+        patch("src.notification_sender.email_sender.EmailSender") as email_sender,
+        pytest.raises(_DeliveryConfigurationError, match="email configuration unavailable"),
+    ):
+        _production_mail_sender(RenderedReport("subject", "html", "text"))
+
+    email_sender.assert_not_called()
 
 
 def test_script_import_has_no_side_effect(monkeypatch) -> None:

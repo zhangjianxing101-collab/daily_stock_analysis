@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import logging
 from collections.abc import Iterable, Mapping
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from types import MappingProxyType
 from typing import Any
@@ -62,6 +64,36 @@ def _project(result: Any) -> Mapping[str, Any]:
     return MappingProxyType(values)
 
 
+class _StockCodeRedactionFilter(logging.Filter):
+    def __init__(self, codes: Iterable[str]) -> None:
+        super().__init__()
+        self._codes = tuple(codes)
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        message = record.getMessage()
+        for code in self._codes:
+            message = message.replace(code, "[redacted-stock]")
+        record.msg = message
+        record.args = ()
+        return True
+
+
+@contextmanager
+def _redact_pipeline_logs(codes: Iterable[str]):
+    redaction_filter = _StockCodeRedactionFilter(codes)
+    handlers = set(logging.getLogger().handlers)
+    for value in logging.root.manager.loggerDict.values():
+        if isinstance(value, logging.Logger):
+            handlers.update(value.handlers)
+    for handler in handlers:
+        handler.addFilter(redaction_filter)
+    try:
+        yield
+    finally:
+        for handler in handlers:
+            handler.removeFilter(redaction_filter)
+
+
 def create_pipeline():
     """Construct the production pipeline without loading it during module import."""
 
@@ -95,13 +127,14 @@ def enrich_codes(
 
     try:
         active_pipeline = create_pipeline() if pipeline is None else pipeline
-        results = active_pipeline.run(
-            stock_codes=unique_codes,
-            send_notification=False,
-            merge_notification=False,
-            current_time=timestamp,
-            save_report=False,
-        )
+        with _redact_pipeline_logs(unique_codes):
+            results = active_pipeline.run(
+                stock_codes=unique_codes,
+                send_notification=False,
+                merge_notification=False,
+                current_time=timestamp,
+                save_report=False,
+            )
         requested = set(unique_codes)
         successful: dict[str, Mapping[str, Any]] = {}
         unsuccessful: set[str] = set()

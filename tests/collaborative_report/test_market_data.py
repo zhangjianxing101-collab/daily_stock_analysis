@@ -182,6 +182,28 @@ def test_get_a_share_snapshot_calls_injected_provider_once() -> None:
     assert result.source == "akshare.stock_zh_a_spot_em"
     assert result.observed_at == OBSERVED_AT
     assert result.frame["code"].tolist() == ["000001"]
+    assert result.source_timestamp is None
+
+
+def test_get_a_share_snapshot_carries_authoritative_provider_timestamp() -> None:
+    raw = pd.DataFrame({"代码": ["000001"], "名称": ["A"], "最新价": [10]})
+    raw.attrs["source_timestamp"] = "2026-08-19T15:00:00+08:00"
+    gateway = MarketDataGateway(snapshot_fetcher=lambda: raw, clock=lambda: OBSERVED_AT)
+
+    result = gateway.get_a_share_snapshot()
+
+    assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+def test_get_a_share_snapshot_rejects_untrustworthy_provider_timestamp() -> None:
+    raw = pd.DataFrame({"代码": ["000001"], "名称": ["A"], "最新价": [10]})
+    raw.attrs["source_timestamp"] = "not-a-time"
+    gateway = MarketDataGateway(snapshot_fetcher=lambda: raw, clock=lambda: OBSERVED_AT)
+
+    result = gateway.get_a_share_snapshot()
+
+    assert result.source_timestamp is None
+    assert "snapshot source timestamp unavailable" in result.warnings
 
 
 def test_get_a_share_snapshot_rejects_empty_provider_response() -> None:
