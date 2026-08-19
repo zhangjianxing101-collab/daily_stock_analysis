@@ -45,7 +45,7 @@ def _parse_position(value: Any) -> Position:
     return Position(code=code, quantity=quantity, cost_price=float(cost_price))
 
 
-def _parse_portfolio() -> tuple[Position, ...]:
+def _parse_positions() -> tuple[Position, ...]:
     raw_value = os.environ.get("COLLAB_PORTFOLIO_JSON")
     if not raw_value:
         raise ValueError("COLLAB_PORTFOLIO_JSON is required")
@@ -61,7 +61,7 @@ def _parse_portfolio() -> tuple[Position, ...]:
 @dataclass(frozen=True)
 class CollaborativeSettings:
     capital_cny: float
-    portfolio: tuple[Position, ...]
+    positions: tuple[Position, ...]
     risk_fraction: float
     short_limit: int
     swing_limit: int
@@ -91,7 +91,7 @@ class CollaborativeSettings:
 
         return cls(
             capital_cny=capital_cny,
-            portfolio=_parse_portfolio(),
+            positions=_parse_positions(),
             risk_fraction=risk_fraction,
             short_limit=short_limit,
             swing_limit=swing_limit,

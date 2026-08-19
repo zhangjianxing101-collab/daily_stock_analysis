@@ -25,7 +25,7 @@ class Candidate:
     horizon: str
     score: float
     close: float
-    trigger: float
+    trigger: str
     stop_price: float
     target_price: float
     matched_rules: tuple[str, ...]

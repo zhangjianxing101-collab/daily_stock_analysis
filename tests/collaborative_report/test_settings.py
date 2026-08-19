@@ -2,6 +2,7 @@ import os
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from types import MappingProxyType
+from typing import get_type_hints
 from unittest.mock import patch
 
 import pytest
@@ -23,9 +24,9 @@ def test_from_env_parses_required_portfolio_and_defaults() -> None:
     settings = load_settings(COLLAB_CAPITAL_CNY="20000")
 
     assert settings.capital_cny == 20000
-    assert settings.portfolio[0].code == "600000"
-    assert settings.portfolio[0].quantity == 500
-    assert settings.portfolio[0].cost_price == 10.25
+    assert settings.positions[0].code == "600000"
+    assert settings.positions[0].quantity == 500
+    assert settings.positions[0].cost_price == 10.25
     assert settings.risk_fraction == 0.02
     assert settings.short_limit == 5
     assert settings.swing_limit == 5
@@ -146,7 +147,7 @@ def test_shared_models_are_frozen_and_expose_the_public_contracts() -> None:
         horizon="short",
         score=88.5,
         close=10.5,
-        trigger=10.6,
+        trigger="break above 10.60 with volume confirmation",
         stop_price=10.0,
         target_price=11.4,
         matched_rules=("volume_breakout",),
@@ -158,6 +159,7 @@ def test_shared_models_are_frozen_and_expose_the_public_contracts() -> None:
 
     assert ReportMode.PREMARKET.value == "premarket"
     assert ReportMode.POSTMARKET.value == "postmarket"
+    assert get_type_hints(Candidate)["trigger"] is str
     assert candidate.warning == ""
     assert result.warnings == ()
     with pytest.raises(FrozenInstanceError):
