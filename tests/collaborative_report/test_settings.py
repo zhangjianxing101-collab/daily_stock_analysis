@@ -1,3 +1,4 @@
+import json
 import os
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
@@ -74,7 +75,20 @@ def test_portfolio_must_be_a_required_non_empty_json_list(payload: str | None) -
     ],
 )
 def test_portfolio_position_validation(position: dict[str, object]) -> None:
-    import json
+    with pytest.raises(ValueError):
+        load_settings(COLLAB_PORTFOLIO_JSON=json.dumps([position]))
+
+
+def test_portfolio_rejects_non_ascii_six_character_numeric_code() -> None:
+    position = {"code": "\uff16\uff10\uff10\uff10\uff10\uff10", "quantity": 500, "cost_price": 10.25}
+
+    with pytest.raises(ValueError):
+        load_settings(COLLAB_PORTFOLIO_JSON=json.dumps([position]))
+
+
+@pytest.mark.parametrize("cost_price", [float("nan"), float("inf"), float("-inf")])
+def test_portfolio_rejects_non_finite_cost_price(cost_price: float) -> None:
+    position = {"code": "600000", "quantity": 500, "cost_price": cost_price}
 
     with pytest.raises(ValueError):
         load_settings(COLLAB_PORTFOLIO_JSON=json.dumps([position]))
