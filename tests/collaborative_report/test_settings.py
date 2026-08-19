@@ -94,6 +94,13 @@ def test_portfolio_rejects_non_finite_cost_price(cost_price: float) -> None:
         load_settings(COLLAB_PORTFOLIO_JSON=json.dumps([position]))
 
 
+def test_portfolio_rejects_oversized_integer_cost_price_as_value_error() -> None:
+    position = {"code": "600000", "quantity": 500, "cost_price": 10**400}
+
+    with pytest.raises(ValueError):
+        load_settings(COLLAB_PORTFOLIO_JSON=json.dumps([position]))
+
+
 @pytest.mark.parametrize("capital", ["0", "-1", "not-a-number"])
 def test_capital_must_be_positive_number(capital: str) -> None:
     with pytest.raises(ValueError):

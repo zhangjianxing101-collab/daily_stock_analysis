@@ -39,10 +39,16 @@ def _parse_position(value: Any) -> Position:
         raise ValueError("portfolio code must contain exactly six digits")
     if type(quantity) is not int or quantity <= 0 or quantity % 100 != 0:
         raise ValueError("portfolio quantity must be a positive multiple of 100")
-    if type(cost_price) not in (int, float) or not math.isfinite(cost_price) or cost_price <= 0:
+    if type(cost_price) not in (int, float):
+        raise ValueError("portfolio cost_price must be a positive finite number")
+    try:
+        normalized_cost_price = float(cost_price)
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("portfolio cost_price must be a positive finite number") from exc
+    if not math.isfinite(normalized_cost_price) or normalized_cost_price <= 0:
         raise ValueError("portfolio cost_price must be a positive finite number")
 
-    return Position(code=code, quantity=quantity, cost_price=float(cost_price))
+    return Position(code=code, quantity=quantity, cost_price=normalized_cost_price)
 
 
 def _parse_positions() -> tuple[Position, ...]:
