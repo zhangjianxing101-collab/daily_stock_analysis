@@ -226,6 +226,25 @@ def test_ineligible_snapshot_rows_are_excluded() -> None:
     assert [candidate.code for candidate in result.short_term] == ["000016"]
 
 
+def test_snapshot_missing_volume_column_is_ineligible() -> None:
+    snapshot = pd.DataFrame([snapshot_row("000017")]).drop(columns="volume")
+
+    result = screen_aggressive(snapshot, {"000017": bars()}, {}, observed_at=OBSERVED_AT)
+
+    assert result.short_term == ()
+    assert result.swing == ()
+
+
+@pytest.mark.parametrize("volume", [np.nan, 0.0, -1.0])
+def test_nonfinite_or_nonpositive_snapshot_volume_is_ineligible(volume: float) -> None:
+    snapshot = pd.DataFrame([snapshot_row("000018", volume=volume)])
+
+    result = screen_aggressive(snapshot, {"000018": bars()}, {}, observed_at=OBSERVED_AT)
+
+    assert result.short_term == ()
+    assert result.swing == ()
+
+
 def test_limit_up_is_never_actionable_and_only_fills_unused_capacity() -> None:
     snapshot = pd.DataFrame(
         [

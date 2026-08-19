@@ -13,7 +13,7 @@ from .market_data import MarketDataset
 from .models import Candidate
 
 
-_SNAPSHOT_REQUIRED = ("code", "name", "price", "change_pct", "volume_ratio", "turnover", "amount")
+_SNAPSHOT_REQUIRED = ("code", "name", "price", "change_pct", "volume_ratio", "turnover", "amount", "volume")
 _BAR_ALIASES = {
     "date": ("date", "Date", "日期", "时间"),
     "open": ("open", "Open", "开盘"),
@@ -83,9 +83,8 @@ def _eligible_snapshot(frame: pd.DataFrame) -> pd.DataFrame:
         valid &= np.isfinite(eligible[column])
     valid &= (eligible["price"] > 0) & (eligible["amount"] >= 50_000_000)
 
-    if "volume" in eligible.columns:
-        eligible["volume"] = pd.to_numeric(eligible["volume"], errors="coerce")
-        valid &= np.isfinite(eligible["volume"]) & (eligible["volume"] > 0)
+    eligible["volume"] = pd.to_numeric(eligible["volume"], errors="coerce")
+    valid &= np.isfinite(eligible["volume"]) & (eligible["volume"] > 0)
 
     eligible = eligible.loc[valid].copy()
     eligible["code"] = code.loc[valid].astype(str)
