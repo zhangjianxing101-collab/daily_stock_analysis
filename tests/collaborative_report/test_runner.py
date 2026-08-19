@@ -1,4 +1,5 @@
 import json
+import runpy
 from dataclasses import replace
 from datetime import date, datetime
 from pathlib import Path
@@ -8,21 +9,26 @@ from zoneinfo import ZoneInfo
 import pandas as pd
 import pytest
 
+from src.collaborative_report.ai_bridge import enrich_codes
+from src.collaborative_report.backtest import backtest_breakout, backtest_swing
 from src.collaborative_report.gold import analyze_gold
-from src.collaborative_report.market_data import MarketDataset
+from src.collaborative_report.market_data import MarketDataGateway, MarketDataset
 from src.collaborative_report.models import Candidate, ModuleResult, Position, ReportMode
-from src.collaborative_report.report import RenderedReport
+from src.collaborative_report.report import RenderedReport, render_report
+from src.collaborative_report.risk import evaluate_position, suggested_board_lots
 from src.collaborative_report.runner import (
     EXIT_FAILURE,
     EXIT_SUCCESS,
+    SNAPSHOT_DAILY_CLOSE_TOLERANCE,
     FinalState,
     RunnerDependencies,
     classify_prior_candidates,
+    default_dependencies,
     run_report,
     write_report_artifacts,
 )
-from src.collaborative_report.screener import ScreeningResult
-from src.collaborative_report.session import ReportSession
+from src.collaborative_report.screener import ScreeningResult, screen_aggressive
+from src.collaborative_report.session import ReportSession, build_report_session, report_data_session
 from src.collaborative_report.settings import CollaborativeSettings
 
 
@@ -100,7 +106,7 @@ class FakeGateway:
         )
         self.histories = {
             PORTFOLIO_CODE: dataset(bars()),
-            CANDIDATE_CODE: dataset(bars()),
+            CANDIDATE_CODE: dataset(bars(high=10.6, close=10.5)),
         }
 
     def get_a_share_snapshot(self):
@@ -159,6 +165,7 @@ def deps(settings) -> RunnerDependencies:
         ai_enricher=lambda codes, **kwargs: ModuleResult("ai", "ok", NOW, {"count": len(tuple(codes))}),
         renderer=renderer,
         mail_sender=mailer,
+        data_session_resolver=lambda mode, report_date, generated_at: report_date,
     )
 
 
@@ -261,6 +268,54 @@ def test_force_does_not_accept_stale_snapshot_or_create_action_levels(tmp_path, 
     assert result.modules["screening"].status == "unavailable"
     assert not result.short_term_candidates
     sizing_evaluator.assert_not_called()
+
+
+def test_material_snapshot_history_conflict_forces_watch_and_suppresses_risk_and_sizing(
+    tmp_path, deps, settings
+) -> None:
+    conflict_settings = replace(settings, positions=(Position(CANDIDATE_CODE, 100, 10.0),))
+    gateway = FakeGateway()
+    gateway.snapshot.frame.loc[gateway.snapshot.frame["code"] == CANDIDATE_CODE, "price"] = 11.0
+    risk_evaluator = Mock(return_value={"状态": "正常"})
+    sizing_evaluator = Mock(return_value=100)
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(
+            deps,
+            settings_loader=lambda: conflict_settings,
+            gateway=gateway,
+            risk_evaluator=risk_evaluator,
+            sizing_evaluator=sizing_evaluator,
+        ),
+        output_dir=tmp_path,
+    )
+
+    assert SNAPSHOT_DAILY_CLOSE_TOLERANCE == 0.01
+    assert "snapshot_daily_close_conflict" in result.modules["market"].warnings
+    assert result.modules["market"].status == "partial"
+    assert result.short_term_candidates[0].warning == "价格来源冲突，仅供观望"
+    assert deps.renderer.call_args.kwargs["short_term_candidates"][0].warning == "价格来源冲突，仅供观望"
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert "snapshot_daily_close_conflict" in manifest["warning_codes"]
+    risk_evaluator.assert_not_called()
+    sizing_evaluator.assert_not_called()
+
+
+def test_snapshot_history_price_within_tolerance_remains_actionable(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.snapshot.frame.loc[gateway.snapshot.frame["code"] == CANDIDATE_CODE, "price"] = 10.59
+    sizing_evaluator = Mock(return_value=100)
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway, sizing_evaluator=sizing_evaluator),
+        output_dir=tmp_path,
+    )
+
+    assert "snapshot_daily_close_conflict" not in result.modules["market"].warnings
+    assert result.short_term_candidates[0].warning == ""
+    sizing_evaluator.assert_called_once()
 
 
 def test_inconsistent_session_identity_fails_closed(tmp_path, deps) -> None:
@@ -419,6 +474,9 @@ def test_postmarket_ingests_prior_manifest_and_classifies_all_statuses(tmp_path,
             {
                 "schema_version": 1,
                 "mode": "premarket",
+                "trading_date": "2026-08-19",
+                "report_key": "2026-08-19-premarket",
+                "generated_at": "2026-08-19T09:00:00+08:00",
                 "candidate_state": [
                     {"code": "600001", "name": "触发", "trigger_price": 10.5, "stop_price": 9.8},
                     {"code": "600002", "name": "失效", "trigger_price": 10.5, "stop_price": 9.8},
@@ -448,6 +506,82 @@ def test_postmarket_ingests_prior_manifest_and_classifies_all_statuses(tmp_path,
     assert [row["status"] for row in result.morning_candidates] == ["触发", "失效", "继续观察"]
     assert deps.renderer.call_args.kwargs["morning_candidates"] == result.morning_candidates
     assert result.modules["morning_candidates"].status == "ok"
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"trading_date": "2026-08-18", "report_key": "2026-08-18-premarket"},
+        {"report_key": "2026-08-19-postmarket"},
+        {"generated_at": "2026-08-19T09:00:00"},
+        {"generated_at": "not-a-timestamp"},
+        {"generated_at": "2026-08-18T15:30:00+00:00"},
+    ],
+)
+def test_prior_state_wrong_session_identity_or_timestamp_degrades_without_guessing(
+    tmp_path, deps, overrides
+) -> None:
+    payload = {
+        "schema_version": 1,
+        "mode": "premarket",
+        "trading_date": "2026-08-19",
+        "report_key": "2026-08-19-premarket",
+        "generated_at": "2026-08-19T09:00:00+08:00",
+        "candidate_state": [
+            {"code": "600002", "name": "旧候选", "trigger_price": 10.5, "stop_price": 9.8}
+        ],
+    }
+    payload.update(overrides)
+    prior = tmp_path / "prior.json"
+    prior.write_text(json.dumps(payload), encoding="utf-8")
+    gateway = FakeGateway()
+    gateway.get_daily_bars = Mock(wraps=gateway.get_daily_bars)
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        prior_report=prior,
+        output_dir=tmp_path / "out",
+    )
+
+    assert result.modules["morning_candidates"].status == "unavailable"
+    assert result.morning_candidates == ()
+    assert all(call.args[0] != "600002" for call in gateway.get_daily_bars.call_args_list)
+
+
+def test_prior_candidate_history_is_fetched_once_before_screening(tmp_path, deps) -> None:
+    prior = tmp_path / "prior.json"
+    prior.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "mode": "premarket",
+                "trading_date": "2026-08-19",
+                "report_key": "2026-08-19-premarket",
+                "generated_at": "2026-08-19T01:00:00+00:00",
+                "candidate_state": [
+                    {"code": "600002", "name": "旧候选", "trigger_price": 10.5, "stop_price": 9.8}
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+    gateway = FakeGateway()
+    gateway.histories["600002"] = dataset(bars(high=10.6, low=10.0))
+    gateway.get_daily_bars = Mock(wraps=gateway.get_daily_bars)
+    screener = Mock(return_value=ScreeningResult((candidate(),), ()))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway, screener=screener),
+        prior_report=prior,
+        output_dir=tmp_path / "out",
+    )
+
+    histories_at_screen = screener.call_args.args[1]
+    assert "600002" in histories_at_screen
+    assert [call.args[0] for call in gateway.get_daily_bars.call_args_list].count("600002") == 1
+    assert result.morning_candidates[0]["status"] == "触发"
 
 
 @pytest.mark.parametrize("content", [None, "not json", '{"schema_version":99}'])
@@ -563,3 +697,35 @@ def test_settings_privacy_failure_is_closed_without_secret_in_result(tmp_path, d
     assert result.exit_code == EXIT_FAILURE
     assert result.error_code == "configuration_invalid"
     assert PORTFOLIO_CODE not in json.dumps(result.to_public_dict())
+
+
+def test_default_dependencies_bind_production_collaborative_modules_without_running_them() -> None:
+    clock = Mock(return_value=NOW)
+
+    production = default_dependencies(clock=clock)
+
+    assert production.settings_loader == CollaborativeSettings.from_env
+    assert production.session_builder is build_report_session
+    assert production.data_session_resolver is report_data_session
+    assert production.screener is screen_aggressive
+    assert production.risk_evaluator is evaluate_position
+    assert production.sizing_evaluator is suggested_board_lots
+    assert production.short_backtest is backtest_breakout
+    assert production.swing_backtest is backtest_swing
+    assert production.gold_analyzer is analyze_gold
+    assert production.ai_enricher is enrich_codes
+    assert production.renderer is render_report
+    assert isinstance(production.gateway, MarketDataGateway)
+    assert production.gateway._clock is clock
+    clock.assert_not_called()
+
+
+def test_script_import_has_no_side_effect(monkeypatch) -> None:
+    cli_main = Mock()
+    monkeypatch.setattr("src.collaborative_report.cli.main", cli_main)
+    script = Path(__file__).resolve().parents[2] / "scripts" / "run_collaborative_report.py"
+
+    namespace = runpy.run_path(str(script), run_name="collaborative_report_entrypoint_test")
+
+    assert namespace["main"] is cli_main
+    cli_main.assert_not_called()

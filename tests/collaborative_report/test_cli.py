@@ -1,3 +1,6 @@
+import json
+import subprocess
+import sys
 from pathlib import Path
 from unittest.mock import Mock
 
@@ -46,8 +49,12 @@ def test_cli_passes_all_task_9_arguments_and_returns_success(tmp_path, capsys) -
         output_dir=tmp_path,
     )
     output = capsys.readouterr().out
-    assert "2026-08-19-premarket" in output
-    assert "duplicate_skip" in output
+    assert json.loads(output) == {
+        "report_key": "2026-08-19-premarket",
+        "module_statuses": {},
+        "artifact_path": None,
+        "final_state": "duplicate_skip",
+    }
 
 
 @pytest.mark.parametrize(
@@ -84,3 +91,20 @@ def test_cli_rejects_premarket_prior_report_without_calling_runner(tmp_path) -> 
 
     assert error.value.code == 2
     runner.assert_not_called()
+
+
+def test_repository_entrypoint_help_executes_without_running_report() -> None:
+    root = Path(__file__).resolve().parents[2]
+    completed = subprocess.run(
+        [sys.executable, str(root / "scripts" / "run_collaborative_report.py"), "--help"],
+        cwd=root,
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    assert completed.returncode == 0
+    assert "--mode {premarket,postmarket}" in completed.stdout
+    assert "--already-sent" in completed.stdout
+    assert completed.stderr == ""

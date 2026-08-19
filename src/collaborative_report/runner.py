@@ -7,7 +7,7 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass, field, fields, is_dataclass
+from dataclasses import dataclass, field, fields, is_dataclass, replace
 from datetime import date, datetime
 from enum import Enum
 from pathlib import Path
@@ -24,7 +24,7 @@ from .models import Candidate, ModuleResult, Position, ReportMode
 from .report import RenderedReport, render_report
 from .risk import evaluate_position, suggested_board_lots
 from .screener import ScreeningResult, prefilter_universe, screen_aggressive
-from .session import ReportSession, build_report_session, report_data_session
+from .session import SHANGHAI_TIMEZONE, ReportSession, build_report_session, report_data_session
 from .settings import CollaborativeSettings
 
 
@@ -33,7 +33,10 @@ from .settings import CollaborativeSettings
 EXIT_SUCCESS = 0
 EXIT_FAILURE = 1
 MANIFEST_SCHEMA_VERSION = 1
+SNAPSHOT_DAILY_CLOSE_TOLERANCE = 0.01
 _TEST_SUBJECT_PREFIX = "测试"
+_PRICE_CONFLICT_WARNING_CODE = "snapshot_daily_close_conflict"
+_PRICE_CONFLICT_CANDIDATE_WARNING = "价格来源冲突，仅供观望"
 
 
 class FinalState(str, Enum):
@@ -77,7 +80,6 @@ class RunResult:
             "module_statuses": {name: result.status for name, result in self.modules.items()},
             "artifact_path": str(self.manifest_path) if self.manifest_path else None,
             "final_state": self.final_state.value,
-            "error_code": self.error_code,
         }
 
 
@@ -207,6 +209,49 @@ def _portfolio_prices(snapshot: MarketDataset, positions: Sequence[Position]) ->
     return prices
 
 
+def _snapshot_history_conflicts(
+    snapshot: MarketDataset,
+    histories: Mapping[str, MarketDataset],
+    *,
+    expected_session: date,
+) -> set[str]:
+    if "code" not in snapshot.frame or "price" not in snapshot.frame:
+        return set()
+    conflicts: set[str] = set()
+    for _, row in snapshot.frame.iterrows():
+        code = str(row["code"])
+        history = histories.get(code)
+        bar = _last_session_bar(history, expected_session) if history is not None else None
+        if bar is None:
+            continue
+        try:
+            snapshot_price = float(row["price"])
+            history_close = float(bar["close"])
+        except (KeyError, TypeError, ValueError, OverflowError):
+            continue
+        if not all(math.isfinite(value) and value > 0 for value in (snapshot_price, history_close)):
+            continue
+        relative_difference = abs(snapshot_price - history_close) / history_close
+        if relative_difference > SNAPSHOT_DAILY_CLOSE_TOLERANCE:
+            conflicts.add(code)
+    return conflicts
+
+
+def _suppress_conflicting_candidates(
+    candidates: Sequence[Candidate], conflict_codes: set[str]
+) -> tuple[Candidate, ...]:
+    return tuple(
+        replace(
+            item,
+            trigger="观望：价格来源冲突",
+            warning=_PRICE_CONFLICT_CANDIDATE_WARNING,
+        )
+        if item.code in conflict_codes
+        else item
+        for item in candidates
+    )
+
+
 def _last_session_bar(dataset: MarketDataset, expected_session: date) -> pd.Series | None:
     frame = dataset.frame
     if not isinstance(frame, pd.DataFrame) or frame.empty or "date" not in frame:
@@ -260,7 +305,7 @@ def classify_prior_candidates(
     return tuple(rows)
 
 
-def _load_prior_state(path: Path | None) -> tuple[Mapping[str, Any], ...]:
+def _load_prior_state(path: Path | None, session: ReportSession) -> tuple[Mapping[str, Any], ...]:
     if path is None:
         raise ValueError("prior state unavailable")
     try:
@@ -269,7 +314,26 @@ def _load_prior_state(path: Path | None) -> tuple[Mapping[str, Any], ...]:
         raise ValueError("prior state unavailable") from None
     if not isinstance(payload, dict) or payload.get("schema_version") != MANIFEST_SCHEMA_VERSION:
         raise ValueError("prior state unavailable")
-    if payload.get("mode") != ReportMode.PREMARKET.value or not isinstance(payload.get("candidate_state"), list):
+    expected_date = session.trading_date.isoformat()
+    if (
+        payload.get("mode") != ReportMode.PREMARKET.value
+        or payload.get("trading_date") != expected_date
+        or payload.get("report_key") != f"{expected_date}-{ReportMode.PREMARKET.value}"
+        or not isinstance(payload.get("candidate_state"), list)
+    ):
+        raise ValueError("prior state unavailable")
+    generated_at_raw = payload.get("generated_at")
+    if not isinstance(generated_at_raw, str):
+        raise ValueError("prior state unavailable")
+    try:
+        generated_at = datetime.fromisoformat(generated_at_raw)
+    except ValueError:
+        raise ValueError("prior state unavailable") from None
+    if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+        raise ValueError("prior state unavailable")
+    if generated_at.astimezone(SHANGHAI_TIMEZONE).date() != session.trading_date:
+        raise ValueError("prior state unavailable")
+    if generated_at > session.now_shanghai:
         raise ValueError("prior state unavailable")
     rows: list[Mapping[str, Any]] = []
     for item in payload["candidate_state"]:
@@ -327,8 +391,12 @@ def _checksum(value: str) -> str:
 def _warning_codes(modules: Mapping[str, ModuleResult]) -> list[str]:
     codes: list[str] = []
     for name, result in modules.items():
-        for index, _warning in enumerate(result.warnings, start=1):
-            codes.append(f"{name}_warning_{index}")
+        for index, warning in enumerate(result.warnings, start=1):
+            codes.append(
+                warning
+                if warning == _PRICE_CONFLICT_WARNING_CODE
+                else f"{name}_warning_{index}"
+            )
     return codes
 
 
@@ -336,7 +404,11 @@ def _candidate_state(candidates: Sequence[Candidate], portfolio_codes: set[str])
     state: list[dict[str, Any]] = []
     seen: set[str] = set()
     for item in candidates:
-        if item.code in portfolio_codes or item.code in seen:
+        if (
+            item.code in portfolio_codes
+            or item.code in seen
+            or item.warning == _PRICE_CONFLICT_CANDIDATE_WARNING
+        ):
             continue
         seen.add(item.code)
         state.append(
@@ -457,7 +529,10 @@ def run_report(
     prior_candidates: tuple[Mapping[str, Any], ...] = ()
     if normalized_mode is ReportMode.POSTMARKET:
         try:
-            prior_candidates = _load_prior_state(Path(prior_report) if prior_report is not None else None)
+            prior_candidates = _load_prior_state(
+                Path(prior_report) if prior_report is not None else None,
+                session,
+            )
         except Exception:
             modules["morning_candidates"] = _unavailable(
                 "morning_candidates", session.now_shanghai, "早盘候选状态不可用"
@@ -491,7 +566,8 @@ def run_report(
             prefiltered_codes = [str(code) for code in prefiltered.get("code", ())]
         except Exception:
             prefiltered_codes = []
-    requested_codes = tuple(dict.fromkeys((*prefiltered_codes, *portfolio_codes)))
+    prior_codes = tuple(str(item["code"]) for item in prior_candidates)
+    requested_codes = tuple(dict.fromkeys((*prefiltered_codes, *portfolio_codes, *prior_codes)))
     histories: dict[str, MarketDataset] = {}
     history_failures = 0
     for code in requested_codes:
@@ -499,6 +575,22 @@ def run_report(
             histories[code] = active.gateway.get_daily_bars(code, expected_session)
         except Exception:
             history_failures += 1
+
+    conflict_codes = (
+        _snapshot_history_conflicts(snapshot, histories, expected_session=expected_session)
+        if snapshot is not None
+        else set()
+    )
+    if conflict_codes:
+        market = modules["market"]
+        modules["market"] = ModuleResult(
+            market.name,
+            "partial",
+            market.observed_at,
+            market.payload,
+            (*market.warnings, _PRICE_CONFLICT_WARNING_CODE),
+        )
+        prices = {code: price for code, price in prices.items() if code not in conflict_codes}
 
     leading: dict[str, str] = {}
     try:
@@ -524,6 +616,11 @@ def run_report(
                 swing_limit=settings.swing_limit,
                 prefilter_limit=settings.screen_prefilter,
                 observed_at=session.now_shanghai,
+            )
+            screening = ScreeningResult(
+                _suppress_conflicting_candidates(screening.short_term, conflict_codes),
+                _suppress_conflicting_candidates(screening.swing, conflict_codes),
+                screening.warnings,
             )
             status = "partial" if history_failures or screening.warnings else "ok"
             modules["screening"] = ModuleResult(
@@ -636,12 +733,6 @@ def run_report(
 
     morning_candidates: tuple[Mapping[str, Any], ...] = ()
     if normalized_mode is ReportMode.POSTMARKET and prior_candidates:
-        for code in (str(item["code"]) for item in prior_candidates):
-            if code not in histories:
-                try:
-                    histories[code] = active.gateway.get_daily_bars(code, expected_session)
-                except Exception:
-                    pass
         morning_candidates = classify_prior_candidates(
             prior_candidates,
             histories,
