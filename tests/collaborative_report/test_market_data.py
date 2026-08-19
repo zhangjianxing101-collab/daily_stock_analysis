@@ -1,5 +1,6 @@
 from datetime import date, datetime, timezone
 from unittest.mock import Mock, call
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -123,6 +124,25 @@ def test_validate_daily_bars_rejects_invalid_ohlcv(column: str, value: float, me
         validate_daily_bars(frame, SESSION)
 
 
+@pytest.mark.parametrize(
+    "updates",
+    [
+        {"High": 8.0, "Low": 9.0},
+        {"High": 10.0, "Open": 11.0},
+        {"High": 10.0, "Close": 11.0},
+        {"Low": 12.0, "Open": 11.0},
+        {"Low": 12.0, "Close": 11.0},
+    ],
+)
+def test_validate_daily_bars_rejects_impossible_ohlc(updates: dict[str, float]) -> None:
+    frame = daily_bars()
+    for column, value in updates.items():
+        frame.loc[10, column] = value
+
+    with pytest.raises(ValueError, match="^daily bars invalid ohlc$"):
+        validate_daily_bars(frame, SESSION)
+
+
 def test_validate_daily_bars_normalizes_chinese_columns_and_returns_new_ascending_frame() -> None:
     original = daily_bars().rename(
         columns={
@@ -163,6 +183,17 @@ def test_get_a_share_snapshot_rejects_empty_provider_response() -> None:
         gateway.get_a_share_snapshot()
 
 
+def test_get_a_share_snapshot_wraps_provider_failure() -> None:
+    failure = RuntimeError("https://feed.invalid/?token=secret")
+    gateway = MarketDataGateway(snapshot_fetcher=Mock(side_effect=failure))
+
+    with pytest.raises(ValueError, match="^snapshot provider unavailable$") as caught:
+        gateway.get_a_share_snapshot()
+
+    assert caught.value.__cause__ is failure
+    assert "secret" not in str(caught.value)
+
+
 def test_get_daily_bars_calls_injected_manager_and_preserves_source() -> None:
     fetcher = Mock(return_value=(daily_bars(), "test-source"))
     gateway = MarketDataGateway(daily_fetcher=fetcher, clock=lambda: OBSERVED_AT)
@@ -179,6 +210,17 @@ def test_get_daily_bars_rejects_empty_provider_response() -> None:
 
     with pytest.raises(ValueError, match="^daily provider returned empty data$"):
         gateway.get_daily_bars("000001", expected_session=SESSION)
+
+
+def test_get_daily_bars_wraps_provider_failure() -> None:
+    failure = RuntimeError("https://feed.invalid/?token=secret")
+    gateway = MarketDataGateway(daily_fetcher=Mock(side_effect=failure))
+
+    with pytest.raises(ValueError, match="^daily provider unavailable$") as caught:
+        gateway.get_daily_bars("000001", expected_session=SESSION)
+
+    assert caught.value.__cause__ is failure
+    assert "secret" not in str(caught.value)
 
 
 def test_get_leading_sector_codes_calls_top_boards_and_returns_partial_map() -> None:
@@ -224,6 +266,20 @@ def test_get_leading_sector_codes_warns_without_leaking_partial_failure() -> Non
     assert "secret" not in " ".join(result.warnings)
 
 
+def test_get_leading_sector_codes_wraps_sector_list_failure() -> None:
+    failure = RuntimeError("https://feed.invalid/?token=secret")
+    gateway = MarketDataGateway(
+        sector_names_fetcher=Mock(side_effect=failure),
+        sector_members_fetcher=Mock(),
+    )
+
+    with pytest.raises(ValueError, match="^sector provider unavailable$") as caught:
+        gateway.get_leading_sector_codes()
+
+    assert caught.value.__cause__ is failure
+    assert "secret" not in str(caught.value)
+
+
 def global_download_frame(*, multi_index: bool) -> pd.DataFrame:
     symbols = ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F"]
     dates = pd.to_datetime(["2026-08-17", "2026-08-18"])
@@ -247,6 +303,7 @@ def test_get_global_snapshot_supports_simple_and_multiindex_closes(multi_index: 
         interval="1d",
         auto_adjust=False,
         progress=False,
+        timeout=15,
     )
     assert result.frame["symbol"].tolist() == ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F"]
     assert result.frame["change_pct"].tolist() == pytest.approx([2.0] * 6)
@@ -260,6 +317,17 @@ def test_get_global_snapshot_rejects_empty_provider_response() -> None:
         gateway.get_global_snapshot()
 
 
+def test_get_global_snapshot_wraps_yahoo_failure() -> None:
+    failure = RuntimeError("https://query.invalid/?crumb=secret")
+    gateway = MarketDataGateway(yfinance_download=Mock(side_effect=failure), clock=lambda: OBSERVED_AT)
+
+    with pytest.raises(ValueError, match="^global provider unavailable$") as caught:
+        gateway.get_global_snapshot()
+
+    assert caught.value.__cause__ is failure
+    assert "secret" not in str(caught.value)
+
+
 def test_get_global_snapshot_ignores_same_day_incomplete_close() -> None:
     frame = global_download_frame(multi_index=False)
     frame.loc[pd.Timestamp("2026-08-19")] = [999.0] * len(frame.columns)
@@ -271,13 +339,70 @@ def test_get_global_snapshot_ignores_same_day_incomplete_close() -> None:
     assert result.frame["as_of_date"].tolist() == [date(2026, 8, 18)] * 6
 
 
+def test_get_global_snapshot_uses_symbol_specific_close_cutoffs() -> None:
+    frame = global_download_frame(multi_index=False)
+    frame.loc[pd.Timestamp("2026-08-19")] = [104.0] * len(frame.columns)
+    frame = frame.sort_index()
+
+    before_equity_close = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: frame,
+        clock=lambda: datetime(2026, 8, 19, 20, 14, tzinfo=timezone.utc),
+    ).get_global_snapshot()
+    after_equity_close = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: frame,
+        clock=lambda: datetime(2026, 8, 19, 20, 16, tzinfo=timezone.utc),
+    ).get_global_snapshot()
+    after_futures_close = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: frame,
+        clock=lambda: datetime(2026, 8, 19, 21, 16, tzinfo=timezone.utc),
+    ).get_global_snapshot()
+
+    assert before_equity_close.frame.set_index("symbol")["close"].to_dict() == {
+        symbol: 102.0 for symbol in ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F"]
+    }
+    after_equity = after_equity_close.frame.set_index("symbol")["close"].to_dict()
+    assert after_equity["^GSPC"] == 104.0
+    assert after_equity["^IXIC"] == 104.0
+    assert after_equity["^DJI"] == 104.0
+    assert after_equity["GC=F"] == 102.0
+    assert after_equity["HG=F"] == 102.0
+    assert after_equity["CL=F"] == 102.0
+    assert after_futures_close.frame["close"].tolist() == [104.0] * 6
+
+
+def test_get_global_snapshot_is_invariant_to_observation_timezone() -> None:
+    frame = global_download_frame(multi_index=False)
+    frame.loc[pd.Timestamp("2026-08-19")] = [104.0] * len(frame.columns)
+    instant_utc = datetime(2026, 8, 19, 21, 16, tzinfo=timezone.utc)
+    instant_shanghai = instant_utc.astimezone(ZoneInfo("Asia/Shanghai"))
+
+    utc_result = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: frame,
+        clock=lambda: instant_utc,
+    ).get_global_snapshot()
+    shanghai_result = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: frame,
+        clock=lambda: instant_shanghai,
+    ).get_global_snapshot()
+
+    pd.testing.assert_frame_equal(utc_result.frame, shanghai_result.frame)
+    assert utc_result.observed_at == shanghai_result.observed_at
+
+
 def test_get_gold_bars_calls_yfinance_and_normalizes_ohlcv() -> None:
-    download = Mock(return_value=daily_bars())
+    download = Mock(return_value=daily_bars(end="2026-08-18"))
     gateway = MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT)
 
     result = gateway.get_gold_bars()
 
-    download.assert_called_once_with("GC=F", period="10y", interval="1d", auto_adjust=False, progress=False)
+    download.assert_called_once_with(
+        "GC=F",
+        period="10y",
+        interval="1d",
+        auto_adjust=False,
+        progress=False,
+        timeout=15,
+    )
     assert result == MarketDataset(
         frame=result.frame,
         source="yfinance:GC=F",
@@ -291,6 +416,61 @@ def test_get_gold_bars_rejects_empty_provider_response() -> None:
 
     with pytest.raises(ValueError, match="^gold provider returned empty data$"):
         gateway.get_gold_bars()
+
+
+def test_get_gold_bars_wraps_yahoo_failure() -> None:
+    failure = RuntimeError("https://query.invalid/?crumb=secret")
+    gateway = MarketDataGateway(yfinance_download=Mock(side_effect=failure), clock=lambda: OBSERVED_AT)
+
+    with pytest.raises(ValueError, match="^gold provider unavailable$") as caught:
+        gateway.get_gold_bars()
+
+    assert caught.value.__cause__ is failure
+    assert "secret" not in str(caught.value)
+
+
+@pytest.mark.parametrize(
+    ("mutate", "message"),
+    [
+        (lambda frame: frame.iloc[:59], "daily bars insufficient"),
+        (lambda frame: pd.concat([frame.iloc[:-1], frame.iloc[[-2]]], ignore_index=True), "daily bars duplicate dates"),
+        (
+            lambda frame: frame.assign(
+                Date=[*frame["Date"].iloc[:10], frame.loc[11, "Date"], frame.loc[10, "Date"], *frame["Date"].iloc[12:]]
+            ),
+            "daily bars non-monotonic dates",
+        ),
+        (lambda frame: frame.assign(High=frame["Low"] - 1.0), "daily bars invalid ohlc"),
+        (lambda frame: frame.assign(Volume=-1.0), "daily bars invalid volume"),
+    ],
+)
+def test_get_gold_bars_rejects_invalid_history(mutate, message: str) -> None:
+    frame = daily_bars(end="2026-08-18")
+    gateway = MarketDataGateway(yfinance_download=lambda *args, **kwargs: mutate(frame), clock=lambda: OBSERVED_AT)
+
+    with pytest.raises(ValueError, match=f"^{message}$"):
+        gateway.get_gold_bars()
+
+
+def test_get_gold_bars_rejects_incomplete_row_before_futures_cutoff() -> None:
+    gateway = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: daily_bars(end="2026-08-19"),
+        clock=lambda: datetime(2026, 8, 19, 21, 14, tzinfo=timezone.utc),
+    )
+
+    with pytest.raises(ValueError, match="^daily bars future dates$"):
+        gateway.get_gold_bars()
+
+
+def test_get_gold_bars_accepts_local_date_after_futures_cutoff() -> None:
+    gateway = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: daily_bars(end="2026-08-19"),
+        clock=lambda: datetime(2026, 8, 19, 21, 16, tzinfo=timezone.utc),
+    )
+
+    result = gateway.get_gold_bars()
+
+    assert result.frame.iloc[-1]["date"].date() == date(2026, 8, 19)
 
 
 def test_market_dataset_requires_timezone_aware_observation() -> None:

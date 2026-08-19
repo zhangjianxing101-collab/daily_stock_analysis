@@ -3,8 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, time, timedelta, timezone
 from typing import Callable
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -39,6 +40,17 @@ _BAR_ALIASES = {
     "volume": ("volume", "Volume", "成交量"),
 }
 _GLOBAL_SYMBOLS = ("^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F")
+_NEW_YORK = ZoneInfo("America/New_York")
+_EQUITY_CLOSE_CUTOFF = time(16, 15)
+_FUTURES_CLOSE_CUTOFF = time(17, 15)
+_SYMBOL_CLOSE_CUTOFFS = {
+    "^GSPC": _EQUITY_CLOSE_CUTOFF,
+    "^IXIC": _EQUITY_CLOSE_CUTOFF,
+    "^DJI": _EQUITY_CLOSE_CUTOFF,
+    "GC=F": _FUTURES_CLOSE_CUTOFF,
+    "HG=F": _FUTURES_CLOSE_CUTOFF,
+    "CL=F": _FUTURES_CLOSE_CUTOFF,
+}
 
 
 @dataclass(frozen=True)
@@ -152,14 +164,28 @@ def _validate_bar_values(frame: pd.DataFrame) -> None:
     ohlc = frame.loc[:, ["open", "high", "low", "close"]].to_numpy(dtype=float)
     if not np.isfinite(ohlc).all() or (ohlc <= 0).any():
         raise ValueError("daily bars invalid ohlc")
+    open_values = frame["open"].to_numpy(dtype=float)
+    high_values = frame["high"].to_numpy(dtype=float)
+    low_values = frame["low"].to_numpy(dtype=float)
+    close_values = frame["close"].to_numpy(dtype=float)
+    if (
+        (high_values < low_values).any()
+        or (high_values < np.maximum(open_values, close_values)).any()
+        or (low_values > np.minimum(open_values, close_values)).any()
+    ):
+        raise ValueError("daily bars invalid ohlc")
     volume = frame["volume"].to_numpy(dtype=float)
     if not np.isfinite(volume).all() or (volume < 0).any():
         raise ValueError("daily bars invalid volume")
 
 
-def validate_daily_bars(frame: pd.DataFrame, expected_session: date, *, min_rows: int = 60) -> pd.DataFrame:
-    """Validate a complete daily series and return a new ascending frame."""
-
+def _validate_bar_series(
+    frame: pd.DataFrame,
+    *,
+    min_rows: int,
+    latest_allowed: date,
+    required_latest: date | None = None,
+) -> pd.DataFrame:
     normalized = _normalize_bar_columns(frame)
     if len(normalized) < min_rows:
         raise ValueError("daily bars insufficient")
@@ -170,14 +196,34 @@ def validate_daily_bars(frame: pd.DataFrame, expected_session: date, *, min_rows
     dates = normalized["date"]
     if not (dates.is_monotonic_increasing or dates.is_monotonic_decreasing):
         raise ValueError("daily bars non-monotonic dates")
-    expected = pd.Timestamp(expected_session)
-    if (dates > expected).any():
+    if (dates > pd.Timestamp(latest_allowed)).any():
         raise ValueError("daily bars future dates")
     _validate_bar_values(normalized)
     ascending = normalized.sort_values("date", kind="stable").reset_index(drop=True)
-    if ascending.iloc[-1]["date"].date() != expected_session:
+    if required_latest is not None and ascending.iloc[-1]["date"].date() != required_latest:
         raise ValueError("daily bars stale")
     return ascending
+
+
+def validate_daily_bars(frame: pd.DataFrame, expected_session: date, *, min_rows: int = 60) -> pd.DataFrame:
+    """Validate a complete daily series and return a new ascending frame."""
+
+    return _validate_bar_series(
+        frame,
+        min_rows=min_rows,
+        latest_allowed=expected_session,
+        required_latest=expected_session,
+    )
+
+
+def _latest_completed_date(symbol: str, observed_at: datetime) -> date:
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("observed_at must be timezone-aware")
+    local = observed_at.astimezone(_NEW_YORK)
+    cutoff = _SYMBOL_CLOSE_CUTOFFS[symbol]
+    if local.time().replace(tzinfo=None) >= cutoff:
+        return local.date()
+    return local.date() - timedelta(days=1)
 
 
 class MarketDataGateway:
@@ -204,12 +250,15 @@ class MarketDataGateway:
         return self._clock()
 
     def get_a_share_snapshot(self) -> MarketDataset:
-        if self._snapshot_fetcher is None:
-            import akshare
+        try:
+            if self._snapshot_fetcher is None:
+                import akshare
 
-            raw = akshare.stock_zh_a_spot_em()
-        else:
-            raw = self._snapshot_fetcher()
+                raw = akshare.stock_zh_a_spot_em()
+            else:
+                raw = self._snapshot_fetcher()
+        except Exception as exc:
+            raise ValueError("snapshot provider unavailable") from exc
         if raw is None or raw.empty:
             raise ValueError("snapshot provider returned empty data")
         normalized = normalize_a_share_snapshot(raw)
@@ -218,28 +267,33 @@ class MarketDataGateway:
         return MarketDataset(normalized, "akshare.stock_zh_a_spot_em", self._observed_at())
 
     def get_daily_bars(self, code: str, expected_session: date, *, days: int = 160) -> MarketDataset:
-        if self._daily_fetcher is None:
-            from data_provider.base import DataFetcherManager
+        try:
+            if self._daily_fetcher is None:
+                from data_provider.base import DataFetcherManager
 
-            raw, source = DataFetcherManager().get_daily_data(code, days=days)
-        else:
-            raw, source = self._daily_fetcher(code, days=days)
+                raw, source = DataFetcherManager().get_daily_data(code, days=days)
+            else:
+                raw, source = self._daily_fetcher(code, days=days)
+        except Exception as exc:
+            raise ValueError("daily provider unavailable") from exc
         if raw is None or raw.empty:
             raise ValueError("daily provider returned empty data")
         normalized = validate_daily_bars(raw, expected_session)
         return MarketDataset(normalized, str(source), self._observed_at())
 
     def get_leading_sector_codes(self, limit: int = 10) -> MarketDataset:
-        if self._sector_names_fetcher is None or self._sector_members_fetcher is None:
-            import akshare
+        try:
+            if self._sector_names_fetcher is None or self._sector_members_fetcher is None:
+                import akshare
 
-            names_fetcher = self._sector_names_fetcher or akshare.stock_board_industry_name_em
-            members_fetcher = self._sector_members_fetcher or akshare.stock_board_industry_cons_em
-        else:
-            names_fetcher = self._sector_names_fetcher
-            members_fetcher = self._sector_members_fetcher
-
-        boards = names_fetcher()
+                names_fetcher = self._sector_names_fetcher or akshare.stock_board_industry_name_em
+                members_fetcher = self._sector_members_fetcher or akshare.stock_board_industry_cons_em
+            else:
+                names_fetcher = self._sector_names_fetcher
+                members_fetcher = self._sector_members_fetcher
+            boards = names_fetcher()
+        except Exception as exc:
+            raise ValueError("sector provider unavailable") from exc
         if boards is None or boards.empty:
             raise ValueError("sector provider returned empty data")
         name_column = _matching_column(boards, ("板块名称", "名称", "name", "sector"))
@@ -292,13 +346,17 @@ class MarketDataGateway:
 
     def get_global_snapshot(self) -> MarketDataset:
         observed_at = self._observed_at()
-        raw = self._download(
-            list(_GLOBAL_SYMBOLS),
-            period="5d",
-            interval="1d",
-            auto_adjust=False,
-            progress=False,
-        )
+        try:
+            raw = self._download(
+                list(_GLOBAL_SYMBOLS),
+                period="5d",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                timeout=15,
+            )
+        except Exception as exc:
+            raise ValueError("global provider unavailable") from exc
         if raw is None or raw.empty:
             raise ValueError("global provider returned empty data")
         closes = self._global_closes(raw)
@@ -309,8 +367,10 @@ class MarketDataGateway:
                 warnings.append(f"global close unavailable: {symbol}")
                 continue
             values = pd.to_numeric(closes[symbol], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-            completed = [pd.Timestamp(index).date() < observed_at.date() for index in values.index]
+            latest_completed = _latest_completed_date(symbol, observed_at)
+            completed = [pd.Timestamp(index).date() <= latest_completed for index in values.index]
             values = values.loc[completed]
+            values = values.sort_index()
             if len(values) < 2:
                 warnings.append(f"global close unavailable: {symbol}")
                 continue
@@ -333,12 +393,23 @@ class MarketDataGateway:
         return MarketDataset(pd.DataFrame(records), "yfinance", observed_at, tuple(warnings))
 
     def get_gold_bars(self) -> MarketDataset:
-        raw = self._download("GC=F", period="10y", interval="1d", auto_adjust=False, progress=False)
+        observed_at = self._observed_at()
+        try:
+            raw = self._download(
+                "GC=F",
+                period="10y",
+                interval="1d",
+                auto_adjust=False,
+                progress=False,
+                timeout=15,
+            )
+        except Exception as exc:
+            raise ValueError("gold provider unavailable") from exc
         if raw is None or raw.empty:
             raise ValueError("gold provider returned empty data")
-        normalized = _normalize_bar_columns(raw)
-        if normalized.empty or normalized["date"].isna().any():
-            raise ValueError("gold provider returned invalid data")
-        _validate_bar_values(normalized)
-        normalized = normalized.sort_values("date", kind="stable").reset_index(drop=True)
-        return MarketDataset(normalized, "yfinance:GC=F", self._observed_at())
+        normalized = _validate_bar_series(
+            raw,
+            min_rows=60,
+            latest_allowed=_latest_completed_date("GC=F", observed_at),
+        )
+        return MarketDataset(normalized, "yfinance:GC=F", observed_at)
