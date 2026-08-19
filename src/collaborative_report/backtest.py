@@ -39,6 +39,7 @@ class BacktestSummary:
 
 
 _REQUIRED_COLUMNS = ("date", "open", "high", "low", "close", "volume")
+_BOUNDARY_TOLERANCE = 1e-12
 
 
 def _finite_number(value: object, name: str) -> float:
@@ -372,8 +373,8 @@ def backtest_swing(
     signals = (
         (ma20 > ma50)
         & (close > ma20)
-        & return20.between(0.03, 0.25, inclusive="both")
-        & bias.between(0.0, 0.08, inclusive="both")
+        & return20.between(0.03 - _BOUNDARY_TOLERANCE, 0.25 + _BOUNDARY_TOLERANCE, inclusive="both")
+        & bias.between(0.0 - _BOUNDARY_TOLERANCE, 0.08 + _BOUNDARY_TOLERANCE, inclusive="both")
     ).fillna(False)
     return _run_backtest(
         frame,

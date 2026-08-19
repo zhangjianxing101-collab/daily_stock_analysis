@@ -1,3 +1,4 @@
+import inspect
 from dataclasses import FrozenInstanceError
 from typing import get_type_hints
 
@@ -24,6 +25,26 @@ def gold_bars(*, tail: list[tuple[float, float, float, float]] | None = None) ->
             "volume": 100.0,
         }
     )
+
+
+def test_analyze_gold_exact_api_signature_and_defaults() -> None:
+    signature = inspect.signature(analyze_gold)
+    expected = {
+        "bars": inspect.Parameter.empty,
+        "capital": 20_000,
+        "fast": 20,
+        "slow": 50,
+        "fee_rate": 0.0003,
+        "sell_tax": 0.0005,
+        "slippage": 0.001,
+        "risk_fraction": 0.02,
+        "stop_fraction": 0.03,
+    }
+
+    assert list(signature.parameters) == list(expected)
+    assert {name: parameter.default for name, parameter in signature.parameters.items()} == expected
+    assert all(parameter.kind is inspect.Parameter.POSITIONAL_OR_KEYWORD for parameter in signature.parameters.values())
+    assert get_type_hints(analyze_gold)["return"] is GoldResult
 
 
 def test_gold_contract_and_exact_risk_checks() -> None:
@@ -76,6 +97,46 @@ def test_gold_three_percent_gap_and_intraday_stops() -> None:
 
     assert (gap_trade.exit_price, gap_trade.exit_reason) == (11.0, "stop_gap")
     assert (intraday_trade.exit_price, intraday_trade.exit_reason) == (pytest.approx(11.64), "stop")
+
+
+def test_gold_cross_below_exits_at_next_open() -> None:
+    frame = gold_bars(
+        tail=[
+            (10.0, 12.4, 9.9, 12.2),
+            (12.0, 12.1, 10.7, 10.8),
+            (10.5, 10.9, 10.4, 10.8),
+        ]
+    )
+
+    trade = analyze_gold(frame, fee_rate=0, sell_tax=0, slippage=0).backtest.trades[0]
+
+    assert trade.exit_reason == "cross_below"
+    assert trade.exit_date == frame.iloc[-1]["date"]
+    assert trade.exit_price == 10.5
+
+
+def test_gold_fast_below_slow_exits_at_next_open_without_cross_below() -> None:
+    closes = [10.0] * 31 + [20.0] + [10.0] * 18 + [11.0, 11.0, 10.9]
+    frame = pd.DataFrame(
+        {
+            "date": pd.bdate_range("2025-01-02", periods=len(closes)),
+            "open": closes,
+            "high": np.asarray(closes) + 0.2,
+            "low": np.asarray(closes) - 0.2,
+            "close": closes,
+            "volume": 100.0,
+        }
+    )
+    frame.loc[frame.index[-1], "open"] = 10.8
+    frame.loc[frame.index[-1], "low"] = 10.7
+
+    trade = analyze_gold(frame, fee_rate=0, sell_tax=0, slippage=0).backtest.trades[0]
+
+    assert trade.signal_date == frame.iloc[50]["date"]
+    assert trade.entry_date == frame.iloc[51]["date"]
+    assert trade.exit_reason == "fast_below_slow"
+    assert trade.exit_date == frame.iloc[52]["date"]
+    assert trade.exit_price == 10.8
 
 
 def test_current_gold_direction_signal_and_watch_only_sample_rule() -> None:
