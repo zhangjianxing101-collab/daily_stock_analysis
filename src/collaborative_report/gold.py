@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from types import MappingProxyType
 from typing import Mapping
 
 import pandas as pd
@@ -101,13 +102,15 @@ def analyze_gold(
     else:
         risk_level = "low"
     watch_only = risk_level == "high" or backtest.trade_count < 10
-    risk_checks: Mapping[str, float | int] = {
-        "single_trade_risk_limit": risk_fraction,
-        "stop_loss": stop_fraction,
-        "drawdown_pause": 0.10,
-        "consecutive_loss_pause": 3,
-        "minimum_trade_sample": 10,
-    }
+    risk_checks: Mapping[str, float | int] = MappingProxyType(
+        {
+            "single_trade_risk_limit": risk_fraction,
+            "stop_loss": stop_fraction,
+            "drawdown_pause": 0.10,
+            "consecutive_loss_pause": 3,
+            "minimum_trade_sample": 10,
+        }
+    )
     return GoldResult(
         direction=direction,
         signal=signal,

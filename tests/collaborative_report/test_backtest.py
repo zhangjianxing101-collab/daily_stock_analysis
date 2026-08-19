@@ -1,5 +1,6 @@
 import inspect
 from dataclasses import FrozenInstanceError
+from decimal import Decimal
 from typing import get_type_hints
 
 import numpy as np
@@ -7,7 +8,14 @@ import pandas as pd
 import pytest
 
 import src.collaborative_report.backtest as backtest_module
-from src.collaborative_report.backtest import BacktestSummary, Trade, _run_backtest, backtest_breakout, backtest_swing
+from src.collaborative_report.backtest import (
+    BacktestSummary,
+    Trade,
+    _position_size,
+    _run_backtest,
+    backtest_breakout,
+    backtest_swing,
+)
 
 
 def breakout_bars(*, tail: list[tuple[float, float, float, float]] | None = None) -> pd.DataFrame:
@@ -140,12 +148,76 @@ def test_breakout_enters_next_open_and_applies_exact_costs() -> None:
     assert trade.exit_date == pd.Timestamp("2026-02-03")
     assert trade.entry_price == pytest.approx(10.0 * 1.001)
     assert trade.exit_price == pytest.approx(11.0 * 0.999)
-    assert trade.shares == 1_300
+    assert trade.shares == 1_200
     buy_cost = trade.entry_price * trade.shares * 1.0003
     sell_proceeds = trade.exit_price * trade.shares * (1 - 0.0003 - 0.0005)
     assert trade.pnl == pytest.approx(sell_proceeds - buy_cost)
     assert trade.return_fraction == pytest.approx(trade.pnl / buy_cost)
     assert trade.exit_reason == "horizon"
+
+
+def test_default_size_caps_planned_net_stop_loss_at_two_percent() -> None:
+    summary = backtest_breakout(breakout_bars(), horizon=2)
+    trade = summary.trades[0]
+    entry_outflow = trade.entry_price * (1 + 0.0003)
+    stop_execution = trade.entry_price * (1 - 0.03) * (1 - 0.001)
+    stop_proceeds = stop_execution * (1 - 0.0003 - 0.0005)
+    planned_loss_per_share = entry_outflow - stop_proceeds
+
+    assert trade.shares * planned_loss_per_share <= summary.initial_capital * 0.02
+    assert (trade.shares + 100) * planned_loss_per_share > summary.initial_capital * 0.02
+
+
+def test_fractional_size_never_rounds_above_exact_risk_budget() -> None:
+    shares = _position_size(
+        current_equity=1,
+        available_cash=1,
+        entry_price=1.1,
+        fee_rate=0.0003,
+        sell_tax=0.0005,
+        slippage=0.001,
+        risk_fraction=0.02,
+        stop_fraction=0.03,
+        lot_size=None,
+    )
+    entry = Decimal("1.1")
+    entry_outflow = entry * Decimal("1.0003")
+    stop_proceeds = entry * Decimal("0.97") * Decimal("0.999") * Decimal("0.9992")
+
+    assert Decimal(str(shares)) * (entry_outflow - stop_proceeds) <= Decimal("0.02")
+
+
+def test_repeated_losses_each_use_two_percent_of_current_pretrade_equity() -> None:
+    closes = [10.0, 9.8, 10.0, 9.8, 10.0, 9.8]
+    frame = bars_from_closes(closes)
+    frame.loc[[1, 3, 5], "low"] = 9.0
+    signals = pd.Series([True, False, True, False, True, False])
+    summary = _run_backtest(
+        frame,
+        signals,
+        strategy="test",
+        capital=100_000,
+        horizon=2,
+        fee_rate=0.0003,
+        sell_tax=0.0005,
+        slippage=0.001,
+        risk_fraction=0.02,
+        stop_fraction=0.03,
+        lot_size=100,
+    )
+
+    pretrade_equity = summary.initial_capital
+    for trade in summary.trades:
+        entry_outflow = trade.entry_price * 1.0003
+        stop_proceeds = trade.entry_price * 0.97 * 0.999 * (1 - 0.0003 - 0.0005)
+        planned_loss = trade.shares * (entry_outflow - stop_proceeds)
+        assert planned_loss <= pretrade_equity * 0.02
+        assert (trade.shares + 100) * (entry_outflow - stop_proceeds) > pretrade_equity * 0.02
+        pretrade_equity += trade.pnl
+
+    assert len(summary.trades) == 3
+    assert summary.trades[1].shares < summary.trades[0].shares
+    assert summary.trades[2].shares <= summary.trades[1].shares
 
 
 def test_gap_stop_uses_adverse_open_and_intraday_stop_uses_stop_price() -> None:
@@ -368,8 +440,8 @@ def test_summary_tracks_mark_to_market_drawdown_and_worst_loss_streak() -> None:
     assert summary.trade_count == 3
     assert summary.consecutive_losses == 3
     assert summary.win_rate == 0
-    assert summary.final_equity == pytest.approx(19_220)
-    assert summary.max_drawdown == pytest.approx(0.039)
+    assert summary.final_equity == pytest.approx(19_240)
+    assert summary.max_drawdown == pytest.approx(0.038)
 
 
 @pytest.mark.parametrize(
@@ -387,6 +459,16 @@ def test_backtests_reject_invalid_bars(mutate) -> None:
         backtest_breakout(mutate(breakout_bars()))
 
 
+def test_backtests_reject_arbitrary_precision_ohlc_source_values() -> None:
+    frame = breakout_bars()
+    frame["close"] = frame["close"].astype(object)
+    frame.loc[frame.index[-1], "close"] = Decimal("125.0000000000000000001")
+    frame.loc[frame.index[-1], "high"] = 126.0
+
+    with pytest.raises(ValueError):
+        backtest_breakout(frame)
+
+
 @pytest.mark.parametrize(
     "kwargs",
     [
@@ -394,6 +476,10 @@ def test_backtests_reject_invalid_bars(mutate) -> None:
         {"horizon": 0},
         {"fee_rate": -0.1},
         {"sell_tax": float("nan")},
+        {"fee_rate": 0.6, "sell_tax": 0.4},
+        {"fee_rate": 1},
+        {"sell_tax": 1},
+        {"slippage": -0.0001},
         {"slippage": 1},
         {"risk_fraction": 0.03},
         {"stop_fraction": 0},

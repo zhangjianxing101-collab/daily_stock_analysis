@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
-from decimal import Decimal
+from decimal import ROUND_FLOOR, Decimal
 from typing import Callable
 
 import numpy as np
@@ -69,7 +69,7 @@ def _validate_parameters(
     normalized_stop = _finite_number(stop_fraction, "stop_fraction")
     if normalized_capital <= 0:
         raise ValueError("capital must be positive")
-    if not 0 <= normalized_fee < 1 or not 0 <= normalized_tax < 1:
+    if not 0 <= normalized_fee < 1 or not 0 <= normalized_tax < 1 or normalized_fee + normalized_tax >= 1:
         raise ValueError("cost rates must be at least zero and less than one")
     if not 0 <= normalized_slippage < 1:
         raise ValueError("slippage must be at least zero and less than one")
@@ -110,10 +110,13 @@ def _validate_bars(bars: pd.DataFrame, *, min_rows: int = 1) -> pd.DataFrame:
 
     numeric_columns = ("open", "high", "low", "close", "volume")
     for column in numeric_columns:
-        try:
-            frame[column] = pd.to_numeric(frame[column], errors="raise").astype(float)
-        except (TypeError, ValueError, OverflowError):
-            raise ValueError("bars contain invalid numeric values") from None
+        native_values = frame[column].map(
+            lambda value: not isinstance(value, (bool, np.bool_))
+            and isinstance(value, (int, float, np.integer, np.floating))
+        )
+        if not native_values.all():
+            raise ValueError("bars numeric values must be native int or float")
+        frame[column] = frame[column].astype(float)
     values = frame.loc[:, numeric_columns].to_numpy(dtype=float)
     if not np.isfinite(values).all():
         raise ValueError("bars contain non-finite values")
@@ -130,20 +133,35 @@ def _validate_bars(bars: pd.DataFrame, *, min_rows: int = 1) -> pd.DataFrame:
 
 def _position_size(
     *,
-    initial_capital: float,
+    current_equity: float,
     available_cash: float,
     entry_price: float,
     fee_rate: float,
+    sell_tax: float,
+    slippage: float,
     risk_fraction: float,
     stop_fraction: float,
     lot_size: int | None,
 ) -> float:
-    risk_capacity = initial_capital * risk_fraction / (entry_price * stop_fraction)
-    cash_capacity = available_cash / (entry_price * (1 + fee_rate))
+    decimal_entry = Decimal(str(entry_price))
+    decimal_fee = Decimal(str(fee_rate))
+    decimal_tax = Decimal(str(sell_tax))
+    decimal_slippage = Decimal(str(slippage))
+    one = Decimal("1")
+    entry_outflow = decimal_entry * (one + decimal_fee)
+    stop_execution_price = decimal_entry * (one - Decimal(str(stop_fraction))) * (one - decimal_slippage)
+    stop_proceeds = stop_execution_price * (one - decimal_fee - decimal_tax)
+    planned_loss_per_unit = entry_outflow - stop_proceeds
+    risk_capacity = Decimal(str(current_equity)) * Decimal(str(risk_fraction)) / planned_loss_per_unit
+    cash_capacity = Decimal(str(available_cash)) / entry_outflow
     capacity = min(risk_capacity, cash_capacity)
     if lot_size is None:
-        return max(capacity, 0.0)
-    return float((math.floor(capacity) // lot_size) * lot_size)
+        shares = float(capacity)
+        while Decimal(str(shares)) > capacity:
+            shares = math.nextafter(shares, 0.0)
+        return max(shares, 0.0)
+    whole_units = int(capacity.to_integral_value(rounding=ROUND_FLOOR))
+    return float((whole_units // lot_size) * lot_size)
 
 
 def _drawdown(equity_curve: list[float]) -> float:
@@ -216,10 +234,12 @@ def _run_backtest(
         entry_index = signal_index + 1
         entry_price = float(frame.iloc[entry_index]["open"]) * (1 + slippage)
         shares = _position_size(
-            initial_capital=capital,
+            current_equity=cash,
             available_cash=cash,
             entry_price=entry_price,
             fee_rate=fee_rate,
+            sell_tax=sell_tax,
+            slippage=slippage,
             risk_fraction=risk_fraction,
             stop_fraction=stop_fraction,
             lot_size=lot_size,

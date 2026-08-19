@@ -70,6 +70,8 @@ def test_gold_contract_and_exact_risk_checks() -> None:
     }
     with pytest.raises(FrozenInstanceError):
         result.signal = "hold"  # type: ignore[misc]
+    with pytest.raises(TypeError):
+        result.risk_checks["single_trade_risk_limit"] = 1  # type: ignore[index]
 
 
 def test_gold_crosses_above_twenty_only_when_twenty_is_above_fifty() -> None:
