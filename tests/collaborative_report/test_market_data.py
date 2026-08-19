@@ -1,5 +1,6 @@
+import traceback
 from datetime import date, datetime, timezone
-from unittest.mock import Mock, call
+from unittest.mock import Mock, call, patch
 from zoneinfo import ZoneInfo
 
 import numpy as np
@@ -16,6 +17,10 @@ from src.collaborative_report.market_data import (
 
 SESSION = date(2026, 8, 19)
 OBSERVED_AT = datetime(2026, 8, 19, 8, 0, tzinfo=timezone.utc)
+
+
+def formatted_traceback(caught: pytest.ExceptionInfo[ValueError]) -> str:
+    return "".join(traceback.format_exception(caught.type, caught.value, caught.tb))
 
 
 def daily_bars(rows: int = 60, *, end: str = "2026-08-19") -> pd.DataFrame:
@@ -190,8 +195,9 @@ def test_get_a_share_snapshot_wraps_provider_failure() -> None:
     with pytest.raises(ValueError, match="^snapshot provider unavailable$") as caught:
         gateway.get_a_share_snapshot()
 
-    assert caught.value.__cause__ is failure
-    assert "secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert "secret" not in formatted_traceback(caught)
+    assert "https://feed.invalid" not in formatted_traceback(caught)
 
 
 def test_get_daily_bars_calls_injected_manager_and_preserves_source() -> None:
@@ -219,8 +225,9 @@ def test_get_daily_bars_wraps_provider_failure() -> None:
     with pytest.raises(ValueError, match="^daily provider unavailable$") as caught:
         gateway.get_daily_bars("000001", expected_session=SESSION)
 
-    assert caught.value.__cause__ is failure
-    assert "secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert "secret" not in formatted_traceback(caught)
+    assert "https://feed.invalid" not in formatted_traceback(caught)
 
 
 def test_get_leading_sector_codes_calls_top_boards_and_returns_partial_map() -> None:
@@ -276,8 +283,9 @@ def test_get_leading_sector_codes_wraps_sector_list_failure() -> None:
     with pytest.raises(ValueError, match="^sector provider unavailable$") as caught:
         gateway.get_leading_sector_codes()
 
-    assert caught.value.__cause__ is failure
-    assert "secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert "secret" not in formatted_traceback(caught)
+    assert "https://feed.invalid" not in formatted_traceback(caught)
 
 
 def global_download_frame(*, multi_index: bool) -> pd.DataFrame:
@@ -324,8 +332,9 @@ def test_get_global_snapshot_wraps_yahoo_failure() -> None:
     with pytest.raises(ValueError, match="^global provider unavailable$") as caught:
         gateway.get_global_snapshot()
 
-    assert caught.value.__cause__ is failure
-    assert "secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert "secret" not in formatted_traceback(caught)
+    assert "https://query.invalid" not in formatted_traceback(caught)
 
 
 def test_get_global_snapshot_ignores_same_day_incomplete_close() -> None:
@@ -339,22 +348,22 @@ def test_get_global_snapshot_ignores_same_day_incomplete_close() -> None:
     assert result.frame["as_of_date"].tolist() == [date(2026, 8, 18)] * 6
 
 
-def test_get_global_snapshot_uses_symbol_specific_close_cutoffs() -> None:
+def test_get_global_snapshot_uses_exchange_session_closes() -> None:
     frame = global_download_frame(multi_index=False)
     frame.loc[pd.Timestamp("2026-08-19")] = [104.0] * len(frame.columns)
     frame = frame.sort_index()
 
     before_equity_close = MarketDataGateway(
         yfinance_download=lambda *args, **kwargs: frame,
-        clock=lambda: datetime(2026, 8, 19, 20, 14, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 8, 19, 19, 59, tzinfo=timezone.utc),
     ).get_global_snapshot()
     after_equity_close = MarketDataGateway(
         yfinance_download=lambda *args, **kwargs: frame,
-        clock=lambda: datetime(2026, 8, 19, 20, 16, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 8, 19, 20, 1, tzinfo=timezone.utc),
     ).get_global_snapshot()
     after_futures_close = MarketDataGateway(
         yfinance_download=lambda *args, **kwargs: frame,
-        clock=lambda: datetime(2026, 8, 19, 21, 16, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 8, 19, 22, 1, tzinfo=timezone.utc),
     ).get_global_snapshot()
 
     assert before_equity_close.frame.set_index("symbol")["close"].to_dict() == {
@@ -373,7 +382,7 @@ def test_get_global_snapshot_uses_symbol_specific_close_cutoffs() -> None:
 def test_get_global_snapshot_is_invariant_to_observation_timezone() -> None:
     frame = global_download_frame(multi_index=False)
     frame.loc[pd.Timestamp("2026-08-19")] = [104.0] * len(frame.columns)
-    instant_utc = datetime(2026, 8, 19, 21, 16, tzinfo=timezone.utc)
+    instant_utc = datetime(2026, 8, 19, 22, 1, tzinfo=timezone.utc)
     instant_shanghai = instant_utc.astimezone(ZoneInfo("Asia/Shanghai"))
 
     utc_result = MarketDataGateway(
@@ -387,6 +396,67 @@ def test_get_global_snapshot_is_invariant_to_observation_timezone() -> None:
 
     pd.testing.assert_frame_equal(utc_result.frame, shanghai_result.frame)
     assert utc_result.observed_at == shanghai_result.observed_at
+
+
+def dated_global_frame(dates: list[str]) -> pd.DataFrame:
+    symbols = ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F"]
+    return pd.DataFrame(
+        {symbol: np.arange(len(dates), dtype=float) + 100.0 for symbol in symbols},
+        index=pd.to_datetime(dates),
+    )
+
+
+def test_get_global_snapshot_honors_xnys_early_close() -> None:
+    frame = dated_global_frame(["2026-11-24", "2026-11-25", "2026-11-27"])
+    observed = datetime(2026, 11, 27, 14, 0, tzinfo=ZoneInfo("America/New_York"))
+
+    result = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: frame,
+        clock=lambda: observed,
+    ).get_global_snapshot()
+
+    as_of = result.frame.set_index("symbol")["as_of_date"].to_dict()
+    assert as_of["^GSPC"] == date(2026, 11, 27)
+    assert as_of["^IXIC"] == date(2026, 11, 27)
+    assert as_of["^DJI"] == date(2026, 11, 27)
+
+
+def test_get_global_snapshot_uses_prior_sessions_on_holiday_and_weekend() -> None:
+    frame = dated_global_frame(["2026-11-24", "2026-11-25", "2026-11-26", "2026-11-27", "2026-11-28"])
+    thanksgiving = datetime(2026, 11, 26, 14, 0, tzinfo=ZoneInfo("America/New_York"))
+    weekend = datetime(2026, 11, 28, 12, 0, tzinfo=ZoneInfo("America/New_York"))
+
+    holiday_result = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: frame,
+        clock=lambda: thanksgiving,
+    ).get_global_snapshot()
+    weekend_result = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: frame,
+        clock=lambda: weekend,
+    ).get_global_snapshot()
+
+    holiday_dates = holiday_result.frame.set_index("symbol")["as_of_date"].to_dict()
+    assert holiday_dates["^GSPC"] == date(2026, 11, 25)
+    assert holiday_dates["GC=F"] == date(2026, 11, 26)
+    assert set(weekend_result.frame["as_of_date"]) == {date(2026, 11, 27)}
+
+
+def test_get_global_snapshot_sanitizes_calendar_failure() -> None:
+    failure = RuntimeError("https://calendar.invalid/?token=secret")
+    gateway = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: global_download_frame(multi_index=False),
+        clock=lambda: OBSERVED_AT,
+    )
+
+    with (
+        patch("src.collaborative_report.market_data.exchange_calendars.get_calendar", side_effect=failure),
+        pytest.raises(ValueError, match="^market calendar unavailable$") as caught,
+    ):
+        gateway.get_global_snapshot()
+
+    assert caught.value.__cause__ is None
+    assert "secret" not in formatted_traceback(caught)
+    assert "https://calendar.invalid" not in formatted_traceback(caught)
 
 
 def test_get_gold_bars_calls_yfinance_and_normalizes_ohlcv() -> None:
@@ -425,8 +495,9 @@ def test_get_gold_bars_wraps_yahoo_failure() -> None:
     with pytest.raises(ValueError, match="^gold provider unavailable$") as caught:
         gateway.get_gold_bars()
 
-    assert caught.value.__cause__ is failure
-    assert "secret" not in str(caught.value)
+    assert caught.value.__cause__ is None
+    assert "secret" not in formatted_traceback(caught)
+    assert "https://query.invalid" not in formatted_traceback(caught)
 
 
 @pytest.mark.parametrize(
@@ -455,7 +526,7 @@ def test_get_gold_bars_rejects_invalid_history(mutate, message: str) -> None:
 def test_get_gold_bars_rejects_incomplete_row_before_futures_cutoff() -> None:
     gateway = MarketDataGateway(
         yfinance_download=lambda *args, **kwargs: daily_bars(end="2026-08-19"),
-        clock=lambda: datetime(2026, 8, 19, 21, 14, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 8, 19, 21, 59, tzinfo=timezone.utc),
     )
 
     with pytest.raises(ValueError, match="^daily bars future dates$"):
@@ -465,12 +536,22 @@ def test_get_gold_bars_rejects_incomplete_row_before_futures_cutoff() -> None:
 def test_get_gold_bars_accepts_local_date_after_futures_cutoff() -> None:
     gateway = MarketDataGateway(
         yfinance_download=lambda *args, **kwargs: daily_bars(end="2026-08-19"),
-        clock=lambda: datetime(2026, 8, 19, 21, 16, tzinfo=timezone.utc),
+        clock=lambda: datetime(2026, 8, 19, 22, 1, tzinfo=timezone.utc),
     )
 
     result = gateway.get_gold_bars()
 
     assert result.frame.iloc[-1]["date"].date() == date(2026, 8, 19)
+
+
+def test_get_gold_bars_rejects_stale_history() -> None:
+    gateway = MarketDataGateway(
+        yfinance_download=lambda *args, **kwargs: daily_bars(end="2026-07-31"),
+        clock=lambda: OBSERVED_AT,
+    )
+
+    with pytest.raises(ValueError, match="^daily bars stale$"):
+        gateway.get_gold_bars()
 
 
 def test_market_dataset_requires_timezone_aware_observation() -> None:

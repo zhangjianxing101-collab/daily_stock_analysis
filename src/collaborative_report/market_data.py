@@ -3,10 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, time, timedelta, timezone
+from datetime import date, datetime, timezone
 from typing import Callable
-from zoneinfo import ZoneInfo
 
+import exchange_calendars
 import numpy as np
 import pandas as pd
 
@@ -40,16 +40,13 @@ _BAR_ALIASES = {
     "volume": ("volume", "Volume", "成交量"),
 }
 _GLOBAL_SYMBOLS = ("^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F")
-_NEW_YORK = ZoneInfo("America/New_York")
-_EQUITY_CLOSE_CUTOFF = time(16, 15)
-_FUTURES_CLOSE_CUTOFF = time(17, 15)
-_SYMBOL_CLOSE_CUTOFFS = {
-    "^GSPC": _EQUITY_CLOSE_CUTOFF,
-    "^IXIC": _EQUITY_CLOSE_CUTOFF,
-    "^DJI": _EQUITY_CLOSE_CUTOFF,
-    "GC=F": _FUTURES_CLOSE_CUTOFF,
-    "HG=F": _FUTURES_CLOSE_CUTOFF,
-    "CL=F": _FUTURES_CLOSE_CUTOFF,
+_SYMBOL_CALENDARS = {
+    "^GSPC": "XNYS",
+    "^IXIC": "XNYS",
+    "^DJI": "XNYS",
+    "GC=F": "CMES",
+    "HG=F": "CMES",
+    "CL=F": "CMES",
 }
 
 
@@ -216,14 +213,18 @@ def validate_daily_bars(frame: pd.DataFrame, expected_session: date, *, min_rows
     )
 
 
-def _latest_completed_date(symbol: str, observed_at: datetime) -> date:
+def _latest_completed_session_date(symbol: str, observed_at: datetime) -> date:
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
-    local = observed_at.astimezone(_NEW_YORK)
-    cutoff = _SYMBOL_CLOSE_CUTOFFS[symbol]
-    if local.time().replace(tzinfo=None) >= cutoff:
-        return local.date()
-    return local.date() - timedelta(days=1)
+    try:
+        observed_utc = pd.Timestamp(observed_at).tz_convert("UTC")
+        calendar = exchange_calendars.get_calendar(_SYMBOL_CALENDARS[symbol])
+        session = calendar.date_to_session(observed_utc.date(), direction="previous")
+        while calendar.session_close(session) > observed_utc:
+            session = calendar.previous_session(session)
+        return session.date()
+    except Exception:
+        raise ValueError("market calendar unavailable") from None
 
 
 class MarketDataGateway:
@@ -257,8 +258,8 @@ class MarketDataGateway:
                 raw = akshare.stock_zh_a_spot_em()
             else:
                 raw = self._snapshot_fetcher()
-        except Exception as exc:
-            raise ValueError("snapshot provider unavailable") from exc
+        except Exception:
+            raise ValueError("snapshot provider unavailable") from None
         if raw is None or raw.empty:
             raise ValueError("snapshot provider returned empty data")
         normalized = normalize_a_share_snapshot(raw)
@@ -274,8 +275,8 @@ class MarketDataGateway:
                 raw, source = DataFetcherManager().get_daily_data(code, days=days)
             else:
                 raw, source = self._daily_fetcher(code, days=days)
-        except Exception as exc:
-            raise ValueError("daily provider unavailable") from exc
+        except Exception:
+            raise ValueError("daily provider unavailable") from None
         if raw is None or raw.empty:
             raise ValueError("daily provider returned empty data")
         normalized = validate_daily_bars(raw, expected_session)
@@ -292,8 +293,8 @@ class MarketDataGateway:
                 names_fetcher = self._sector_names_fetcher
                 members_fetcher = self._sector_members_fetcher
             boards = names_fetcher()
-        except Exception as exc:
-            raise ValueError("sector provider unavailable") from exc
+        except Exception:
+            raise ValueError("sector provider unavailable") from None
         if boards is None or boards.empty:
             raise ValueError("sector provider returned empty data")
         name_column = _matching_column(boards, ("板块名称", "名称", "name", "sector"))
@@ -355,8 +356,8 @@ class MarketDataGateway:
                 progress=False,
                 timeout=15,
             )
-        except Exception as exc:
-            raise ValueError("global provider unavailable") from exc
+        except Exception:
+            raise ValueError("global provider unavailable") from None
         if raw is None or raw.empty:
             raise ValueError("global provider returned empty data")
         closes = self._global_closes(raw)
@@ -367,7 +368,7 @@ class MarketDataGateway:
                 warnings.append(f"global close unavailable: {symbol}")
                 continue
             values = pd.to_numeric(closes[symbol], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
-            latest_completed = _latest_completed_date(symbol, observed_at)
+            latest_completed = _latest_completed_session_date(symbol, observed_at)
             completed = [pd.Timestamp(index).date() <= latest_completed for index in values.index]
             values = values.loc[completed]
             values = values.sort_index()
@@ -403,13 +404,15 @@ class MarketDataGateway:
                 progress=False,
                 timeout=15,
             )
-        except Exception as exc:
-            raise ValueError("gold provider unavailable") from exc
+        except Exception:
+            raise ValueError("gold provider unavailable") from None
         if raw is None or raw.empty:
             raise ValueError("gold provider returned empty data")
+        latest_completed = _latest_completed_session_date("GC=F", observed_at)
         normalized = _validate_bar_series(
             raw,
             min_rows=60,
-            latest_allowed=_latest_completed_date("GC=F", observed_at),
+            latest_allowed=latest_completed,
+            required_latest=latest_completed,
         )
         return MarketDataset(normalized, "yfinance:GC=F", observed_at)
