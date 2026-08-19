@@ -134,7 +134,11 @@ class EmailSender:
         if use_ssl:
             return smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=timeout)
         server = smtplib.SMTP(smtp_server, smtp_port, timeout=timeout)
-        server.starttls()
+        try:
+            server.starttls()
+        except Exception:
+            self._close_server(server)
+            raise
         return server
 
     @staticmethod
@@ -239,7 +243,10 @@ class EmailSender:
 
         sender = self._email_config['sender']
         password = self._email_config['password']
-        selected_receivers = receivers or self._email_config['receivers']
+        selected_receivers = self._email_config['receivers'] if receivers is None else receivers
+        if not selected_receivers:
+            logger.warning("收件人列表为空，跳过邮件发送")
+            return False
         server: Optional[smtplib.SMTP] = None
         try:
             msg = MIMEMultipart('alternative')

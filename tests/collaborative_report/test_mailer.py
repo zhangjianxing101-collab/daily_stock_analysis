@@ -58,3 +58,18 @@ def test_mailer_raises_final_failure_after_three_attempts() -> None:
         )
 
     assert len(sender.calls) == 3
+
+
+def test_mailer_does_not_retry_non_network_programming_errors() -> None:
+    sender = FakeEmailSender([ValueError("invalid message")])
+
+    with pytest.raises(ValueError, match="invalid message"):
+        send_with_retry(
+            sender,
+            html_content="<p>报告</p>",
+            text_content="报告",
+            subject="A股盘前日报 2026-08-19",
+            wait_strategy=wait_none(),
+        )
+
+    assert len(sender.calls) == 1

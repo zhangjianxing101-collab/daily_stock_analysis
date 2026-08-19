@@ -1,8 +1,12 @@
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from src.collaborative_report.models import Candidate, ModuleResult, ReportMode
-from src.collaborative_report.report import build_subject, render_report
+from src.collaborative_report.report import (
+    build_subject,
+    evaluate_candidate_actionability,
+    render_report,
+)
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -13,7 +17,9 @@ def module(name: str, payload: dict, *warnings: str, status: str = "ok") -> Modu
     return ModuleResult(name, status, OBSERVED_AT, payload, warnings)
 
 
-def candidate(*, warning: str = "", name: str = "示例股份") -> Candidate:
+def candidate(
+    *, warning: str = "", name: str = "示例股份", observed_at: datetime = OBSERVED_AT
+) -> Candidate:
     return Candidate(
         code="600001",
         name=name,
@@ -24,7 +30,7 @@ def candidate(*, warning: str = "", name: str = "示例股份") -> Candidate:
         stop_price=9.8,
         target_price=12.0,
         matched_rules=("ma5>ma10>ma20", "volume_expansion"),
-        observed_at=OBSERVED_AT,
+        observed_at=observed_at,
         source="synthetic",
         warning=warning,
     )
@@ -102,6 +108,26 @@ def test_all_supplied_module_warnings_render_once_in_html_and_text() -> None:
     assert "保留展示" in rendered.text
 
 
+def test_non_ok_module_status_is_explicit_without_duplicating_warning() -> None:
+    rendered = render_report(
+        ReportMode.PREMARKET,
+        date(2026, 8, 19),
+        modules={
+            "ai": module(
+                "ai",
+                {"结论": "确定性结果"},
+                "AI固定警告",
+                "AI固定警告",
+                status="unavailable",
+            ),
+        },
+    )
+
+    for output in (rendered.html, rendered.text):
+        assert "模块状态：unavailable" in output
+        assert output.count("AI固定警告") == 1
+
+
 def test_postmarket_without_morning_rows_renders_unavailable_status() -> None:
     rendered = render_report(
         ReportMode.POSTMARKET,
@@ -145,6 +171,48 @@ def test_stale_or_non_actionable_candidate_suppresses_all_price_levels() -> None
     assert "放量突破10.60" not in rendered.text
     assert "9.80" not in rendered.text
     assert "12.00" not in rendered.text
+
+
+def test_stale_timestamp_without_warning_suppresses_levels_but_fresh_candidate_keeps_them() -> None:
+    generated_at = datetime(2026, 8, 19, 9, 0, tzinfo=SHANGHAI)
+    stale = candidate(observed_at=generated_at - timedelta(hours=25))
+    fresh = candidate(name="新鲜股份", observed_at=generated_at - timedelta(minutes=5))
+
+    stale_policy = evaluate_candidate_actionability(stale, generated_at=generated_at)
+    fresh_policy = evaluate_candidate_actionability(fresh, generated_at=generated_at)
+    rendered = render_report(
+        ReportMode.PREMARKET,
+        date(2026, 8, 19),
+        modules={},
+        short_term_candidates=(stale,),
+        swing_candidates=(fresh,),
+        generated_at=generated_at,
+    )
+
+    assert stale_policy.actionable is False
+    assert stale_policy.reason == "数据时间超过24小时，仅供观察"
+    assert fresh_policy.actionable is True
+    for output in (rendered.html, rendered.text):
+        assert "数据时间超过24小时，仅供观察" in output
+        assert output.count("放量突破10.60") == 1
+        assert output.count("9.80") == 1
+        assert output.count("12.00") == 1
+
+
+def test_html_and_text_share_complete_disclaimer_content() -> None:
+    rendered = render_report(
+        ReportMode.PREMARKET,
+        date(2026, 8, 19),
+        modules={},
+    )
+
+    for statement in (
+        "人工确认后操作 / 不承诺收益 / 不自动下单",
+        "所有价格均为分析参考，需核验数据时效与市场状态。",
+        "盘前参考价不代表成交价。",
+    ):
+        assert rendered.html.count(statement) == 1
+        assert rendered.text.count(statement) == 1
 
 
 def test_subject_prefix_is_explicit_and_optional() -> None:

@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from pathlib import Path
 from typing import Any, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
@@ -19,7 +20,13 @@ _ENVIRONMENT = Environment(
     trim_blocks=True,
     lstrip_blocks=True,
 )
-_DISCLAIMER = "人工确认后操作 / 不承诺收益 / 不自动下单"
+_SHANGHAI = ZoneInfo("Asia/Shanghai")
+_CANDIDATE_MAX_AGE = timedelta(hours=24)
+_DISCLAIMER_LINES = (
+    "人工确认后操作 / 不承诺收益 / 不自动下单",
+    "所有价格均为分析参考，需核验数据时效与市场状态。",
+    "盘前参考价不代表成交价。",
+)
 _NO_MORNING_STATUS = "暂无早盘候选记录，状态不可用"
 _MODULE_TITLES = {
     "global": "全球与黄金背景",
@@ -37,6 +44,14 @@ class RenderedReport:
     subject: str
     html: str
     text: str
+
+
+@dataclass(frozen=True)
+class CandidateActionability:
+    """Report-boundary decision controlling whether price levels may be shown."""
+
+    actionable: bool
+    reason: str = ""
 
 
 @dataclass(frozen=True)
@@ -98,9 +113,7 @@ def _module_view(title: str, result: ModuleResult | None) -> _ModuleView:
     if result is None:
         return _ModuleView(title, "unavailable", "暂无", (), ("数据暂不可用",))
     rows = tuple((str(key), _display_value(value)) for key, value in result.payload.items())
-    warnings = tuple(str(warning) for warning in result.warnings)
-    if result.status != "ok" and not warnings:
-        warnings = (f"模块状态：{result.status}",)
+    warnings = tuple(dict.fromkeys(str(warning) for warning in result.warnings))
     return _ModuleView(title, result.status, _format_timestamp(result.observed_at), rows, warnings)
 
 
@@ -118,30 +131,51 @@ def _module_sections(
     return tuple(sections)
 
 
-def _is_actionable(candidate: Candidate) -> bool:
+def evaluate_candidate_actionability(
+    candidate: Candidate,
+    *,
+    generated_at: datetime,
+    max_age: timedelta = _CANDIDATE_MAX_AGE,
+) -> CandidateActionability:
+    """Suppress levels unless candidate data is aware, non-future, and at most 24 hours old."""
+
+    if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+        raise ValueError("generated_at must be timezone-aware")
+    if max_age <= timedelta(0):
+        raise ValueError("max_age must be positive")
+    observed_at = candidate.observed_at
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        return CandidateActionability(False, "数据时间缺少时区，仅供观察")
+    age = generated_at - observed_at
+    if age < timedelta(0):
+        return CandidateActionability(False, "数据时间晚于报告生成时间，仅供观察")
+    if age > max_age:
+        hours = int(max_age.total_seconds() // 3600)
+        return CandidateActionability(False, f"数据时间超过{hours}小时，仅供观察")
+    if candidate.warning.strip():
+        return CandidateActionability(False, candidate.warning.strip())
     trigger = candidate.trigger.strip()
-    return not candidate.warning.strip() and bool(trigger) and not any(
-        marker in trigger.lower() for marker in ("观望", "仅供观察", "watch only", "stale")
-    )
+    if not trigger or any(marker in trigger.lower() for marker in ("观望", "仅供观察", "watch only", "stale")):
+        return CandidateActionability(False, "仅供观察")
+    return CandidateActionability(True)
 
 
-def _candidate_view(candidate: Candidate) -> _CandidateView:
-    actionable = _is_actionable(candidate)
-    warning = candidate.warning.strip() or ("仅供观察" if not actionable else "")
+def _candidate_view(candidate: Candidate, generated_at: datetime) -> _CandidateView:
+    policy = evaluate_candidate_actionability(candidate, generated_at=generated_at)
     return _CandidateView(
         code=candidate.code,
         name=candidate.name,
         horizon=candidate.horizon,
         score=f"{candidate.score:.1f}",
         close=f"{candidate.close:.2f}",
-        trigger=candidate.trigger if actionable else "已抑制",
-        stop=f"{candidate.stop_price:.2f}" if actionable else "已抑制",
-        target=f"{candidate.target_price:.2f}" if actionable else "已抑制",
+        trigger=candidate.trigger if policy.actionable else "已抑制",
+        stop=f"{candidate.stop_price:.2f}" if policy.actionable else "已抑制",
+        target=f"{candidate.target_price:.2f}" if policy.actionable else "已抑制",
         rules="、".join(candidate.matched_rules),
         observed_at=_format_timestamp(candidate.observed_at),
         source=candidate.source,
-        actionable=actionable,
-        warning=warning,
+        actionable=policy.actionable,
+        warning=policy.reason,
     )
 
 
@@ -169,6 +203,8 @@ def _plain_text(
     lines = [build_subject(mode, report_date), ""]
     for section in sections:
         lines.extend((section.title, f"数据时间：{section.observed_at}"))
+        if section.status != "ok":
+            lines.append(f"模块状态：{section.status}")
         lines.extend(f"{label}：{value}" for label, value in section.rows)
         lines.extend(f"警告：{warning}" for warning in section.warnings)
         lines.append("")
@@ -191,8 +227,13 @@ def _plain_text(
             if item.warning:
                 lines.append(f"警告：{item.warning}")
         lines.append("")
-    lines.extend((_DISCLAIMER, "所有价格均为分析参考，需核验数据时效与市场状态。"))
+    lines.extend(_DISCLAIMER_LINES)
     return "\n".join(lines)
+
+
+def _default_generated_at(mode: ReportMode, report_date: date) -> datetime:
+    session_time = time(9, 0) if mode is ReportMode.PREMARKET else time(16, 30)
+    return datetime.combine(report_date, session_time, tzinfo=_SHANGHAI)
 
 
 def render_report(
@@ -204,10 +245,16 @@ def render_report(
     swing_candidates: Sequence[Candidate] = (),
     morning_candidates: Sequence[Mapping[str, Any]] = (),
     subject_prefix: str | None = None,
+    generated_at: datetime | None = None,
 ) -> RenderedReport:
     """Render one of the two collaborative report modes from structured results."""
 
     normalized_mode = ReportMode(mode)
+    report_generated_at = generated_at or _default_generated_at(normalized_mode, report_date)
+    if report_generated_at.tzinfo is None or report_generated_at.utcoffset() is None:
+        raise ValueError("generated_at must be timezone-aware")
+    if report_generated_at.astimezone(_SHANGHAI).date() != report_date:
+        raise ValueError("generated_at must match report_date in Asia/Shanghai")
     if normalized_mode is ReportMode.PREMARKET:
         sections = _module_sections(modules, ("global", "gold", "portfolio"))
         short_title, swing_title = "短线候选池", "波段候选池"
@@ -215,8 +262,8 @@ def render_report(
         sections = _module_sections(modules, ("market", "portfolio", "backtests", "gold"))
         short_title, swing_title = "下一交易日短线池", "下一交易日波段池"
 
-    short_views = tuple(_candidate_view(item) for item in short_term_candidates)
-    swing_views = tuple(_candidate_view(item) for item in swing_candidates)
+    short_views = tuple(_candidate_view(item, report_generated_at) for item in short_term_candidates)
+    swing_views = tuple(_candidate_view(item, report_generated_at) for item in swing_candidates)
     morning_rows = _morning_rows(morning_candidates)
     subject = build_subject(normalized_mode, report_date, prefix=subject_prefix)
     template = _ENVIRONMENT.get_template("collaborative_report.html.j2")
@@ -231,7 +278,7 @@ def render_report(
         swing_candidates=swing_views,
         morning_rows=morning_rows,
         no_morning_status=_NO_MORNING_STATUS,
-        disclaimer=_DISCLAIMER,
+        disclaimer_lines=_DISCLAIMER_LINES,
     )
     text = _plain_text(
         normalized_mode,

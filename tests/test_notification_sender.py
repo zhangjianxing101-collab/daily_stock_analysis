@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import smtplib
 import sys
 import unittest
 from email.header import decode_header, make_header
@@ -1096,6 +1097,35 @@ class TestEmailSender(unittest.TestCase):
 
         msg = mock_smtp_ssl.return_value.send_message.call_args.args[0]
         self.assertEqual(msg["To"], "one@qq.com, two@qq.com")
+
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_send_html_email_rejects_explicit_empty_receivers_before_smtp(self, mock_smtp_ssl):
+        cfg = _config(
+            email_sender="a@qq.com",
+            email_password="p",
+            email_receivers=["default@qq.com"],
+        )
+        sender = EmailSender(cfg)
+
+        self.assertFalse(sender.send_html_email("<p>body</p>", "body", "subject", receivers=[]))
+
+        mock_smtp_ssl.assert_not_called()
+
+    @mock.patch("smtplib.SMTP")
+    def test_send_html_email_closes_smtp_when_starttls_raises(self, mock_smtp):
+        cfg = _config(
+            email_sender="a@gmail.com",
+            email_password="p",
+            email_receivers=["b@example.com"],
+        )
+        server = mock_smtp.return_value
+        server.starttls.side_effect = smtplib.SMTPException("TLS setup failed")
+        sender = EmailSender(cfg)
+
+        self.assertFalse(sender.send_html_email("<p>body</p>", "body", "subject"))
+
+        server.quit.assert_called_once()
+        server.login.assert_not_called()
 
     @mock.patch("src.notification_sender.email_sender.logger")
     @mock.patch("smtplib.SMTP_SSL", side_effect=RuntimeError("secret-authorization-code"))

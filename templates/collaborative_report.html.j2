@@ -54,6 +54,7 @@
       </table>
       {% else %}<p class="empty">暂无可用数据</p>{% endif %}
       <p class="meta">数据时间：{{ section.observed_at }}</p>
+      {% if section.status != "ok" %}<p class="warning">模块状态：{{ section.status }}</p>{% endif %}
       {% for warning in section.warnings %}<p class="warning">警告：{{ warning }}</p>{% endfor %}
     </section>
     {% endfor %}
@@ -93,8 +94,8 @@
     {% endfor %}
 
     <footer class="footer">
-      <strong>{{ disclaimer }}</strong><br>
-      所有价格均为分析参考，需核验数据时效与市场状态；盘前参考价不代表成交价。
+      <strong>{{ disclaimer_lines[0] }}</strong><br>
+      {% for line in disclaimer_lines[1:] %}{{ line }}{% if not loop.last %}<br>{% endif %}{% endfor %}
     </footer>
   </main>
 </body>
