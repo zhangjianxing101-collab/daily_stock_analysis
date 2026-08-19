@@ -177,7 +177,7 @@ def test_pipeline_exception_is_sanitized_in_full_result_report() -> None:
 
     assert output.status == "unavailable"
     assert output.payload == {}
-    assert output.warnings == ("ai_pipeline_unavailable:RuntimeError",)
+    assert output.warnings == ("AI分析暂不可用（RuntimeError）",)
     serialized = repr(output) + report
     assert "provider unavailable" not in serialized
     assert "secret" not in serialized

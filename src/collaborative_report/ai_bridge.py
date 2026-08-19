@@ -137,5 +137,5 @@ def enrich_codes(
             status="unavailable",
             observed_at=timestamp,
             payload=_EMPTY_PAYLOAD,
-            warnings=(f"ai_pipeline_unavailable:{type(exc).__name__}",),
+            warnings=(f"AI分析暂不可用（{type(exc).__name__}）",),
         )
