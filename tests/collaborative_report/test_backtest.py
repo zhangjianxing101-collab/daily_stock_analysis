@@ -490,6 +490,33 @@ def test_backtests_reject_invalid_parameters(kwargs: dict[str, object]) -> None:
         backtest_breakout(breakout_bars(), **kwargs)  # type: ignore[arg-type]
 
 
+def test_stop_slippage_geometry_accepts_exact_boundary() -> None:
+    stop_fraction = 0.03
+    boundary = stop_fraction / (1 - stop_fraction)
+
+    summary = backtest_breakout(
+        breakout_bars(),
+        horizon=1,
+        fee_rate=0,
+        sell_tax=0,
+        slippage=boundary,
+        stop_fraction=stop_fraction,
+    )
+
+    assert summary.trade_count == 1
+
+
+@pytest.mark.parametrize("slippage", [float(np.nextafter(0.03 / 0.97, np.inf)), 0.5])
+def test_stop_slippage_geometry_rejects_values_above_boundary(slippage: float) -> None:
+    with pytest.raises(ValueError, match="^slippage must not place stop above raw entry open$"):
+        backtest_breakout(breakout_bars(), slippage=slippage, stop_fraction=0.03)
+
+
+def test_high_slippage_is_rejected_before_bar_simulation() -> None:
+    with pytest.raises(ValueError, match="^slippage must not place stop above raw entry open$"):
+        backtest_breakout(pd.DataFrame(), slippage=0.10, stop_fraction=0.03)
+
+
 @pytest.mark.parametrize(
     ("bars", "kwargs"),
     [

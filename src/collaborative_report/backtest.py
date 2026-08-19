@@ -77,6 +77,8 @@ def _validate_parameters(
         raise ValueError("risk_fraction must be greater than zero and at most 0.02")
     if not 0 < normalized_stop < 1:
         raise ValueError("stop_fraction must be greater than zero and less than one")
+    if normalized_slippage > normalized_stop / (1 - normalized_stop):
+        raise ValueError("slippage must not place stop above raw entry open")
     if horizon is not None and (type(horizon) is not int or horizon <= 0):
         raise ValueError("horizon must be a positive integer")
     return (
