@@ -3,14 +3,14 @@
 from __future__ import annotations
 
 from dataclasses import asdict, dataclass, is_dataclass
-from datetime import date, datetime, time, timedelta
+from datetime import date, datetime
 from pathlib import Path
 from typing import Any, Mapping, Sequence
-from zoneinfo import ZoneInfo
 
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 
 from .models import Candidate, ModuleResult, ReportMode
+from .session import latest_completed_xshg_session, report_data_session
 
 
 _TEMPLATE_DIR = Path(__file__).resolve().parents[2] / "templates"
@@ -20,8 +20,6 @@ _ENVIRONMENT = Environment(
     trim_blocks=True,
     lstrip_blocks=True,
 )
-_SHANGHAI = ZoneInfo("Asia/Shanghai")
-_CANDIDATE_MAX_AGE = timedelta(hours=24)
 _DISCLAIMER_LINES = (
     "人工确认后操作 / 不承诺收益 / 不自动下单",
     "所有价格均为分析参考，需核验数据时效与市场状态。",
@@ -134,24 +132,31 @@ def _module_sections(
 def evaluate_candidate_actionability(
     candidate: Candidate,
     *,
-    generated_at: datetime,
-    max_age: timedelta = _CANDIDATE_MAX_AGE,
+    mode: ReportMode,
+    report_date: date,
+    generated_at: datetime | None = None,
 ) -> CandidateActionability:
-    """Suppress levels unless candidate data is aware, non-future, and at most 24 hours old."""
+    """Expose levels only when candidate data belongs to the report's completed XSHG session."""
 
-    if generated_at.tzinfo is None or generated_at.utcoffset() is None:
-        raise ValueError("generated_at must be timezone-aware")
-    if max_age <= timedelta(0):
-        raise ValueError("max_age must be positive")
+    if not isinstance(mode, ReportMode):
+        raise ValueError("invalid report mode")
     observed_at = candidate.observed_at
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         return CandidateActionability(False, "数据时间缺少时区，仅供观察")
-    age = generated_at - observed_at
-    if age < timedelta(0):
+    if generated_at is not None and observed_at > generated_at:
         return CandidateActionability(False, "数据时间晚于报告生成时间，仅供观察")
-    if age > max_age:
-        hours = int(max_age.total_seconds() // 3600)
-        return CandidateActionability(False, f"数据时间超过{hours}小时，仅供观察")
+    try:
+        expected_session = report_data_session(mode, report_date, generated_at)
+        observed_session = latest_completed_xshg_session(observed_at)
+    except RuntimeError:
+        return CandidateActionability(False, "交易日历不可用，仅供观察")
+    if observed_session < expected_session:
+        return CandidateActionability(
+            False,
+            f"数据交易日{observed_session.isoformat()}早于预期交易日{expected_session.isoformat()}，仅供观察",
+        )
+    if observed_session > expected_session:
+        return CandidateActionability(False, "数据交易日晚于报告会话，仅供观察")
     if candidate.warning.strip():
         return CandidateActionability(False, candidate.warning.strip())
     trigger = candidate.trigger.strip()
@@ -160,8 +165,18 @@ def evaluate_candidate_actionability(
     return CandidateActionability(True)
 
 
-def _candidate_view(candidate: Candidate, generated_at: datetime) -> _CandidateView:
-    policy = evaluate_candidate_actionability(candidate, generated_at=generated_at)
+def _candidate_view(
+    candidate: Candidate,
+    mode: ReportMode,
+    report_date: date,
+    generated_at: datetime | None,
+) -> _CandidateView:
+    policy = evaluate_candidate_actionability(
+        candidate,
+        mode=mode,
+        report_date=report_date,
+        generated_at=generated_at,
+    )
     return _CandidateView(
         code=candidate.code,
         name=candidate.name,
@@ -231,11 +246,6 @@ def _plain_text(
     return "\n".join(lines)
 
 
-def _default_generated_at(mode: ReportMode, report_date: date) -> datetime:
-    session_time = time(9, 0) if mode is ReportMode.PREMARKET else time(16, 30)
-    return datetime.combine(report_date, session_time, tzinfo=_SHANGHAI)
-
-
 def render_report(
     mode: ReportMode,
     report_date: date,
@@ -250,11 +260,6 @@ def render_report(
     """Render one of the two collaborative report modes from structured results."""
 
     normalized_mode = ReportMode(mode)
-    report_generated_at = generated_at or _default_generated_at(normalized_mode, report_date)
-    if report_generated_at.tzinfo is None or report_generated_at.utcoffset() is None:
-        raise ValueError("generated_at must be timezone-aware")
-    if report_generated_at.astimezone(_SHANGHAI).date() != report_date:
-        raise ValueError("generated_at must match report_date in Asia/Shanghai")
     if normalized_mode is ReportMode.PREMARKET:
         sections = _module_sections(modules, ("global", "gold", "portfolio"))
         short_title, swing_title = "短线候选池", "波段候选池"
@@ -262,8 +267,14 @@ def render_report(
         sections = _module_sections(modules, ("market", "portfolio", "backtests", "gold"))
         short_title, swing_title = "下一交易日短线池", "下一交易日波段池"
 
-    short_views = tuple(_candidate_view(item, report_generated_at) for item in short_term_candidates)
-    swing_views = tuple(_candidate_view(item, report_generated_at) for item in swing_candidates)
+    short_views = tuple(
+        _candidate_view(item, normalized_mode, report_date, generated_at)
+        for item in short_term_candidates
+    )
+    swing_views = tuple(
+        _candidate_view(item, normalized_mode, report_date, generated_at)
+        for item in swing_candidates
+    )
     morning_rows = _morning_rows(morning_candidates)
     subject = build_subject(normalized_mode, report_date, prefix=subject_prefix)
     template = _ENVIRONMENT.get_template("collaborative_report.html.j2")

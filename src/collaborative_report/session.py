@@ -1,7 +1,7 @@
 """Trading-session identity and delivery-window gating for reports."""
 
 from dataclasses import dataclass
-from datetime import date, datetime, time
+from datetime import date, datetime, time, timezone
 from zoneinfo import ZoneInfo
 
 import exchange_calendars
@@ -31,6 +31,57 @@ def _shanghai_time(current_time: datetime | None) -> datetime:
     if current_time.tzinfo is None:
         return current_time.replace(tzinfo=SHANGHAI_TIMEZONE)
     return current_time.astimezone(SHANGHAI_TIMEZONE)
+
+
+def _xshg_calendar():
+    try:
+        return exchange_calendars.get_calendar("XSHG")
+    except Exception as exc:
+        raise RuntimeError("trading calendar unavailable") from exc
+
+
+def _latest_completed_session(calendar, current_time: datetime) -> date:
+    if current_time.tzinfo is None or current_time.utcoffset() is None:
+        raise ValueError("current_time must be timezone-aware")
+    current_utc = current_time.astimezone(timezone.utc)
+    try:
+        session = calendar.date_to_session(current_utc.date(), direction="previous")
+        while calendar.session_close(session).to_pydatetime() > current_utc:
+            session = calendar.previous_session(session)
+        return session.date()
+    except Exception as exc:
+        raise RuntimeError("trading calendar unavailable") from exc
+
+
+def latest_completed_xshg_session(current_time: datetime) -> date:
+    """Return the latest XSHG session closed by an actual aware instant."""
+
+    return _latest_completed_session(_xshg_calendar(), current_time)
+
+
+def report_data_session(
+    mode: ReportMode,
+    report_date: date,
+    generated_at: datetime | None = None,
+) -> date:
+    """Resolve the completed XSHG session whose data a report may expose."""
+
+    if not isinstance(mode, ReportMode):
+        raise ValueError("invalid report mode")
+    calendar = _xshg_calendar()
+    if generated_at is not None:
+        if generated_at.tzinfo is None or generated_at.utcoffset() is None:
+            raise ValueError("generated_at must be timezone-aware")
+        if generated_at.astimezone(SHANGHAI_TIMEZONE).date() != report_date:
+            raise ValueError("generated_at must match report_date in Asia/Shanghai")
+        return _latest_completed_session(calendar, generated_at)
+    try:
+        session = calendar.date_to_session(report_date, direction="previous")
+        if mode is ReportMode.PREMARKET and session.date() == report_date:
+            session = calendar.previous_session(session)
+        return session.date()
+    except Exception as exc:
+        raise RuntimeError("trading calendar unavailable") from exc
 
 
 def build_report_session(

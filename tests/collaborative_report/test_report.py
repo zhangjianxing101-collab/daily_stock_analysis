@@ -1,4 +1,5 @@
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timezone
+from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
 from src.collaborative_report.models import Candidate, ModuleResult, ReportMode
@@ -173,30 +174,130 @@ def test_stale_or_non_actionable_candidate_suppresses_all_price_levels() -> None
     assert "12.00" not in rendered.text
 
 
-def test_stale_timestamp_without_warning_suppresses_levels_but_fresh_candidate_keeps_them() -> None:
-    generated_at = datetime(2026, 8, 19, 9, 0, tzinfo=SHANGHAI)
-    stale = candidate(observed_at=generated_at - timedelta(hours=25))
-    fresh = candidate(name="新鲜股份", observed_at=generated_at - timedelta(minutes=5))
+def test_friday_close_candidate_is_actionable_in_monday_premarket_report() -> None:
+    report_date = date(2026, 8, 17)
+    generated_at = datetime(2026, 8, 17, 9, 0, tzinfo=SHANGHAI)
+    friday_close = candidate(observed_at=datetime(2026, 8, 14, 15, 5, tzinfo=SHANGHAI))
 
-    stale_policy = evaluate_candidate_actionability(stale, generated_at=generated_at)
-    fresh_policy = evaluate_candidate_actionability(fresh, generated_at=generated_at)
+    policy = evaluate_candidate_actionability(
+        friday_close,
+        mode=ReportMode.PREMARKET,
+        report_date=report_date,
+        generated_at=generated_at,
+    )
     rendered = render_report(
         ReportMode.PREMARKET,
-        date(2026, 8, 19),
+        report_date,
         modules={},
-        short_term_candidates=(stale,),
-        swing_candidates=(fresh,),
+        short_term_candidates=(friday_close,),
         generated_at=generated_at,
     )
 
-    assert stale_policy.actionable is False
-    assert stale_policy.reason == "数据时间超过24小时，仅供观察"
-    assert fresh_policy.actionable is True
+    assert policy.actionable is True
     for output in (rendered.html, rendered.text):
-        assert "数据时间超过24小时，仅供观察" in output
-        assert output.count("放量突破10.60") == 1
-        assert output.count("9.80") == 1
-        assert output.count("12.00") == 1
+        assert "放量突破10.60" in output
+        assert "9.80" in output
+        assert "12.00" in output
+
+
+def test_last_open_session_survives_multi_day_xshg_holiday() -> None:
+    policy = evaluate_candidate_actionability(
+        candidate(observed_at=datetime(2025, 9, 30, 15, 5, tzinfo=SHANGHAI)),
+        mode=ReportMode.PREMARKET,
+        report_date=date(2025, 10, 9),
+        generated_at=datetime(2025, 10, 9, 9, 0, tzinfo=SHANGHAI),
+    )
+
+    assert policy.actionable is True
+
+
+def test_candidate_older_than_expected_market_session_is_suppressed() -> None:
+    old_candidate = candidate(observed_at=datetime(2025, 9, 29, 15, 5, tzinfo=SHANGHAI))
+    generated_at = datetime(2025, 10, 9, 9, 0, tzinfo=SHANGHAI)
+    policy = evaluate_candidate_actionability(
+        old_candidate,
+        mode=ReportMode.PREMARKET,
+        report_date=date(2025, 10, 9),
+        generated_at=generated_at,
+    )
+    rendered = render_report(
+        ReportMode.PREMARKET,
+        date(2025, 10, 9),
+        modules={},
+        short_term_candidates=(old_candidate,),
+        generated_at=generated_at,
+    )
+
+    assert policy.actionable is False
+    assert policy.reason == "数据交易日2025-09-29早于预期交易日2025-09-30，仅供观察"
+    for output in (rendered.html, rendered.text):
+        assert policy.reason in output
+        assert "放量突破10.60" not in output
+        assert "9.80" not in output
+        assert "12.00" not in output
+
+
+def test_cross_timezone_equivalent_instants_are_not_future() -> None:
+    generated_at = datetime(2026, 8, 17, 9, 0, tzinfo=SHANGHAI)
+    same_instant_utc = candidate(observed_at=datetime(2026, 8, 17, 1, 0, tzinfo=timezone.utc))
+
+    policy = evaluate_candidate_actionability(
+        same_instant_utc,
+        mode=ReportMode.PREMARKET,
+        report_date=date(2026, 8, 17),
+        generated_at=generated_at,
+    )
+
+    assert policy.actionable is True
+
+
+def test_actual_premarket_generation_time_accepts_post_nine_observation() -> None:
+    generated_at = datetime(2026, 8, 17, 9, 20, tzinfo=SHANGHAI)
+    observed = candidate(observed_at=datetime(2026, 8, 17, 9, 10, tzinfo=SHANGHAI))
+
+    policy = evaluate_candidate_actionability(
+        observed,
+        mode=ReportMode.PREMARKET,
+        report_date=date(2026, 8, 17),
+        generated_at=generated_at,
+    )
+
+    assert policy.actionable is True
+
+
+def test_omitted_generated_at_uses_session_identity_without_inventing_time() -> None:
+    observed_after_nine = candidate(observed_at=datetime(2026, 8, 17, 9, 10, tzinfo=SHANGHAI))
+
+    rendered = render_report(
+        ReportMode.PREMARKET,
+        date(2026, 8, 17),
+        modules={},
+        short_term_candidates=(observed_after_nine,),
+    )
+
+    for output in (rendered.html, rendered.text):
+        assert "数据时间晚于报告生成时间" not in output
+        assert "放量突破10.60" in output
+
+
+def test_calendar_failure_suppresses_levels() -> None:
+    with patch(
+        "src.collaborative_report.session.exchange_calendars.get_calendar",
+        side_effect=RuntimeError("calendar down"),
+    ):
+        rendered = render_report(
+            ReportMode.PREMARKET,
+            date(2026, 8, 17),
+            modules={},
+            short_term_candidates=(
+                candidate(observed_at=datetime(2026, 8, 17, 8, 55, tzinfo=SHANGHAI)),
+            ),
+            generated_at=datetime(2026, 8, 17, 9, 0, tzinfo=SHANGHAI),
+        )
+
+    for output in (rendered.html, rendered.text):
+        assert "交易日历不可用，仅供观察" in output
+        assert "放量突破10.60" not in output
 
 
 def test_html_and_text_share_complete_disclaimer_content() -> None:
