@@ -5,7 +5,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src.collaborative_report.market_data import MarketDataset
+from src.collaborative_report.market_data import MarketDataset, normalize_a_share_snapshot
 from src.collaborative_report.screener import ScreeningResult, prefilter_universe, screen_aggressive
 
 
@@ -51,6 +51,10 @@ def bars(
         closes = np.linspace(10.0, 13.0, 60)
         volumes = np.full(60, 100.0)
         volumes[-1] = 120.0 if current_volume is None else current_volume
+    elif kind == "downtrend":
+        closes = np.linspace(20.0, 10.0, 60)
+        volumes = np.full(60, 100.0)
+        volumes[-1] = 100.0 if current_volume is None else current_volume
     else:
         closes = np.full(60, 10.0)
         volumes = np.full(60, 100.0)
@@ -83,7 +87,7 @@ def test_breakout_has_exact_short_score_rules_and_risk_prices() -> None:
     assert candidate.score == 100
     assert candidate.matched_rules == (
         "ma5>ma10>ma20",
-        "close>prior_20d_high",
+        "close_breaks_20d_high",
         "volume_expansion>=1.5",
         "0<return_5d<15%",
         "leading_sector",
@@ -107,7 +111,7 @@ def test_swing_has_exact_score_and_rules() -> None:
     candidate = result.swing[0]
     assert candidate.score == 100
     assert candidate.matched_rules == (
-        "ma20>ma50_and_close>ma20",
+        "ma20>ma50且close>ma20",
         "3%<=return_20d<=25%",
         "0%<=close_above_ma20<=8%",
         "volume_expansion>=1.2",
@@ -126,12 +130,12 @@ def test_turnover_score_boundaries(turnover: float, short_points: int, swing_poi
     result = screen_aggressive(
         pd.DataFrame([snapshot_row("000003", price=13.0, turnover=turnover)]),
         {"000003": bars("swing")},
-        {},
+        {"000003": "强势板块"},
         observed_at=OBSERVED_AT,
     )
 
-    assert result.short_term[0].score == 40 + short_points
-    assert result.swing[0].score == 85 + swing_points
+    assert result.short_term[0].score == 50 + short_points
+    assert result.swing[0].score == 95 + swing_points
 
 
 def test_return_and_volume_boundaries_are_inclusive_only_where_specified() -> None:
@@ -187,7 +191,68 @@ def test_prior_high_excludes_current_bar() -> None:
         observed_at=OBSERVED_AT,
     )
 
-    assert "close>prior_20d_high" in result.short_term[0].matched_rules
+    assert "close_breaks_20d_high" in result.short_term[0].matched_rules
+
+
+def test_normalized_akshare_snapshot_integrates_with_prefilter_and_screening() -> None:
+    normalized = normalize_a_share_snapshot(
+        pd.DataFrame(
+            {
+                "代码": ["000007"],
+                "名称": ["测试股份"],
+                "最新价": ["12.0"],
+                "涨跌幅": ["3.0%"],
+                "量比": ["1.8"],
+                "换手率": ["3.0%"],
+                "成交额": ["100,000,000"],
+                "成交量": ["1,000,000"],
+                "总市值": ["2,000,000,000"],
+            }
+        )
+    )
+
+    assert prefilter_universe(normalized, 5)["code"].tolist() == ["000007"]
+    result = screen_aggressive(normalized, {"000007": bars()}, {}, observed_at=OBSERVED_AT)
+    assert [candidate.code for candidate in result.short_term] == ["000007"]
+
+
+def test_zero_score_history_is_omitted_from_both_pools() -> None:
+    result = screen_aggressive(
+        pd.DataFrame([snapshot_row("000008", price=10.0, turnover=20.0)]),
+        {"000008": bars("downtrend")},
+        {},
+        observed_at=OBSERVED_AT,
+    )
+
+    assert result.short_term == ()
+    assert result.swing == ()
+
+
+def test_weak_universe_does_not_fill_requested_limits() -> None:
+    no_core = bars("flat", current_volume=200.0)
+    no_core.loc[no_core.index[:40], ["open", "high", "low", "close"]] = [10.95, 11.15, 10.85, 11.0]
+    no_core.loc[no_core.index[-10:-6], ["open", "high", "low", "close"]] = [11.95, 12.15, 11.85, 12.0]
+    no_core.loc[no_core.index[-1], ["open", "high", "low", "close"]] = [10.45, 10.65, 10.35, 10.5]
+    snapshot = pd.DataFrame(
+        [
+            snapshot_row("000080", price=12.0),
+            snapshot_row("000081", price=13.0, turnover=0.5),
+            snapshot_row("000082", price=10.5),
+        ]
+    )
+    histories = {"000080": bars(), "000081": bars("swing"), "000082": no_core}
+
+    result = screen_aggressive(
+        snapshot,
+        histories,
+        {"000082": "强势板块"},
+        short_limit=5,
+        swing_limit=5,
+        observed_at=OBSERVED_AT,
+    )
+
+    assert [candidate.code for candidate in result.short_term] == ["000080"]
+    assert [candidate.code for candidate in result.swing] == ["000081", "000080"]
 
 
 def test_atr_uses_previous_close_for_gap_true_range() -> None:
@@ -324,6 +389,32 @@ def test_market_dataset_metadata_and_plain_frame_metadata() -> None:
     assert candidates["000051"].source == "validated_history"
     assert candidates["000051"].observed_at == OBSERVED_AT
     assert all(candidate.observed_at.utcoffset() is not None for candidate in candidates.values())
+
+
+def test_plain_history_requires_explicit_observed_at() -> None:
+    with pytest.raises(ValueError, match="^observed_at is required for DataFrame histories$"):
+        screen_aggressive(pd.DataFrame([snapshot_row("000052")]), {"000052": bars()}, {})
+
+
+def test_plain_history_is_repeatable_with_explicit_observed_at() -> None:
+    snapshot = pd.DataFrame([snapshot_row("000053")])
+    histories = {"000053": bars()}
+
+    first = screen_aggressive(snapshot, histories, {}, observed_at=OBSERVED_AT)
+    second = screen_aggressive(snapshot, histories, {}, observed_at=OBSERVED_AT)
+
+    assert first == second
+    assert first.short_term[0].observed_at == OBSERVED_AT
+
+
+def test_market_dataset_history_uses_its_timestamp_without_observed_at_argument() -> None:
+    history_time = datetime(2026, 8, 19, 7, 45, tzinfo=timezone.utc)
+    history = MarketDataset(bars(), "provider-b", history_time)
+
+    result = screen_aggressive(pd.DataFrame([snapshot_row("000054")]), {"000054": history}, {})
+
+    assert result.short_term[0].observed_at == history_time
+    assert result.short_term[0].source == "provider-b"
 
 
 def test_prefilter_is_stable_capped_canonical_and_does_not_mutate() -> None:

@@ -19,6 +19,7 @@ _SNAPSHOT_COLUMNS = (
     "volume_ratio",
     "turnover",
     "amount",
+    "volume",
     "total_mv",
 )
 _SNAPSHOT_ALIASES = {
@@ -29,6 +30,7 @@ _SNAPSHOT_ALIASES = {
     "volume_ratio": ("volume_ratio", "量比"),
     "turnover": ("turnover", "换手率", "换手"),
     "amount": ("amount", "成交额"),
+    "volume": ("volume", "成交量"),
     "total_mv": ("total_mv", "总市值"),
 }
 _BAR_ALIASES = {

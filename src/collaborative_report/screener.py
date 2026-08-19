@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Mapping
 
 import numpy as np
@@ -14,6 +14,8 @@ from .models import Candidate
 
 
 _SNAPSHOT_REQUIRED = ("code", "name", "price", "change_pct", "volume_ratio", "turnover", "amount", "volume")
+_SHORT_CORE_RULES = frozenset(("ma5>ma10>ma20", "close_breaks_20d_high"))
+_SWING_CORE_RULE = "ma20>ma50且close>ma20"
 _BAR_ALIASES = {
     "date": ("date", "Date", "日期", "时间"),
     "open": ("open", "Open", "开盘"),
@@ -182,10 +184,12 @@ def _indicators(frame: pd.DataFrame) -> _Indicators:
 
 def _metadata(
     history: MarketDataset | pd.DataFrame,
-    fallback_observed_at: datetime,
+    fallback_observed_at: datetime | None,
 ) -> tuple[datetime, str]:
     if isinstance(history, MarketDataset):
         return history.observed_at, history.source
+    if fallback_observed_at is None:
+        raise ValueError("observed_at is required for DataFrame histories")
     return fallback_observed_at, "validated_history"
 
 
@@ -194,7 +198,7 @@ def _short_rules(indicators: _Indicators, turnover: float, leading: bool) -> tup
     rules: list[str] = []
     conditions = (
         (indicators.ma5 > indicators.ma10 > indicators.ma20, 25, "ma5>ma10>ma20"),
-        (indicators.close > indicators.prior_high20, 25, "close>prior_20d_high"),
+        (indicators.close > indicators.prior_high20, 25, "close_breaks_20d_high"),
         (indicators.volume_expansion >= 1.5, 20, "volume_expansion>=1.5"),
         (
             indicators.return5 > 0
@@ -227,7 +231,7 @@ def _swing_rules(indicators: _Indicators, turnover: float, leading: bool) -> tup
         and (above_ma20 < 8 or _at_boundary(above_ma20, 8))
     )
     conditions = (
-        (indicators.ma20 > indicators.ma50 and indicators.close > indicators.ma20, 30, "ma20>ma50_and_close>ma20"),
+        (indicators.ma20 > indicators.ma50 and indicators.close > indicators.ma20, 30, "ma20>ma50且close>ma20"),
         (return20_in_range, 20, "3%<=return_20d<=25%"),
         (above_ma20_in_range, 20, "0%<=close_above_ma20<=8%"),
         (indicators.volume_expansion >= 1.2, 15, "volume_expansion>=1.2"),
@@ -245,14 +249,14 @@ def _trigger(horizon: str, rules: tuple[str, ...], inaccessible: bool) -> str:
     if inaccessible:
         return "观望：涨停附近，等待恢复可交易"
     if horizon == "short":
-        if "close>prior_20d_high" in rules and "volume_expansion>=1.5" in rules:
+        if "close_breaks_20d_high" in rules and "volume_expansion>=1.5" in rules:
             return "放量突破前20日高点"
-        if "close>prior_20d_high" in rules:
+        if "close_breaks_20d_high" in rules:
             return "突破前20日高点"
         if "ma5>ma10>ma20" in rules:
             return "MA5高于MA10和MA20"
         return "短线动量条件跟踪"
-    return "站稳MA20且MA20高于MA50" if "ma20>ma50_and_close>ma20" in rules else "回到MA20上方后跟踪"
+    return "站稳MA20且MA20高于MA50" if "ma20>ma50且close>ma20" in rules else "回到MA20上方后跟踪"
 
 
 def _candidate(
@@ -310,13 +314,10 @@ def screen_aggressive(
 ) -> ScreeningResult:
     """Screen liquid A-shares with fixed technical rules and no AI calls."""
 
-    fallback_time = observed_at
-    if fallback_time is None and isinstance(snapshot, MarketDataset):
-        fallback_time = snapshot.observed_at
-    if fallback_time is None:
-        fallback_time = datetime.now(timezone.utc)
-    if fallback_time.tzinfo is None or fallback_time.utcoffset() is None:
+    if observed_at is not None and (observed_at.tzinfo is None or observed_at.utcoffset() is None):
         raise ValueError("observed_at must be timezone-aware")
+    if observed_at is None and any(isinstance(history, pd.DataFrame) for history in histories.values()):
+        raise ValueError("observed_at is required for DataFrame histories")
 
     universe = prefilter_universe(snapshot, prefilter_limit)
     short_pool: list[_RankedCandidate] = []
@@ -345,36 +346,36 @@ def screen_aggressive(
             warnings.append(f"{code}: risk bounds invalid")
             continue
 
-        candidate_time, source = _metadata(history, fallback_time)
+        candidate_time, source = _metadata(history, observed_at)
         turnover = float(row["turnover"])
         leading = code in leading_sectors
         inaccessible = float(row["change_pct"]) >= 9.8
         short_score, short_rules = _short_rules(indicators, turnover, leading)
         swing_score, swing_rules = _swing_rules(indicators, turnover, leading)
-        short = _candidate(
-            row,
-            indicators,
-            horizon="short",
-            score=short_score,
-            rules=short_rules,
-            observed_at=candidate_time,
-            source=source,
-            inaccessible=inaccessible,
-        )
-        swing = _candidate(
-            row,
-            indicators,
-            horizon="swing",
-            score=swing_score,
-            rules=swing_rules,
-            observed_at=candidate_time,
-            source=source,
-            inaccessible=inaccessible,
-        )
-        ranked_short = _RankedCandidate(short, float(row["amount"]), inaccessible)
-        ranked_swing = _RankedCandidate(swing, float(row["amount"]), inaccessible)
-        short_pool.append(ranked_short)
-        swing_pool.append(ranked_swing)
+        if short_score >= 45 and _SHORT_CORE_RULES.intersection(short_rules):
+            short = _candidate(
+                row,
+                indicators,
+                horizon="short",
+                score=short_score,
+                rules=short_rules,
+                observed_at=candidate_time,
+                source=source,
+                inaccessible=inaccessible,
+            )
+            short_pool.append(_RankedCandidate(short, float(row["amount"]), inaccessible))
+        if swing_score >= 50 and _SWING_CORE_RULE in swing_rules:
+            swing = _candidate(
+                row,
+                indicators,
+                horizon="swing",
+                score=swing_score,
+                rules=swing_rules,
+                observed_at=candidate_time,
+                source=source,
+                inaccessible=inaccessible,
+            )
+            swing_pool.append(_RankedCandidate(swing, float(row["amount"]), inaccessible))
         if inaccessible:
             warnings.append(f"{code}: inaccessible upper limit, watch only")
 

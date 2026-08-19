@@ -48,6 +48,7 @@ def test_normalize_a_share_snapshot_maps_chinese_columns_and_numeric_values() ->
             "量比": ["1.8"],
             "换手率": ["2.2%"],
             "成交额": ["1,234.5"],
+            "成交量": ["12,345"],
             "总市值": ["9,876.5"],
         }
     )
@@ -62,6 +63,7 @@ def test_normalize_a_share_snapshot_maps_chinese_columns_and_numeric_values() ->
         "volume_ratio",
         "turnover",
         "amount",
+        "volume",
         "total_mv",
     ]
     assert result.iloc[0].to_dict() == {
@@ -72,6 +74,7 @@ def test_normalize_a_share_snapshot_maps_chinese_columns_and_numeric_values() ->
         "volume_ratio": 1.8,
         "turnover": 2.2,
         "amount": 1234.5,
+        "volume": 12345.0,
         "total_mv": 9876.5,
     }
 
