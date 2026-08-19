@@ -172,6 +172,8 @@ def _exact_ratio_in_band(
     denominators: pd.Series,
     lower: Decimal,
     upper: Decimal,
+    *,
+    lower_inclusive: bool = True,
 ) -> pd.Series:
     matches: list[bool] = []
     one = Decimal("1")
@@ -180,7 +182,8 @@ def _exact_ratio_in_band(
             matches.append(False)
             continue
         ratio = Decimal(str(numerator)) / Decimal(str(denominator)) - one
-        matches.append(lower <= ratio <= upper)
+        lower_matches = lower <= ratio if lower_inclusive else lower < ratio
+        matches.append(lower_matches and ratio <= upper)
     return pd.Series(matches, index=numerators.index, dtype=bool)
 
 
@@ -386,9 +389,16 @@ def backtest_swing(
     ma20 = close.rolling(20).mean()
     ma50 = close.rolling(50).mean()
     return_in_band = _exact_ratio_in_band(close, close.shift(20), Decimal("0.03"), Decimal("0.25"))
-    bias_in_band = _exact_ratio_in_band(close, ma20, Decimal("0"), Decimal("0.08"))
+    bias_in_band = _exact_ratio_in_band(
+        close,
+        ma20,
+        Decimal("0"),
+        Decimal("0.08"),
+        lower_inclusive=False,
+    )
     signals = (
         (ma20 > ma50)
+        & (close > ma20)
         & return_in_band
         & bias_in_band
     ).fillna(False)

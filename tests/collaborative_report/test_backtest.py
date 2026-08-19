@@ -308,13 +308,23 @@ def test_swing_return_values_just_outside_exact_boundaries_are_rejected(
     ) is False
 
 
-@pytest.mark.parametrize("latest_close", [100.0, 108.0])
-def test_swing_bias_boundaries_are_exact_and_inclusive(
-    monkeypatch: pytest.MonkeyPatch, latest_close: float
+def test_swing_zero_bias_is_rejected_and_smallest_positive_float_is_eligible(
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     assert _captured_swing_signal(
         monkeypatch,
-        swing_boundary_bars(latest_close=latest_close, return_base=90.0, ma20=100.0),
+        swing_boundary_bars(latest_close=100.0, return_base=90.0, ma20=100.0),
+    ) is False
+    assert _captured_swing_signal(
+        monkeypatch,
+        swing_boundary_bars(latest_close=np.nextafter(100.0, np.inf), return_base=90.0, ma20=100.0),
+    ) is True
+
+
+def test_swing_exact_eight_percent_bias_is_inclusive(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert _captured_swing_signal(
+        monkeypatch,
+        swing_boundary_bars(latest_close=108.0, return_base=90.0, ma20=100.0),
     ) is True
 
 
