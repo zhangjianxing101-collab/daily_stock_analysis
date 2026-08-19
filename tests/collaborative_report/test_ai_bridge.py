@@ -1,6 +1,5 @@
 import importlib
 import inspect
-import logging
 import sys
 from datetime import datetime, timezone
 from types import MappingProxyType, ModuleType, SimpleNamespace
@@ -58,6 +57,7 @@ def test_enrich_codes_exact_signature_deduplicates_and_calls_pipeline_once() -> 
         merge_notification=False,
         current_time=OBSERVED_AT,
         save_report=False,
+        privacy_safe=True,
     )
     assert output.name == "ai"
     assert output.status == "ok"
@@ -222,21 +222,15 @@ def test_pipeline_exception_is_sanitized_in_full_result_report() -> None:
     assert "token.example" not in serialized
 
 
-def test_collaborative_pipeline_logs_redact_requested_stock_codes(caplog) -> None:
+def test_collaborative_bridge_enables_pipeline_privacy_safe_mode() -> None:
     from src.collaborative_report.ai_bridge import enrich_codes
 
-    class LoggingPipeline:
-        def run(self, **kwargs):
-            logging.getLogger("src.core.pipeline").warning(
-                "processing portfolio code %s", kwargs["stock_codes"][0]
-            )
-            return []
+    pipeline = Mock()
+    pipeline.run.return_value = []
 
-    with caplog.at_level(logging.WARNING):
-        enrich_codes(["600519"], LoggingPipeline(), observed_at=OBSERVED_AT)
+    enrich_codes(["600519"], pipeline, observed_at=OBSERVED_AT)
 
-    assert "600519" not in caplog.text
-    assert "[redacted-stock]" in caplog.text
+    assert pipeline.run.call_args.kwargs["privacy_safe"] is True
 
 
 def test_empty_valid_codes_skip_with_immutable_payload_and_fixed_warning(monkeypatch) -> None:
@@ -285,6 +279,7 @@ def test_candidate_objects_are_not_accepted_or_mutated() -> None:
         merge_notification=False,
         current_time=OBSERVED_AT,
         save_report=False,
+        privacy_safe=True,
     )
 
 

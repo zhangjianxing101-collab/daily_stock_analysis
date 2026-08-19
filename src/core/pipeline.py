@@ -19,6 +19,7 @@ from pathlib import Path
 import uuid
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextvars import ContextVar, copy_context
 from datetime import date, datetime, timedelta, timezone
 from types import SimpleNamespace
 from typing import List, Dict, Any, Optional, Tuple, Callable
@@ -92,6 +93,7 @@ from src.services.decision_signal_extractor import (
 from src.services.decision_signal_summary import summarize_decision_signal
 from src.enums import ReportType
 from src.stock_analyzer import StockTrendAnalyzer, TrendAnalysisResult
+from src.utils.sanitize import sanitize_diagnostic_text
 from src.core.trading_calendar import (
     build_market_phase_context,
     get_effective_trading_date,
@@ -104,6 +106,30 @@ from bot.models import BotMessage
 
 
 logger = logging.getLogger(__name__)
+
+_PIPELINE_PRIVACY_SAFE = ContextVar("pipeline_privacy_safe", default=False)
+
+
+def _scrub_privacy_safe_record(record: logging.LogRecord) -> logging.LogRecord:
+    if not _PIPELINE_PRIVACY_SAFE.get():
+        return record
+    category = sanitize_diagnostic_text("pipeline_event", max_length=40) or "pipeline_event"
+    record.msg = "privacy_safe=%s severity=%s category=%s"
+    record.args = (True, record.levelname.lower(), category)
+    record.exc_info = None
+    record.exc_text = None
+    record.stack_info = None
+    return record
+
+
+_previous_log_record_factory = logging.getLogRecordFactory()
+
+
+def _privacy_aware_log_record_factory(*args: Any, **kwargs: Any) -> logging.LogRecord:
+    return _scrub_privacy_safe_record(_previous_log_record_factory(*args, **kwargs))
+
+
+logging.setLogRecordFactory(_privacy_aware_log_record_factory)
 
 
 def _share_image_payload(result: Any) -> Optional[Dict[str, Any]]:
@@ -3124,6 +3150,32 @@ class StockAnalysisPipeline:
         current_time: Optional[datetime] = None,
         *,
         save_report: bool = True,
+        privacy_safe: bool = False,
+    ) -> List[AnalysisResult]:
+        """Run the pipeline, optionally replacing its logs with safe categories."""
+
+        token = _PIPELINE_PRIVACY_SAFE.set(bool(privacy_safe))
+        try:
+            return self._run_pipeline(
+                stock_codes=stock_codes,
+                dry_run=dry_run,
+                send_notification=send_notification,
+                merge_notification=merge_notification,
+                current_time=current_time,
+                save_report=save_report,
+            )
+        finally:
+            _PIPELINE_PRIVACY_SAFE.reset(token)
+
+    def _run_pipeline(
+        self,
+        stock_codes: Optional[List[str]] = None,
+        dry_run: bool = False,
+        send_notification: bool = True,
+        merge_notification: bool = False,
+        current_time: Optional[datetime] = None,
+        *,
+        save_report: bool = True,
     ) -> List[AnalysisResult]:
         """
         运行完整的分析流程
@@ -3211,6 +3263,7 @@ class StockAnalysisPipeline:
             # 提交任务
             future_to_code = {
                 executor.submit(
+                    copy_context().run,
                     self.process_single_stock,
                     code,
                     skip_analysis=dry_run,

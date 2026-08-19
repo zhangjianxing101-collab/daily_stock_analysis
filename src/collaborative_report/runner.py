@@ -2,14 +2,16 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import math
 import os
 import re
 import shutil
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field, fields, is_dataclass, replace
-from datetime import date, datetime
+from datetime import date, datetime, time, timedelta
 from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
@@ -38,6 +40,11 @@ SNAPSHOT_DAILY_CLOSE_TOLERANCE = 0.01
 _TEST_SUBJECT_PREFIX = "测试"
 _PRICE_CONFLICT_WARNING_CODE = "snapshot_daily_close_conflict"
 _PRICE_CONFLICT_CANDIDATE_WARNING = "价格来源冲突，仅供观望"
+_UNTRUSTED_SNAPSHOT_CANDIDATE_WARNING = "快照权威性不足，仅供观望"
+_SNAPSHOT_AUTHORITY_WARNING_CODE = "snapshot_timestamp_untrusted"
+_REPORT_KEY_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})-(premarket|postmarket)")
+_POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=4)
+_PREMARKET_MAX_SOURCE_AGE = timedelta(days=4)
 
 
 class FinalState(str, Enum):
@@ -52,36 +59,191 @@ class _DeliveryConfigurationError(RuntimeError):
     pass
 
 
+class _DeliveryNotAcceptedError(RuntimeError):
+    """Signals that SMTP acceptance definitively did not occur."""
+
+
+class DeliveryStateError(RuntimeError):
+    """Raised when local delivery ownership cannot be established safely."""
+
+
+class DeliveryState(str, Enum):
+    CLAIMED = "claimed"
+    SENDING = "sending"
+    SENT = "sent"
+    IN_DOUBT = "in_doubt"
+    FAILED = "failed"
+
+
 @dataclass(frozen=True)
 class ArtifactPaths:
     html_path: Path
     text_path: Path
     manifest_path: Path
+    index_path: Path | None = None
+    attempt_id: str | None = None
+
+
+def _canonical_report_key(report_key: str) -> str:
+    if not isinstance(report_key, str) or _REPORT_KEY_PATTERN.fullmatch(report_key) is None:
+        raise ValueError("invalid report key")
+    date_text, mode = report_key.rsplit("-", 1)
+    try:
+        parsed = date.fromisoformat(date_text)
+    except ValueError:
+        raise ValueError("invalid report key") from None
+    if f"{parsed.isoformat()}-{mode}" != report_key:
+        raise ValueError("invalid report key")
+    return report_key
+
+
+def _contained_path(root: Path, *parts: str) -> Path:
+    resolved_root = root.resolve(strict=False)
+    candidate = root.joinpath(*parts)
+    resolved_candidate = candidate.resolve(strict=False)
+    if not resolved_candidate.is_relative_to(resolved_root):
+        raise ValueError("path escapes output root")
+    return candidate
 
 
 class LocalDeliveryLedger:
-    """Atomic local production-delivery markers keyed by report identity."""
+    """Cross-process production-delivery claims keyed by report identity."""
 
     def __init__(self, output_dir: Path | str) -> None:
-        self.directory = Path(output_dir) / ".delivery-ledger"
+        self.root = Path(output_dir)
+        self.directory = _contained_path(self.root, ".delivery-ledger")
 
     def _path(self, report_key: str) -> Path:
-        return self.directory / f"{report_key}.json"
+        key = _canonical_report_key(report_key)
+        return _contained_path(self.root, ".delivery-ledger", f"{key}.json")
 
-    def is_sent(self, report_key: str) -> bool:
+    @contextmanager
+    def _locked(self):
+        self.directory.mkdir(parents=True, exist_ok=True, mode=0o700)
+        self.directory.chmod(0o700)
+        lock_path = _contained_path(self.root, ".delivery-ledger", ".lock")
+        descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
         try:
-            payload = json.loads(self._path(report_key).read_text(encoding="utf-8"))
-        except (OSError, UnicodeError, json.JSONDecodeError):
-            return False
-        return payload == {"report_key": report_key, "production_sent": True}
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            fcntl.flock(descriptor, fcntl.LOCK_UN)
+            os.close(descriptor)
 
-    def mark_sent(self, report_key: str, sent_at: datetime) -> None:
-        del sent_at
+    def _read(self, report_key: str) -> Mapping[str, Any] | None:
+        path = self._path(report_key)
+        try:
+            content = path.read_text(encoding="utf-8")
+        except FileNotFoundError:
+            return None
+        except (OSError, UnicodeError) as exc:
+            raise DeliveryStateError("delivery state unavailable") from exc
+        try:
+            payload = json.loads(content)
+            state = DeliveryState(payload["state"])
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+            raise DeliveryStateError("delivery state unavailable") from exc
+        if set(payload) != {"claim_id", "report_key", "state", "transitioned_at"}:
+            raise DeliveryStateError("delivery state unavailable")
+        if payload.get("report_key") != report_key:
+            raise DeliveryStateError("delivery state unavailable")
+        claim_id = payload.get("claim_id")
+        if not isinstance(claim_id, str) or re.fullmatch(r"[0-9a-f]{32}", claim_id) is None:
+            raise DeliveryStateError("delivery state unavailable")
+        try:
+            transitioned_at = datetime.fromisoformat(payload["transitioned_at"])
+        except (TypeError, ValueError):
+            raise DeliveryStateError("delivery state unavailable") from None
+        if transitioned_at.tzinfo is None or transitioned_at.utcoffset() is None:
+            raise DeliveryStateError("delivery state unavailable")
+        return payload
+
+    def status(self, report_key: str) -> DeliveryState | None:
+        with self._locked():
+            payload = self._read(report_key)
+        return DeliveryState(payload["state"]) if payload else None
+
+    def _write(
+        self,
+        report_key: str,
+        state: DeliveryState,
+        claim_id: str,
+        transitioned_at: datetime,
+    ) -> None:
+        if transitioned_at.tzinfo is None or transitioned_at.utcoffset() is None:
+            raise DeliveryStateError("delivery state timestamp unavailable")
+        payload = {
+            "claim_id": claim_id,
+            "report_key": report_key,
+            "state": state.value,
+            "transitioned_at": transitioned_at.isoformat(),
+        }
         _atomic_write(
             self._path(report_key),
-            json.dumps({"report_key": report_key, "production_sent": True}, sort_keys=True) + "\n",
+            json.dumps(payload, sort_keys=True) + "\n",
             mode=0o600,
         )
+
+    def claim(self, report_key: str, claimed_at: datetime) -> str | None:
+        key = _canonical_report_key(report_key)
+        with self._locked():
+            payload = self._read(key)
+            if payload is not None and DeliveryState(payload["state"]) is not DeliveryState.FAILED:
+                return None
+            claim_id = uuid.uuid4().hex
+            self._write(key, DeliveryState.CLAIMED, claim_id, claimed_at)
+            return claim_id
+
+    def _transition(
+        self,
+        report_key: str,
+        claim_id: str,
+        expected: set[DeliveryState],
+        target: DeliveryState,
+        transitioned_at: datetime,
+    ) -> None:
+        key = _canonical_report_key(report_key)
+        with self._locked():
+            payload = self._read(key)
+            if (
+                payload is None
+                or payload.get("claim_id") != claim_id
+                or DeliveryState(payload["state"]) not in expected
+            ):
+                raise DeliveryStateError("delivery state transition rejected")
+            self._write(key, target, claim_id, transitioned_at)
+
+    def begin_sending(self, report_key: str, claim_id: str, at: datetime) -> None:
+        self._transition(report_key, claim_id, {DeliveryState.CLAIMED}, DeliveryState.SENDING, at)
+
+    def mark_sent(self, report_key: str, claim_id: str, at: datetime) -> None:
+        self._transition(report_key, claim_id, {DeliveryState.SENDING}, DeliveryState.SENT, at)
+
+    def mark_in_doubt(self, report_key: str, claim_id: str, at: datetime) -> None:
+        self._transition(report_key, claim_id, {DeliveryState.SENDING}, DeliveryState.IN_DOUBT, at)
+
+    def mark_failed(self, report_key: str, claim_id: str, at: datetime) -> None:
+        self._transition(
+            report_key,
+            claim_id,
+            {DeliveryState.CLAIMED, DeliveryState.SENDING},
+            DeliveryState.FAILED,
+            at,
+        )
+
+    def reconcile(self, report_key: str, target: DeliveryState, at: datetime) -> None:
+        if target not in {DeliveryState.FAILED, DeliveryState.SENT}:
+            raise DeliveryStateError("invalid reconciliation target")
+        key = _canonical_report_key(report_key)
+        with self._locked():
+            payload = self._read(key)
+            if payload is None or DeliveryState(payload["state"]) not in {
+                DeliveryState.CLAIMED,
+                DeliveryState.SENDING,
+                DeliveryState.IN_DOUBT,
+            }:
+                raise DeliveryStateError("delivery state reconciliation rejected")
+            self._write(key, target, str(payload["claim_id"]), at)
 
 
 @dataclass(frozen=True)
@@ -127,7 +289,7 @@ class RunnerDependencies:
     sizing_evaluator: Callable[..., int] = suggested_board_lots
     ledger_factory: Callable[[Path | str], Any] = LocalDeliveryLedger
     artifact_writer: Callable[..., ArtifactPaths] | None = None
-    manifest_writer: Callable[[Path, str], None] | None = None
+    artifact_finalizer: Callable[..., ArtifactPaths] | None = None
 
 
 def _production_mail_sender(rendered: RenderedReport, *, test_email: bool = False) -> Any:
@@ -203,8 +365,10 @@ def _global_payload(dataset: MarketDataset) -> Mapping[str, Any]:
     return {str(row.get("symbol", index)): _as_payload(row) for index, row in enumerate(rows)}
 
 
-def _market_payload(dataset: MarketDataset) -> Mapping[str, Any]:
+def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[str, Any]:
     frame = dataset.frame
+    if not authoritative:
+        return {"股票数量": int(len(frame))}
     changes = pd.to_numeric(frame.get("change_pct", pd.Series(dtype=float)), errors="coerce")
     return {
         "股票数量": int(len(frame)),
@@ -213,12 +377,32 @@ def _market_payload(dataset: MarketDataset) -> Mapping[str, Any]:
     }
 
 
-def _snapshot_is_fresh(dataset: MarketDataset, session: ReportSession) -> bool:
+def _snapshot_fetch_is_current(dataset: MarketDataset, session: ReportSession) -> bool:
     observed_at = dataset.observed_at
     return (
         observed_at <= session.now_shanghai
         and observed_at.astimezone(session.now_shanghai.tzinfo).date() == session.trading_date
     )
+
+
+def _snapshot_source_is_authoritative(
+    dataset: MarketDataset,
+    session: ReportSession,
+    *,
+    expected_session: date,
+) -> bool:
+    source = dataset.source_timestamp
+    if source is None or source > session.now_shanghai:
+        return False
+    local = source.astimezone(SHANGHAI_TIMEZONE)
+    if local.date() != expected_session or local.time() < time(15, 0):
+        return False
+    maximum_age = (
+        _POSTMARKET_MAX_SOURCE_AGE
+        if session.mode is ReportMode.POSTMARKET
+        else _PREMARKET_MAX_SOURCE_AGE
+    )
+    return session.now_shanghai - local <= maximum_age
 
 
 def _portfolio_prices(snapshot: MarketDataset, positions: Sequence[Position]) -> dict[str, float]:
@@ -270,44 +454,41 @@ def _snapshot_history_conflicts(
 
 def _untrusted_snapshot_codes(
     snapshot: MarketDataset,
-    histories: Mapping[str, MarketDataset],
     *,
-    expected_session: date,
-    session: ReportSession,
-    conflict_codes: set[str],
+    source_is_authoritative: bool,
+    requested_codes: Sequence[str] = (),
 ) -> set[str]:
-    source_timestamp = snapshot.source_timestamp
-    source_is_current = bool(
-        source_timestamp is not None
-        and source_timestamp <= session.now_shanghai
-        and source_timestamp.astimezone(SHANGHAI_TIMEZONE).date() == session.trading_date
-    )
-    if source_is_current:
-        return set(conflict_codes)
+    if source_is_authoritative:
+        return set()
     codes = {str(code) for code in snapshot.frame.get("code", ())}
-    corroborated = {
-        code
-        for code in codes
-        if code in histories
-        and _last_session_bar(histories[code], expected_session) is not None
-        and code not in conflict_codes
-    }
-    return codes - corroborated
+    codes.update(str(code) for code in requested_codes)
+    return codes
 
 
-def _suppress_conflicting_candidates(
-    candidates: Sequence[Candidate], conflict_codes: set[str]
+def _suppress_unactionable_candidates(
+    candidates: Sequence[Candidate], conflict_codes: set[str], untrusted_codes: set[str]
 ) -> tuple[Candidate, ...]:
-    return tuple(
-        replace(
-            item,
-            trigger="观望：价格来源冲突",
-            warning=_PRICE_CONFLICT_CANDIDATE_WARNING,
-        )
-        if item.code in conflict_codes
-        else item
-        for item in candidates
-    )
+    projected: list[Candidate] = []
+    for item in candidates:
+        if item.code in conflict_codes:
+            projected.append(
+                replace(
+                    item,
+                    trigger="观望：价格来源冲突",
+                    warning=_PRICE_CONFLICT_CANDIDATE_WARNING,
+                )
+            )
+        elif item.code in untrusted_codes:
+            projected.append(
+                replace(
+                    item,
+                    trigger="观望：快照权威性不足",
+                    warning=_UNTRUSTED_SNAPSHOT_CANDIDATE_WARNING,
+                )
+            )
+        else:
+            projected.append(item)
+    return tuple(projected)
 
 
 def _last_session_bar(dataset: MarketDataset, expected_session: date) -> pd.Series | None:
@@ -406,10 +587,29 @@ def _load_prior_state(path: Path | None, session: ReportSession) -> tuple[Mappin
     return tuple(rows)
 
 
+def _fsync_directory(path: Path) -> None:
+    descriptor = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+@contextmanager
+def _exclusive_file_lock(path: Path):
+    descriptor = os.open(path, os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        fcntl.flock(descriptor, fcntl.LOCK_EX)
+        yield
+    finally:
+        fcntl.flock(descriptor, fcntl.LOCK_UN)
+        os.close(descriptor)
+
+
 def _atomic_write(path: Path, content: str, *, mode: int = 0o600) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.parent.chmod(0o700)
-    temporary = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
     try:
         with temporary.open("w", encoding="utf-8", newline="") as handle:
             handle.write(content)
@@ -417,6 +617,7 @@ def _atomic_write(path: Path, content: str, *, mode: int = 0o600) -> None:
             os.fsync(handle.fileno())
         temporary.chmod(mode)
         temporary.replace(path)
+        _fsync_directory(path.parent)
     finally:
         try:
             temporary.unlink()
@@ -432,15 +633,55 @@ def write_report_artifacts(
     manifest: Mapping[str, Any],
     test_email: bool = False,
 ) -> ArtifactPaths:
-    """Stage and atomically publish one coherent report-key artifact directory."""
+    """Publish an immutable attempt and atomically point at the coherent set."""
 
+    key = _canonical_report_key(report_key)
     root = Path(output_dir)
-    parent = root / ("test" if test_email else "production")
-    parent.mkdir(parents=True, exist_ok=True)
+    channel = "test" if test_email else "production"
+    parent = _contained_path(root, channel)
+    report_root = _contained_path(root, channel, key)
+    attempts = _contained_path(root, channel, key, "attempts")
+    parent.mkdir(parents=True, exist_ok=True, mode=0o700)
     parent.chmod(0o700)
-    final = parent / report_key
-    staging = parent / f".{report_key}.{uuid.uuid4().hex}.staging"
-    backup = parent / f".{report_key}.{uuid.uuid4().hex}.backup"
+    report_root.mkdir(mode=0o700, exist_ok=True)
+    report_root.chmod(0o700)
+    attempts.mkdir(mode=0o700, exist_ok=True)
+    attempts.chmod(0o700)
+    _fsync_directory(parent)
+    lock_path = _contained_path(root, channel, key, ".publish.lock")
+    with _exclusive_file_lock(lock_path):
+        return _write_report_artifact_attempt(
+            root,
+            channel=channel,
+            report_key=key,
+            report_root=report_root,
+            attempts=attempts,
+            rendered=rendered,
+            manifest=manifest,
+        )
+
+
+def _write_report_artifact_attempt(
+    root: Path,
+    *,
+    channel: str,
+    report_key: str,
+    report_root: Path,
+    attempts: Path,
+    rendered: RenderedReport,
+    manifest: Mapping[str, Any],
+) -> ArtifactPaths:
+    for child in report_root.iterdir():
+        if (
+            child.is_dir()
+            and not child.is_symlink()
+            and re.fullmatch(r"\.staging-[0-9a-f]{32}", child.name)
+        ):
+            shutil.rmtree(child)
+    attempt_id = uuid.uuid4().hex
+    staging = _contained_path(root, channel, report_key, f".staging-{attempt_id}")
+    attempt = _contained_path(root, channel, report_key, "attempts", attempt_id)
+    index_path = _contained_path(root, channel, report_key, "current.json")
     try:
         staging.mkdir(mode=0o700)
         _atomic_write(staging / "report.html", rendered.html)
@@ -449,16 +690,31 @@ def write_report_artifacts(
             staging / "manifest.json",
             json.dumps(dict(manifest), ensure_ascii=False, sort_keys=True, indent=2) + "\n",
         )
-        if final.exists():
-            final.replace(backup)
-        staging.replace(final)
-        shutil.rmtree(backup, ignore_errors=True)
+        _fsync_directory(staging)
+        staging.replace(attempt)
+        _fsync_directory(report_root)
+        _fsync_directory(attempts)
+        pointer = {
+            "attempt": attempt_id,
+            "html": f"attempts/{attempt_id}/report.html",
+            "manifest": f"attempts/{attempt_id}/manifest.json",
+            "text": f"attempts/{attempt_id}/report.txt",
+        }
+        _atomic_write(
+            index_path,
+            json.dumps(pointer, sort_keys=True) + "\n",
+            mode=0o600,
+        )
     except Exception:
         shutil.rmtree(staging, ignore_errors=True)
-        if backup.exists() and not final.exists():
-            backup.replace(final)
         raise
-    return ArtifactPaths(final / "report.html", final / "report.txt", final / "manifest.json")
+    return ArtifactPaths(
+        attempt / "report.html",
+        attempt / "report.txt",
+        attempt / "manifest.json",
+        index_path,
+        attempt_id,
+    )
 
 
 def _warning_codes(modules: Mapping[str, ModuleResult]) -> list[str]:
@@ -480,7 +736,10 @@ def _candidate_state(candidates: Sequence[Candidate], portfolio_codes: set[str])
         if (
             item.code in portfolio_codes
             or item.code in seen
-            or item.warning == _PRICE_CONFLICT_CANDIDATE_WARNING
+            or item.warning in {
+                _PRICE_CONFLICT_CANDIDATE_WARNING,
+                _UNTRUSTED_SNAPSHOT_CANDIDATE_WARNING,
+            }
         ):
             continue
         seen.add(item.code)
@@ -505,7 +764,13 @@ def _redacted_manifest(
     morning_candidates: Sequence[Mapping[str, Any]],
     portfolio_codes: set[str],
     test_email: bool,
+    market_source_timestamp: str,
 ) -> dict[str, Any]:
+    source_timestamps = {
+        name: result.observed_at.isoformat() for name, result in modules.items()
+    }
+    if "market" in modules:
+        source_timestamps["market"] = market_source_timestamp
     manifest: dict[str, Any] = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "report_key": session.report_key,
@@ -515,7 +780,7 @@ def _redacted_manifest(
         "final_state": final_state,
         "test_email": test_email,
         "module_statuses": {name: result.status for name, result in modules.items()},
-        "source_timestamps": {name: result.observed_at.isoformat() for name, result in modules.items()},
+        "source_timestamps": source_timestamps,
         "warning_codes": _warning_codes(modules),
     }
     if session.mode is ReportMode.PREMARKET:
@@ -580,9 +845,17 @@ def run_report(
         return _failure("report_identity_invalid")
     if not session.is_trading_day:
         return RunResult(EXIT_SUCCESS, FinalState.NON_TRADING_DAY_SKIP, session.report_key, {})
-    ledger = active.ledger_factory(output_dir)
-    if not test_email and (already_sent or ledger.is_sent(session.report_key)):
-        return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
+    ledger = None
+    if not test_email:
+        if already_sent:
+            return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
+        try:
+            ledger = active.ledger_factory(output_dir)
+            delivery_state = ledger.status(session.report_key)
+        except Exception:
+            return _failure("delivery_state_unavailable", report_key=session.report_key)
+        if delivery_state not in {None, DeliveryState.FAILED}:
+            return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
 
     try:
         settings = active.settings_loader()
@@ -590,7 +863,7 @@ def run_report(
         return _failure("configuration_invalid", report_key=session.report_key)
 
     artifact_writer = active.artifact_writer or write_report_artifacts
-    manifest_writer = active.manifest_writer or _atomic_write
+    artifact_finalizer = active.artifact_finalizer or write_report_artifacts
     try:
         expected_session = active.data_session_resolver(
             normalized_mode,
@@ -622,11 +895,29 @@ def run_report(
         modules["global"] = _unavailable("global", session.now_shanghai, "全球市场数据暂不可用")
 
     snapshot: MarketDataset | None
+    snapshot_source_is_authoritative = False
+    market_source_timestamp = "unavailable"
     try:
         snapshot = active.gateway.get_a_share_snapshot()
-        if not _snapshot_is_fresh(snapshot, session):
+        if not _snapshot_fetch_is_current(snapshot, session):
             raise ValueError("stale snapshot")
-        modules["market"] = _module("market", snapshot.observed_at, _market_payload(snapshot), *snapshot.warnings)
+        snapshot_source_is_authoritative = _snapshot_source_is_authoritative(
+            snapshot,
+            session,
+            expected_session=expected_session,
+        )
+        if snapshot_source_is_authoritative and snapshot.source_timestamp is not None:
+            market_source_timestamp = snapshot.source_timestamp.isoformat()
+        market_warnings = snapshot.warnings
+        if not snapshot_source_is_authoritative:
+            market_warnings = (*market_warnings, _SNAPSHOT_AUTHORITY_WARNING_CODE)
+        modules["market"] = ModuleResult(
+            "market",
+            "ok" if snapshot_source_is_authoritative else "partial",
+            snapshot.source_timestamp or snapshot.observed_at,
+            _market_payload(snapshot, authoritative=snapshot_source_is_authoritative),
+            tuple(dict.fromkeys(market_warnings)),
+        )
     except Exception:
         snapshot = None
         modules["market"] = _unavailable("market", session.now_shanghai, "数据不足，建议观望")
@@ -659,10 +950,8 @@ def run_report(
     untrusted_codes = (
         _untrusted_snapshot_codes(
             snapshot,
-            histories,
-            expected_session=expected_session,
-            session=session,
-            conflict_codes=conflict_codes,
+            source_is_authoritative=snapshot_source_is_authoritative,
+            requested_codes=requested_codes,
         )
         if snapshot is not None
         else set()
@@ -685,7 +974,7 @@ def run_report(
             "partial",
             market.observed_at,
             market.payload,
-            (*market.warnings, "snapshot_timestamp_untrusted"),
+            tuple(dict.fromkeys((*market.warnings, _SNAPSHOT_AUTHORITY_WARNING_CODE))),
         )
         prices = {code: price for code, price in prices.items() if code not in untrusted_codes}
 
@@ -715,8 +1004,12 @@ def run_report(
                 observed_at=session.now_shanghai,
             )
             screening = ScreeningResult(
-                _suppress_conflicting_candidates(screening.short_term, suppressed_codes),
-                _suppress_conflicting_candidates(screening.swing, suppressed_codes),
+                _suppress_unactionable_candidates(
+                    screening.short_term, conflict_codes, untrusted_codes
+                ),
+                _suppress_unactionable_candidates(
+                    screening.swing, conflict_codes, untrusted_codes
+                ),
                 screening.warnings,
             )
             status = "partial" if history_failures or screening.warnings else "ok"
@@ -878,6 +1171,7 @@ def run_report(
             morning_candidates=morning_candidates,
             portfolio_codes=portfolio_codes,
             test_email=test_email,
+            market_source_timestamp=market_source_timestamp,
         )
         paths = artifact_writer(
             output_dir,
@@ -889,25 +1183,55 @@ def run_report(
     except Exception:
         return _failure("artifact_write_failed", report_key=session.report_key, modules=modules)
 
-    try:
-        active.mail_sender(rendered, test_email=test_email)
-    except _DeliveryConfigurationError:
-        return _failure("configuration_invalid", report_key=session.report_key, modules=modules, paths=paths)
-    except Exception:
-        failure_manifest = dict(manifest, final_state=FinalState.HARD_FAILURE.value, error_code="delivery_failed")
-        try:
-            _atomic_write(
-                paths.manifest_path,
-                json.dumps(failure_manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
-            )
-        except Exception:
-            pass
-        return _failure("delivery_failed", report_key=session.report_key, modules=modules, paths=paths)
-
+    claim_id: str | None = None
     if not test_email:
         try:
-            ledger.mark_sent(session.report_key, session.now_shanghai)
+            claim_id = ledger.claim(session.report_key, session.now_shanghai)
+            if claim_id is None:
+                return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
+            ledger.begin_sending(session.report_key, claim_id, session.now_shanghai)
         except Exception:
+            return _failure(
+                "delivery_state_unavailable",
+                report_key=session.report_key,
+                modules=modules,
+                paths=paths,
+            )
+
+    try:
+        delivery_result = active.mail_sender(rendered, test_email=test_email)
+        if delivery_result is False:
+            raise RuntimeError("delivery result unavailable")
+    except _DeliveryConfigurationError:
+        if claim_id is not None:
+            try:
+                ledger.mark_failed(session.report_key, claim_id, session.now_shanghai)
+            except Exception:
+                pass
+        return _failure("configuration_invalid", report_key=session.report_key, modules=modules, paths=paths)
+    except _DeliveryNotAcceptedError:
+        if claim_id is not None:
+            try:
+                ledger.mark_failed(session.report_key, claim_id, session.now_shanghai)
+            except Exception:
+                pass
+        return _failure("delivery_failed", report_key=session.report_key, modules=modules, paths=paths)
+    except Exception:
+        if claim_id is not None:
+            try:
+                ledger.mark_in_doubt(session.report_key, claim_id, session.now_shanghai)
+            except Exception:
+                pass
+        return _failure("delivery_failed", report_key=session.report_key, modules=modules, paths=paths)
+
+    if claim_id is not None:
+        try:
+            ledger.mark_sent(session.report_key, claim_id, session.now_shanghai)
+        except Exception:
+            try:
+                ledger.mark_in_doubt(session.report_key, claim_id, session.now_shanghai)
+            except Exception:
+                pass
             modules["delivery_state"] = ModuleResult(
                 "delivery_state", "partial", session.now_shanghai, {}, ("delivery_ledger_update_failed",)
             )
@@ -919,9 +1243,12 @@ def run_report(
         warning_codes=_warning_codes(modules),
     )
     try:
-        manifest_writer(
-            paths.manifest_path,
-            json.dumps(manifest, ensure_ascii=False, sort_keys=True, indent=2) + "\n",
+        paths = artifact_finalizer(
+            output_dir,
+            report_key=session.report_key,
+            rendered=rendered,
+            manifest=manifest,
+            test_email=test_email,
         )
     except Exception:
         modules["delivery_state"] = ModuleResult(
