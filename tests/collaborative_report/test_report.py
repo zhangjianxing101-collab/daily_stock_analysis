@@ -82,6 +82,39 @@ def test_postmarket_report_contains_required_sections_and_optional_morning_statu
         assert expected in rendered.text
 
 
+def test_all_supplied_module_warnings_render_once_in_html_and_text() -> None:
+    rendered = render_report(
+        ReportMode.PREMARKET,
+        date(2026, 8, 19),
+        modules={
+            "global": module("global", {"状态": "正常"}, "全球模块警告"),
+            "ai": module("ai", {"结论": "仅使用确定性分析"}, "AI分析暂不可用", status="unavailable"),
+            "future_module": module("future_module", {"新字段": "保留展示"}, "未来模块警告"),
+        },
+    )
+
+    for warning in ("全球模块警告", "AI分析暂不可用", "未来模块警告"):
+        assert rendered.html.count(warning) == 1
+        assert rendered.text.count(warning) == 1
+    assert "AI分析" in rendered.html
+    assert "仅使用确定性分析" in rendered.html
+    assert "future_module" in rendered.text
+    assert "保留展示" in rendered.text
+
+
+def test_postmarket_without_morning_rows_renders_unavailable_status() -> None:
+    rendered = render_report(
+        ReportMode.POSTMARKET,
+        date(2026, 8, 19),
+        modules={},
+        morning_candidates=(),
+    )
+
+    for output in (rendered.html, rendered.text):
+        assert "早盘候选跟踪" in output
+        assert "暂无早盘候选记录，状态不可用" in output
+
+
 def test_report_autoescapes_user_supplied_values() -> None:
     rendered = render_report(
         ReportMode.PREMARKET,

@@ -20,6 +20,16 @@ _ENVIRONMENT = Environment(
     lstrip_blocks=True,
 )
 _DISCLAIMER = "人工确认后操作 / 不承诺收益 / 不自动下单"
+_NO_MORNING_STATUS = "暂无早盘候选记录，状态不可用"
+_MODULE_TITLES = {
+    "global": "全球与黄金背景",
+    "gold": "黄金量化背景",
+    "portfolio": "持仓状态",
+    "market": "市场宽度",
+    "backtests": "回测摘要",
+    "ai": "AI分析",
+    "screening": "筛选状态",
+}
 
 
 @dataclass(frozen=True)
@@ -94,6 +104,20 @@ def _module_view(title: str, result: ModuleResult | None) -> _ModuleView:
     return _ModuleView(title, result.status, _format_timestamp(result.observed_at), rows, warnings)
 
 
+def _module_sections(
+    modules: Mapping[str, ModuleResult], primary_keys: Sequence[str]
+) -> tuple[_ModuleView, ...]:
+    sections = [
+        _module_view(_MODULE_TITLES[key], modules.get(key)) for key in primary_keys
+    ]
+    for key, result in modules.items():
+        if key in primary_keys:
+            continue
+        title = _MODULE_TITLES.get(key, result.name or key)
+        sections.append(_module_view(title, result))
+    return tuple(sections)
+
+
 def _is_actionable(candidate: Candidate) -> bool:
     trigger = candidate.trigger.strip()
     return not candidate.warning.strip() and bool(trigger) and not any(
@@ -148,9 +172,12 @@ def _plain_text(
         lines.extend(f"{label}：{value}" for label, value in section.rows)
         lines.extend(f"警告：{warning}" for warning in section.warnings)
         lines.append("")
-    if mode is ReportMode.POSTMARKET and morning_rows:
+    if mode is ReportMode.POSTMARKET:
         lines.append("早盘候选跟踪")
-        lines.extend(f"{code} {name}：{status}" for code, name, status in morning_rows)
+        if morning_rows:
+            lines.extend(f"{code} {name}：{status}" for code, name, status in morning_rows)
+        else:
+            lines.append(_NO_MORNING_STATUS)
         lines.append("")
     for title, candidates in ((short_title, short_candidates), (swing_title, swing_candidates)):
         lines.append(title)
@@ -182,19 +209,10 @@ def render_report(
 
     normalized_mode = ReportMode(mode)
     if normalized_mode is ReportMode.PREMARKET:
-        sections = (
-            _module_view("全球与黄金背景", modules.get("global")),
-            _module_view("黄金量化背景", modules.get("gold")),
-            _module_view("持仓状态", modules.get("portfolio")),
-        )
+        sections = _module_sections(modules, ("global", "gold", "portfolio"))
         short_title, swing_title = "短线候选池", "波段候选池"
     else:
-        sections = (
-            _module_view("市场宽度", modules.get("market")),
-            _module_view("持仓状态", modules.get("portfolio")),
-            _module_view("回测摘要", modules.get("backtests")),
-            _module_view("黄金量化背景", modules.get("gold")),
-        )
+        sections = _module_sections(modules, ("market", "portfolio", "backtests", "gold"))
         short_title, swing_title = "下一交易日短线池", "下一交易日波段池"
 
     short_views = tuple(_candidate_view(item) for item in short_term_candidates)
@@ -212,6 +230,7 @@ def render_report(
         short_candidates=short_views,
         swing_candidates=swing_views,
         morning_rows=morning_rows,
+        no_morning_status=_NO_MORNING_STATUS,
         disclaimer=_DISCLAIMER,
     )
     text = _plain_text(
