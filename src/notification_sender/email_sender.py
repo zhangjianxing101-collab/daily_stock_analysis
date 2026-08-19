@@ -114,6 +114,29 @@ class EmailSender:
         sender_name = self._email_config.get('sender_name') or '股票分析助手'
         return formataddr((str(Header(str(sender_name), 'utf-8')), sender))
 
+    def _open_server(
+        self, sender: str, timeout_seconds: Optional[float]
+    ) -> smtplib.SMTP:
+        """Open the provider-specific SMTP connection without handling credentials."""
+        domain = sender.split('@')[-1].lower()
+        smtp_config = SMTP_CONFIGS.get(domain)
+        if smtp_config:
+            smtp_server = smtp_config['server']
+            smtp_port = smtp_config['port']
+            use_ssl = smtp_config['ssl']
+            logger.info(f"自动识别邮箱类型: {domain} -> {smtp_server}:{smtp_port}")
+        else:
+            smtp_server = f"smtp.{domain}"
+            smtp_port = 465
+            use_ssl = True
+            logger.warning(f"未知邮箱类型 {domain}，尝试通用配置: {smtp_server}:{smtp_port}")
+        timeout = timeout_seconds or 30
+        if use_ssl:
+            return smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=timeout)
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=timeout)
+        server.starttls()
+        return server
+
     @staticmethod
     def _close_server(server: Optional[smtplib.SMTP]) -> None:
         """Best-effort SMTP cleanup to avoid leaving sockets open on header/build errors.
@@ -182,31 +205,7 @@ class EmailSender:
             msg.attach(text_part)
             msg.attach(html_part)
             
-            # 自动识别 SMTP 配置
-            domain = sender.split('@')[-1].lower()
-            smtp_config = SMTP_CONFIGS.get(domain)
-            
-            if smtp_config:
-                smtp_server = smtp_config['server']
-                smtp_port = smtp_config['port']
-                use_ssl = smtp_config['ssl']
-                logger.info(f"自动识别邮箱类型: {domain} -> {smtp_server}:{smtp_port}")
-            else:
-                # 未知邮箱，尝试通用配置
-                smtp_server = f"smtp.{domain}"
-                smtp_port = 465
-                use_ssl = True
-                logger.warning(f"未知邮箱类型 {domain}，尝试通用配置: {smtp_server}:{smtp_port}")
-            
-            # 根据配置选择连接方式
-            if use_ssl:
-                # SSL 连接（端口 465）
-                server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=timeout_seconds or 30)
-            else:
-                # TLS 连接（端口 587）
-                server = smtplib.SMTP(smtp_server, smtp_port, timeout=timeout_seconds or 30)
-                server.starttls()
-            
+            server = self._open_server(sender, timeout_seconds)
             server.login(sender, password)
             server.send_message(msg)
             
@@ -216,11 +215,53 @@ class EmailSender:
         except smtplib.SMTPAuthenticationError:
             logger.error("邮件发送失败：认证错误，请检查邮箱和授权码是否正确")
             return False
-        except smtplib.SMTPConnectError as e:
-            logger.error(f"邮件发送失败：无法连接 SMTP 服务器 - {e}")
+        except smtplib.SMTPConnectError:
+            logger.error("邮件发送失败：无法连接 SMTP 服务器")
             return False
         except Exception as e:
-            logger.error(f"发送邮件失败: {e}")
+            logger.error("发送邮件失败: %s", type(e).__name__)
+            return False
+        finally:
+            self._close_server(server)
+
+    def send_html_email(
+        self,
+        html_content: str,
+        text_content: str,
+        subject: str,
+        receivers: Optional[List[str]] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        """Send caller-rendered HTML with a plain-text fallback."""
+        if not self._is_email_configured():
+            logger.warning("邮件配置不完整，跳过推送")
+            return False
+
+        sender = self._email_config['sender']
+        password = self._email_config['password']
+        selected_receivers = receivers or self._email_config['receivers']
+        server: Optional[smtplib.SMTP] = None
+        try:
+            msg = MIMEMultipart('alternative')
+            msg['Subject'] = Header(subject, 'utf-8')
+            msg['From'] = self._format_sender_address(sender)
+            msg['To'] = ', '.join(selected_receivers)
+            msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
+            msg.attach(MIMEText(html_content, 'html', 'utf-8'))
+
+            server = self._open_server(sender, timeout_seconds)
+            server.login(sender, password)
+            server.send_message(msg)
+            logger.info("邮件发送成功，收件人: %s", selected_receivers)
+            return True
+        except smtplib.SMTPAuthenticationError:
+            logger.error("邮件发送失败：认证错误，请检查邮箱和授权码是否正确")
+            return False
+        except smtplib.SMTPConnectError:
+            logger.error("邮件发送失败：无法连接 SMTP 服务器")
+            return False
+        except Exception as exc:
+            logger.error("发送邮件失败: %s", type(exc).__name__)
             return False
         finally:
             self._close_server(server)
@@ -276,7 +317,7 @@ class EmailSender:
             logger.info("邮件（内联图片）发送成功，收件人: %s", receivers)
             return True
         except Exception as e:
-            logger.error("邮件（内联图片）发送失败: %s", e)
+            logger.error("邮件（内联图片）发送失败: %s", type(e).__name__)
             return False
         finally:
             self._close_server(server)
