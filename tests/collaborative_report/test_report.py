@@ -2,6 +2,8 @@ from datetime import date, datetime, timezone
 from unittest.mock import patch
 from zoneinfo import ZoneInfo
 
+import pytest
+
 from src.collaborative_report.models import Candidate, ModuleResult, ReportMode
 from src.collaborative_report.report import (
     build_subject,
@@ -263,6 +265,69 @@ def test_actual_premarket_generation_time_accepts_post_nine_observation() -> Non
     )
 
     assert policy.actionable is True
+
+
+def test_late_premarket_generation_keeps_prior_session_as_target() -> None:
+    report_date = date(2026, 8, 17)
+    generated_at = datetime(2026, 8, 17, 16, 30, tzinfo=SHANGHAI)
+    friday = candidate(
+        name="周五数据",
+        observed_at=datetime(2026, 8, 14, 15, 5, tzinfo=SHANGHAI),
+    )
+    monday = candidate(
+        name="周一收盘数据",
+        observed_at=datetime(2026, 8, 17, 15, 5, tzinfo=SHANGHAI),
+    )
+
+    friday_policy = evaluate_candidate_actionability(
+        friday,
+        mode=ReportMode.PREMARKET,
+        report_date=report_date,
+        generated_at=generated_at,
+    )
+    monday_policy = evaluate_candidate_actionability(
+        monday,
+        mode=ReportMode.PREMARKET,
+        report_date=report_date,
+        generated_at=generated_at,
+    )
+
+    assert friday_policy.actionable is True
+    assert monday_policy.actionable is False
+    assert monday_policy.reason == "数据交易日晚于报告会话，仅供观察"
+
+
+def test_postmarket_generation_before_target_close_is_rejected_without_candidates() -> None:
+    with pytest.raises(RuntimeError, match="^report data session incomplete$"):
+        render_report(
+            ReportMode.POSTMARKET,
+            date(2026, 8, 17),
+            modules={},
+            generated_at=datetime(2026, 8, 17, 9, 0, tzinfo=SHANGHAI),
+        )
+
+
+def test_naive_generated_at_is_rejected_before_candidate_iteration() -> None:
+    with pytest.raises(ValueError, match="^generated_at must be timezone-aware$"):
+        render_report(
+            ReportMode.PREMARKET,
+            date(2026, 8, 17),
+            modules={},
+            generated_at=datetime(2026, 8, 17, 9, 0),
+        )
+
+
+def test_generated_at_local_date_mismatch_is_rejected_without_candidates() -> None:
+    with pytest.raises(
+        ValueError,
+        match="^generated_at must match report_date in Asia/Shanghai$",
+    ):
+        render_report(
+            ReportMode.PREMARKET,
+            date(2026, 8, 17),
+            modules={},
+            generated_at=datetime(2026, 8, 16, 15, 0, tzinfo=timezone.utc),
+        )
 
 
 def test_omitted_generated_at_uses_session_identity_without_inventing_time() -> None:

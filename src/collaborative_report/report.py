@@ -140,22 +140,42 @@ def evaluate_candidate_actionability(
 
     if not isinstance(mode, ReportMode):
         raise ValueError("invalid report mode")
+    try:
+        target_session = report_data_session(mode, report_date, generated_at)
+    except RuntimeError as exc:
+        if str(exc) == "trading calendar unavailable":
+            return CandidateActionability(False, "交易日历不可用，仅供观察")
+        raise
+    return _evaluate_candidate_for_session(
+        candidate,
+        target_session=target_session,
+        generated_at=generated_at,
+    )
+
+
+def _evaluate_candidate_for_session(
+    candidate: Candidate,
+    *,
+    target_session: date | None,
+    generated_at: datetime | None,
+) -> CandidateActionability:
     observed_at = candidate.observed_at
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         return CandidateActionability(False, "数据时间缺少时区，仅供观察")
     if generated_at is not None and observed_at > generated_at:
         return CandidateActionability(False, "数据时间晚于报告生成时间，仅供观察")
+    if target_session is None:
+        return CandidateActionability(False, "交易日历不可用，仅供观察")
     try:
-        expected_session = report_data_session(mode, report_date, generated_at)
         observed_session = latest_completed_xshg_session(observed_at)
     except RuntimeError:
         return CandidateActionability(False, "交易日历不可用，仅供观察")
-    if observed_session < expected_session:
+    if observed_session < target_session:
         return CandidateActionability(
             False,
-            f"数据交易日{observed_session.isoformat()}早于预期交易日{expected_session.isoformat()}，仅供观察",
+            f"数据交易日{observed_session.isoformat()}早于预期交易日{target_session.isoformat()}，仅供观察",
         )
-    if observed_session > expected_session:
+    if observed_session > target_session:
         return CandidateActionability(False, "数据交易日晚于报告会话，仅供观察")
     if candidate.warning.strip():
         return CandidateActionability(False, candidate.warning.strip())
@@ -167,14 +187,12 @@ def evaluate_candidate_actionability(
 
 def _candidate_view(
     candidate: Candidate,
-    mode: ReportMode,
-    report_date: date,
+    target_session: date | None,
     generated_at: datetime | None,
 ) -> _CandidateView:
-    policy = evaluate_candidate_actionability(
+    policy = _evaluate_candidate_for_session(
         candidate,
-        mode=mode,
-        report_date=report_date,
+        target_session=target_session,
         generated_at=generated_at,
     )
     return _CandidateView(
@@ -260,6 +278,12 @@ def render_report(
     """Render one of the two collaborative report modes from structured results."""
 
     normalized_mode = ReportMode(mode)
+    try:
+        target_session = report_data_session(normalized_mode, report_date, generated_at)
+    except RuntimeError as exc:
+        if str(exc) != "trading calendar unavailable":
+            raise
+        target_session = None
     if normalized_mode is ReportMode.PREMARKET:
         sections = _module_sections(modules, ("global", "gold", "portfolio"))
         short_title, swing_title = "短线候选池", "波段候选池"
@@ -268,11 +292,11 @@ def render_report(
         short_title, swing_title = "下一交易日短线池", "下一交易日波段池"
 
     short_views = tuple(
-        _candidate_view(item, normalized_mode, report_date, generated_at)
+        _candidate_view(item, target_session, generated_at)
         for item in short_term_candidates
     )
     swing_views = tuple(
-        _candidate_view(item, normalized_mode, report_date, generated_at)
+        _candidate_view(item, target_session, generated_at)
         for item in swing_candidates
     )
     morning_rows = _morning_rows(morning_candidates)

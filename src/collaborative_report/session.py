@@ -64,24 +64,32 @@ def report_data_session(
     report_date: date,
     generated_at: datetime | None = None,
 ) -> date:
-    """Resolve the completed XSHG session whose data a report may expose."""
+    """Resolve the mode/date target and optionally prove it complete at generation time."""
 
     if not isinstance(mode, ReportMode):
         raise ValueError("invalid report mode")
-    calendar = _xshg_calendar()
     if generated_at is not None:
         if generated_at.tzinfo is None or generated_at.utcoffset() is None:
             raise ValueError("generated_at must be timezone-aware")
         if generated_at.astimezone(SHANGHAI_TIMEZONE).date() != report_date:
             raise ValueError("generated_at must match report_date in Asia/Shanghai")
-        return _latest_completed_session(calendar, generated_at)
+    calendar = _xshg_calendar()
     try:
         session = calendar.date_to_session(report_date, direction="previous")
         if mode is ReportMode.PREMARKET and session.date() == report_date:
             session = calendar.previous_session(session)
-        return session.date()
     except Exception as exc:
         raise RuntimeError("trading calendar unavailable") from exc
+    if mode is ReportMode.POSTMARKET and session.date() != report_date:
+        raise RuntimeError("report date is not an XSHG session")
+    if generated_at is not None:
+        try:
+            session_close = calendar.session_close(session).to_pydatetime()
+        except Exception as exc:
+            raise RuntimeError("trading calendar unavailable") from exc
+        if session_close > generated_at.astimezone(timezone.utc):
+            raise RuntimeError("report data session incomplete")
+    return session.date()
 
 
 def build_report_session(
