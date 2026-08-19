@@ -99,30 +99,39 @@ def enrich_codes(
             stock_codes=unique_codes,
             send_notification=False,
             merge_notification=False,
+            current_time=timestamp,
+            save_report=False,
         )
         requested = set(unique_codes)
         successful: dict[str, Mapping[str, Any]] = {}
         unsuccessful: set[str] = set()
-        saw_none = False
+        projection_failed: set[str] = set()
         for result in results:
             if result is None:
-                saw_none = True
                 continue
             code = getattr(result, "code", None)
             if code not in requested or code in successful:
                 continue
-            if not bool(getattr(result, "success", False)):
-                unsuccessful.add(code)
-                continue
-            successful[code] = _project(result)
+            try:
+                if not bool(getattr(result, "success", False)):
+                    unsuccessful.add(code)
+                    continue
+                successful[code] = _project(result)
+            except Exception:
+                projection_failed.add(code)
 
         ordered_payload = MappingProxyType({code: successful[code] for code in unique_codes if code in successful})
-        warnings: list[str] = ["ai_result_none"] if saw_none else []
+        warnings: list[str] = []
         for code in unique_codes:
             if code in successful:
                 continue
-            warning_code = "ai_result_unsuccessful" if code in unsuccessful else "ai_result_missing"
-            warnings.append(f"{code}:{warning_code}")
+            if code in projection_failed:
+                warning_code = "ai_projection_failed"
+            elif code in unsuccessful:
+                warning_code = "ai_result_unsuccessful"
+            else:
+                warning_code = "ai_result_missing"
+            warnings.append(f"{warning_code}:{code}")
         status = "ok" if len(successful) == len(unique_codes) else "partial"
         return ModuleResult(
             name="ai",

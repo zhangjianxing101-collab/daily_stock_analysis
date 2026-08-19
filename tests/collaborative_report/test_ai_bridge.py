@@ -55,6 +55,8 @@ def test_enrich_codes_exact_signature_deduplicates_and_calls_pipeline_once() -> 
         stock_codes=["000002", "000001"],
         send_notification=False,
         merge_notification=False,
+        current_time=OBSERVED_AT,
+        save_report=False,
     )
     assert output.name == "ai"
     assert output.status == "ok"
@@ -122,7 +124,7 @@ def test_unrequested_results_are_discarded_and_first_successful_duplicate_wins()
     duplicate.get_core_conclusion.assert_not_called()
 
 
-def test_failed_none_and_missing_results_produce_partial_with_fixed_warnings() -> None:
+def test_mock_only_unsuccessful_and_production_missing_results_have_distinct_warnings() -> None:
     from src.collaborative_report.ai_bridge import enrich_codes
 
     pipeline = Mock()
@@ -137,9 +139,8 @@ def test_failed_none_and_missing_results_produce_partial_with_fixed_warnings() -
     assert output.status == "partial"
     assert list(output.payload) == ["000001"]
     assert output.warnings == (
-        "ai_result_none",
-        "000002:ai_result_unsuccessful",
-        "000003:ai_result_missing",
+        "ai_result_unsuccessful:000002",
+        "ai_result_missing:000003",
     )
     assert "secret" not in " ".join(output.warnings)
     assert "URL" not in " ".join(output.warnings)
@@ -155,7 +156,43 @@ def test_no_successful_results_are_partial_without_constructing_production_pipel
 
     assert output.status == "partial"
     assert output.payload == {}
-    assert output.warnings == ("000001:ai_result_missing",)
+    assert output.warnings == ("ai_result_missing:000001",)
+
+
+def test_projection_failures_are_isolated_per_result_without_error_details() -> None:
+    from src.collaborative_report.ai_bridge import enrich_codes
+
+    conclusion_failure = result("000001")
+    conclusion_failure.get_core_conclusion.side_effect = RuntimeError("secret conclusion failure")
+
+    class MalformedResult:
+        code = "000002"
+        success = True
+        analysis_summary = "malformed"
+
+        def get_core_conclusion(self):
+            return self.analysis_summary
+
+        @property
+        def action(self):
+            raise ValueError("provider payload malformed secret=token")
+
+    pipeline = Mock()
+    pipeline.run.return_value = [conclusion_failure, MalformedResult(), result("000003")]
+
+    output = enrich_codes(["000001", "000002", "000003"], pipeline, observed_at=OBSERVED_AT)
+
+    assert output.status == "partial"
+    assert list(output.payload) == ["000003"]
+    assert output.warnings == (
+        "ai_projection_failed:000001",
+        "ai_projection_failed:000002",
+    )
+    serialized = repr(output)
+    assert "RuntimeError" not in serialized
+    assert "ValueError" not in serialized
+    assert "secret" not in serialized
+    assert "provider payload" not in serialized
 
 
 def test_pipeline_exception_is_sanitized_in_full_result_report() -> None:
@@ -228,6 +265,8 @@ def test_candidate_objects_are_not_accepted_or_mutated() -> None:
         stock_codes=["000001"],
         send_notification=False,
         merge_notification=False,
+        current_time=OBSERVED_AT,
+        save_report=False,
     )
 
 

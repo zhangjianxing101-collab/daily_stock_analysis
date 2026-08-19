@@ -3122,6 +3122,8 @@ class StockAnalysisPipeline:
         send_notification: bool = True,
         merge_notification: bool = False,
         current_time: Optional[datetime] = None,
+        *,
+        save_report: bool = True,
     ) -> List[AnalysisResult]:
         """
         运行完整的分析流程
@@ -3138,6 +3140,7 @@ class StockAnalysisPipeline:
             send_notification: 是否发送推送通知
             merge_notification: 是否合并推送（跳过本次推送，由 main 层合并个股+大盘后统一发送，Issue #190）
             current_time: 本轮运行冻结的参考时间；为空时在 run 内生成
+            save_report: 是否保存本地聚合报告
 
         Returns:
             分析结果列表
@@ -3274,8 +3277,8 @@ class StockAnalysisPipeline:
         logger.info("===== 分析完成 =====")
         logger.info(f"成功: {success_count}, 失败: {fail_count}, 耗时: {elapsed_time:.2f} 秒")
         
-        # 保存报告到本地文件（无论是否推送通知都保存）
-        if results and not dry_run:
+        # 默认保存本地报告；调用方可显式关闭独立报告落盘。
+        if results and not dry_run and save_report:
             self._save_local_report(results, report_type)
 
         # 发送通知（单股推送模式下跳过汇总推送，避免重复）
