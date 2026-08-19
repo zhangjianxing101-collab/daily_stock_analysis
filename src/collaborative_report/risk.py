@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal, DecimalException, localcontext
 
 from .models import Position
 
@@ -45,7 +46,11 @@ def _finite_calculation(value: float, name: str) -> float:
     return value
 
 
-def _floor_ratio(numerator: float, denominator: float) -> int:
+def _decimal(value: object) -> Decimal:
+    return Decimal(str(value))
+
+
+def _floor_decimal_ratio(numerator: Decimal, denominator: Decimal) -> int:
     numerator_value, numerator_scale = numerator.as_integer_ratio()
     denominator_value, denominator_scale = denominator.as_integer_ratio()
     return (numerator_value * denominator_scale) // (numerator_scale * denominator_value)
@@ -67,20 +72,36 @@ def evaluate_position(position: Position, current_price: float, capital: float) 
         raise ValueError("capital must be positive")
 
     try:
-        cost_value = _finite_calculation(position.quantity * cost_price, "cost_value")
-        market_value = _finite_calculation(position.quantity * normalized_current_price, "market_value")
-        unrealized_pnl = _finite_calculation(market_value - cost_value, "unrealized_pnl")
-        unrealized_return = _finite_calculation(unrealized_pnl / cost_value, "unrealized_return")
-        cost_concentration = _finite_calculation(cost_value / normalized_capital, "cost_concentration")
-        market_concentration = _finite_calculation(market_value / normalized_capital, "market_concentration")
-    except OverflowError as exc:
+        quantity = Decimal(position.quantity)
+        decimal_cost_price = _decimal(position.cost_price)
+        decimal_current_price = _decimal(current_price)
+        decimal_capital = _decimal(capital)
+        precision = max(50, len(str(position.quantity)) + 40)
+        with localcontext() as context:
+            context.prec = precision
+            decimal_cost_value = quantity * decimal_cost_price
+            decimal_market_value = quantity * decimal_current_price
+            decimal_unrealized_pnl = decimal_market_value - decimal_cost_value
+            decimal_unrealized_return = decimal_unrealized_pnl / decimal_cost_value
+            decimal_cost_concentration = decimal_cost_value / decimal_capital
+            decimal_market_concentration = decimal_market_value / decimal_capital
+            concentration_value = max(decimal_cost_value, decimal_market_value)
+            normal_limit = decimal_capital * Decimal("0.40")
+            elevated_limit = decimal_capital * Decimal("0.60")
+
+        cost_value = _finite_calculation(float(decimal_cost_value), "cost_value")
+        market_value = _finite_calculation(float(decimal_market_value), "market_value")
+        unrealized_pnl = _finite_calculation(float(decimal_unrealized_pnl), "unrealized_pnl")
+        unrealized_return = _finite_calculation(float(decimal_unrealized_return), "unrealized_return")
+        cost_concentration = _finite_calculation(float(decimal_cost_concentration), "cost_concentration")
+        market_concentration = _finite_calculation(float(decimal_market_concentration), "market_concentration")
+    except (DecimalException, OverflowError) as exc:
         raise ValueError("position risk calculations must be finite") from exc
 
-    concentration = max(cost_concentration, market_concentration)
-    if concentration <= 0.40:
+    if concentration_value <= normal_limit:
         concentration_label = "正常"
         warnings: tuple[str, ...] = ()
-    elif concentration <= 0.60:
+    elif concentration_value <= elevated_limit:
         concentration_label = "集中度偏高"
         warnings = (_CONCENTRATION_WARNING,)
     else:
@@ -130,13 +151,20 @@ def suggested_board_lots(
         raise ValueError("risk_fraction must be greater than zero and at most 0.02")
     if type(lot_size) is not int or lot_size <= 0:
         raise ValueError("lot_size must be a positive integer")
-    if normalized_stop <= 0 or normalized_stop >= normalized_entry:
+    decimal_entry = _decimal(entry_price)
+    decimal_stop = _decimal(stop_price)
+    decimal_capital = _decimal(capital)
+    decimal_cash = _decimal(available_cash)
+    decimal_risk_fraction = _decimal(risk_fraction)
+    if decimal_stop <= 0 or decimal_stop >= decimal_entry:
         return 0
 
-    risk_per_share = normalized_entry - normalized_stop
-    risk_budget = _finite_calculation(normalized_capital * normalized_risk_fraction, "risk_budget")
-    risk_shares = _floor_ratio(risk_budget, risk_per_share)
-    cash_shares = _floor_ratio(normalized_cash, normalized_entry)
+    with localcontext() as context:
+        context.prec = 50
+        risk_per_share = decimal_entry - decimal_stop
+        risk_budget = decimal_capital * decimal_risk_fraction
+    risk_shares = _floor_decimal_ratio(risk_budget, risk_per_share)
+    cash_shares = _floor_decimal_ratio(decimal_cash, decimal_entry)
     shares = (min(risk_shares, cash_shares) // lot_size) * lot_size
     return shares
 

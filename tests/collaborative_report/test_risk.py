@@ -1,5 +1,6 @@
 import math
 from dataclasses import FrozenInstanceError
+from decimal import Decimal
 from typing import get_type_hints
 
 import pytest
@@ -80,6 +81,24 @@ def test_concentration_warning_is_fixed_for_both_non_normal_labels() -> None:
     assert len(elevated.warnings) == 1
 
 
+def test_decimal_cost_concentration_at_exact_forty_percent_is_normal() -> None:
+    result = evaluate_position(Position(code="600000", quantity=100, cost_price=1.09), 1.09, 272.5)
+
+    assert result.cost_concentration == 0.4
+    assert result.market_concentration == 0.4
+    assert result.concentration_label == "正常"
+    assert result.warnings == ()
+
+
+def test_decimal_concentration_at_exact_sixty_percent_is_elevated_not_high() -> None:
+    result = evaluate_position(Position(code="600000", quantity=100, cost_price=1.11), 1.11, 185)
+
+    assert result.cost_concentration == 0.6
+    assert result.market_concentration == 0.6
+    assert result.concentration_label == "集中度偏高"
+    assert result.warnings
+
+
 @pytest.mark.parametrize("current_price", [0, -1, float("nan"), float("inf"), float("-inf"), "12"])
 def test_evaluate_position_rejects_invalid_current_price(current_price: object) -> None:
     with pytest.raises(ValueError):
@@ -111,6 +130,14 @@ def test_evaluate_position_defends_against_malformed_positions(position: Positio
 
 def test_suggested_board_lots_matches_exact_example() -> None:
     assert suggested_board_lots(20, 19, capital=20_000, available_cash=10_000) == 400
+
+
+def test_suggested_board_lots_keeps_exact_decimal_risk_boundary() -> None:
+    shares = suggested_board_lots(1.00, 0.82, capital=900, available_cash=900)
+
+    assert shares == 100
+    assert Decimal(shares) * (Decimal("1.00") - Decimal("0.82")) <= Decimal(900) * Decimal("0.02")
+    assert Decimal(shares) * Decimal("1.00") <= Decimal(900)
 
 
 def test_suggested_board_lots_returns_zero_for_invalid_price_geometry_or_capacity() -> None:
