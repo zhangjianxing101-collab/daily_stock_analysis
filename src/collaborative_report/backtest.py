@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass
+from decimal import Decimal
 from typing import Callable
 
 import numpy as np
@@ -39,7 +40,6 @@ class BacktestSummary:
 
 
 _REQUIRED_COLUMNS = ("date", "open", "high", "low", "close", "volume")
-_BOUNDARY_TOLERANCE = 1e-12
 
 
 def _finite_number(value: object, name: str) -> float:
@@ -165,6 +165,23 @@ def _worst_loss_streak(trades: list[Trade]) -> int:
         else:
             current = 0
     return worst
+
+
+def _exact_ratio_in_band(
+    numerators: pd.Series,
+    denominators: pd.Series,
+    lower: Decimal,
+    upper: Decimal,
+) -> pd.Series:
+    matches: list[bool] = []
+    one = Decimal("1")
+    for numerator, denominator in zip(numerators, denominators):
+        if pd.isna(numerator) or pd.isna(denominator):
+            matches.append(False)
+            continue
+        ratio = Decimal(str(numerator)) / Decimal(str(denominator)) - one
+        matches.append(lower <= ratio <= upper)
+    return pd.Series(matches, index=numerators.index, dtype=bool)
 
 
 def _run_backtest(
@@ -368,13 +385,12 @@ def backtest_swing(
     close = frame["close"]
     ma20 = close.rolling(20).mean()
     ma50 = close.rolling(50).mean()
-    return20 = close / close.shift(20) - 1
-    bias = close / ma20 - 1
+    return_in_band = _exact_ratio_in_band(close, close.shift(20), Decimal("0.03"), Decimal("0.25"))
+    bias_in_band = _exact_ratio_in_band(close, ma20, Decimal("0"), Decimal("0.08"))
     signals = (
         (ma20 > ma50)
-        & (close > ma20)
-        & return20.between(0.03 - _BOUNDARY_TOLERANCE, 0.25 + _BOUNDARY_TOLERANCE, inclusive="both")
-        & bias.between(0.0 - _BOUNDARY_TOLERANCE, 0.08 + _BOUNDARY_TOLERANCE, inclusive="both")
+        & return_in_band
+        & bias_in_band
     ).fillna(False)
     return _run_backtest(
         frame,

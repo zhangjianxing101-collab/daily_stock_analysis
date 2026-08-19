@@ -41,11 +41,9 @@ def bars_from_closes(closes: list[float] | np.ndarray) -> pd.DataFrame:
     )
 
 
-def swing_boundary_bars(return_fraction: float, bias: float) -> pd.DataFrame:
-    latest_close = 100.0
-    ma20 = latest_close / (1 + bias)
-    prior_19_close = (20 * ma20 - latest_close) / 19
-    closes = [50.0] * 30 + [latest_close / (1 + return_fraction)] + [prior_19_close] * 19 + [latest_close]
+def swing_boundary_bars(*, latest_close: float, return_base: float, ma20: float) -> pd.DataFrame:
+    prior_closes = [ma20] * 18 + [20 * ma20 - latest_close - 18 * ma20]
+    closes = [50.0] * 30 + [return_base] + prior_closes + [latest_close]
     return bars_from_closes(closes)
 
 
@@ -290,26 +288,44 @@ def test_swing_uses_current_and_prior_data_only() -> None:
     assert after_future_spike.trades[0].entry_date == before_future_spike.trades[0].entry_date
 
 
-@pytest.mark.parametrize("return_fraction", [0.03, 0.25])
-def test_swing_return_boundaries_are_inclusive(monkeypatch: pytest.MonkeyPatch, return_fraction: float) -> None:
-    assert _captured_swing_signal(monkeypatch, swing_boundary_bars(return_fraction, 0.04)) is True
-
-
-@pytest.mark.parametrize("return_fraction", [0.029999, 0.250001])
-def test_swing_return_values_outside_boundaries_are_rejected(
-    monkeypatch: pytest.MonkeyPatch, return_fraction: float
+@pytest.mark.parametrize("latest_close", [103.0, 125.0])
+def test_swing_return_boundaries_are_exact_and_inclusive(
+    monkeypatch: pytest.MonkeyPatch, latest_close: float
 ) -> None:
-    assert _captured_swing_signal(monkeypatch, swing_boundary_bars(return_fraction, 0.04)) is False
+    assert _captured_swing_signal(
+        monkeypatch,
+        swing_boundary_bars(latest_close=latest_close, return_base=100.0, ma20=latest_close / 1.04),
+    ) is True
 
 
-def test_swing_bias_zero_requires_strict_close_above_ma20(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert _captured_swing_signal(monkeypatch, swing_boundary_bars(0.10, 0.0)) is False
-    assert _captured_swing_signal(monkeypatch, swing_boundary_bars(0.10, 0.000001)) is True
+@pytest.mark.parametrize("latest_close", [102.99999999999, 125.00000000001])
+def test_swing_return_values_just_outside_exact_boundaries_are_rejected(
+    monkeypatch: pytest.MonkeyPatch, latest_close: float
+) -> None:
+    assert _captured_swing_signal(
+        monkeypatch,
+        swing_boundary_bars(latest_close=latest_close, return_base=100.0, ma20=latest_close / 1.04),
+    ) is False
 
 
-def test_swing_eight_percent_bias_is_inclusive_and_above_is_rejected(monkeypatch: pytest.MonkeyPatch) -> None:
-    assert _captured_swing_signal(monkeypatch, swing_boundary_bars(0.10, 0.08)) is True
-    assert _captured_swing_signal(monkeypatch, swing_boundary_bars(0.10, 0.080001)) is False
+@pytest.mark.parametrize("latest_close", [100.0, 108.0])
+def test_swing_bias_boundaries_are_exact_and_inclusive(
+    monkeypatch: pytest.MonkeyPatch, latest_close: float
+) -> None:
+    assert _captured_swing_signal(
+        monkeypatch,
+        swing_boundary_bars(latest_close=latest_close, return_base=90.0, ma20=100.0),
+    ) is True
+
+
+@pytest.mark.parametrize("latest_close", [99.99999999999, 108.00000000001])
+def test_swing_bias_values_just_outside_exact_boundaries_are_rejected(
+    monkeypatch: pytest.MonkeyPatch, latest_close: float
+) -> None:
+    assert _captured_swing_signal(
+        monkeypatch,
+        swing_boundary_bars(latest_close=latest_close, return_base=90.0, ma20=100.0),
+    ) is False
 
 
 def test_summary_tracks_mark_to_market_drawdown_and_worst_loss_streak() -> None:
