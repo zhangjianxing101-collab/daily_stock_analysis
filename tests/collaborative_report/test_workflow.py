@@ -30,6 +30,41 @@ def _upload_steps(workflow: dict) -> list[dict]:
     return [step for step in _steps(workflow) if step.get("uses") == "actions/upload-artifact@v6"]
 
 
+def _production_prior_candidates(artifacts: list[dict], artifact_name: str) -> list[dict]:
+    """Model the metadata gate before the workflow downloads a prior report."""
+
+    candidates = [
+        artifact
+        for artifact in artifacts
+        if artifact.get("name") == artifact_name
+        and artifact.get("expired") is False
+        and str(artifact.get("id", "")).isdigit()
+        and str(artifact.get("workflow_run", {}).get("id", "")).isdigit()
+    ]
+    return sorted(candidates, key=lambda item: (str(item["created_at"]), int(item["id"])), reverse=True)
+
+
+def _is_valid_prior_manifest(payload: object, report_key: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    return (
+        payload.get("schema_version") == 1
+        and payload.get("report_key") == report_key
+        and payload.get("mode") == "premarket"
+        and payload.get("trading_date") == report_key.removesuffix("-premarket")
+        and payload.get("final_state") == "sent"
+        and payload.get("test_email") is False
+        and isinstance(payload.get("candidate_state"), list)
+    )
+
+
+def _select_valid_prior_artifact(artifacts: list[dict], manifests: dict[int, object], report_key: str) -> int | None:
+    for artifact in _production_prior_candidates(artifacts, f"report-{report_key}"):
+        if _is_valid_prior_manifest(manifests.get(int(artifact["id"])), report_key):
+            return int(artifact["id"])
+    return None
+
+
 def test_workflow_trigger_permissions_concurrency_and_toolchain_contract() -> None:
     workflow = _workflow()
     trigger = workflow["on"]
@@ -56,7 +91,6 @@ def test_workflow_trigger_permissions_concurrency_and_toolchain_contract() -> No
     steps = _steps(workflow)
     assert any(step.get("uses") == "actions/checkout@v5" for step in steps)
     assert any(step.get("uses") == "actions/setup-python@v6" for step in steps)
-    assert any(step.get("uses") == "actions/download-artifact@v7" for step in steps)
     assert all(step.get("uses") == "actions/upload-artifact@v6" for step in _upload_steps(workflow))
     assert _step(workflow, "Set up Python")["with"]["python-version"] == "3.11"
     assert "pip install -r requirements.txt" in _step(workflow, "Install dependencies")["run"]
@@ -94,30 +128,77 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
 def test_workflow_uses_external_duplicate_check_and_redacted_postmarket_prior_state() -> None:
     workflow = _workflow()
     duplicate_check = _step(workflow, "Check external sent marker")
-    prior_download = _step(workflow, "Download prior premarket report")
     prior_extract = _step(workflow, "Extract prior candidate state")
     runner = _step(workflow, "Run collaborative report")
 
     assert "gh api" in duplicate_check["run"]
     assert "/actions/artifacts?name=sent-$REPORT_KEY" in duplicate_check["run"]
-    assert "prior_run_id" in duplicate_check["run"]
-    assert "^[0-9]+$" in duplicate_check["run"]
+    assert "--paginate --slurp" in duplicate_check["run"]
+    assert "created_at" in duplicate_check["run"]
+    assert "prior-artifact-candidates.tsv" in duplicate_check["run"]
     assert "--already-sent" in runner["run"]
     assert duplicate_check["env"]["GH_TOKEN"] == "${{ github.token }}"
-    assert prior_download["uses"] == "actions/download-artifact@v7"
-    assert prior_download["with"]["name"] == "${{ steps.context.outputs.prior_report_artifact }}"
-    assert prior_download["with"]["path"] == ".prior-report-download"
-    assert prior_download["with"]["github-token"] == "${{ github.token }}"
-    assert prior_download["with"]["repository"] == "${{ github.repository }}"
-    assert prior_download["with"]["run-id"] == "${{ steps.duplicate.outputs.prior_run_id }}"
-    assert prior_download["continue-on-error"] == "true"
+    assert "gh run download" in prior_extract["run"]
+    assert "--name \"$PRIOR_REPORT_KEY\"" in prior_extract["run"]
+    assert "--repo \"$GITHUB_REPOSITORY\"" in prior_extract["run"]
+    assert prior_extract["env"]["GH_TOKEN"] == "${{ github.token }}"
+    assert "continue" in prior_extract["run"]
+    assert "^[0-9]+$" in prior_extract["run"]
     assert "candidate_state" in prior_extract["run"]
     assert "manifest.json" in prior_extract["run"]
     assert ".prior-report.json" in prior_extract["run"]
     assert "prior_report_warning=prior_premarket_report_unavailable" in prior_extract["run"]
     assert "--prior-report" in runner["run"]
     assert "curl " not in all_run_content(workflow)
-    assert "gh api" not in prior_extract["run"]
+
+
+def test_external_marker_handoff_is_production_only_and_sent_marker_is_strict() -> None:
+    workflow = _workflow()
+    duplicate_check = _step(workflow, "Check external sent marker")
+    runner = _step(workflow, "Run collaborative report")
+    sent_marker = _step(workflow, "Upload sent marker")
+
+    assert 'if [ "$TEST_EMAIL" = "false" ]' in duplicate_check["run"]
+    assert 'if [ "$ALREADY_SENT" = "true" ]' in runner["run"]
+    assert 'args+=(--already-sent)' in runner["run"]
+    assert "final_state == \"sent\"" in runner["run"]
+    assert 'os.environ["TEST_EMAIL"] == "false"' in runner["run"]
+    assert "steps.runner.outputs.final_state == 'sent'" in sent_marker["if"]
+    assert "steps.context.outputs.test_email == 'false'" in sent_marker["if"]
+    assert "steps.runner.outputs.runner_exit == '0'" in sent_marker["if"]
+
+
+def test_newer_test_artifact_cannot_obscure_an_older_production_prior_report() -> None:
+    report_key = "2026-08-20-premarket"
+    artifacts = [
+        {"id": 99, "name": f"test-report-{report_key}", "expired": False, "created_at": "2026-08-20T02:00:00Z", "workflow_run": {"id": 999}},
+        {"id": 98, "name": f"report-{report_key}", "expired": False, "created_at": "2026-08-20T01:00:00Z", "workflow_run": {"id": 998}},
+    ]
+    manifests = {98: {"schema_version": 1, "report_key": report_key, "mode": "premarket", "trading_date": "2026-08-20", "final_state": "sent", "test_email": False, "candidate_state": []}}
+
+    assert _select_valid_prior_artifact(artifacts, manifests, report_key) == 98
+
+
+def test_invalid_newest_production_artifact_falls_back_to_older_valid_prior_report() -> None:
+    report_key = "2026-08-20-premarket"
+    artifacts = [
+        {"id": 99, "name": f"report-{report_key}", "expired": False, "created_at": "2026-08-20T02:00:00Z", "workflow_run": {"id": 999}},
+        {"id": 98, "name": f"report-{report_key}", "expired": False, "created_at": "2026-08-20T01:00:00Z", "workflow_run": {"id": 998}},
+    ]
+    manifests = {
+        99: {"schema_version": 1, "report_key": report_key, "mode": "premarket", "trading_date": "2026-08-20", "final_state": "test_sent", "test_email": True, "candidate_state": []},
+        98: {"schema_version": 1, "report_key": report_key, "mode": "premarket", "trading_date": "2026-08-20", "final_state": "sent", "test_email": False, "candidate_state": []},
+    }
+
+    assert _select_valid_prior_artifact(artifacts, manifests, report_key) == 98
+
+
+def test_unavailable_or_invalid_prior_candidates_leave_the_fixed_warning_path() -> None:
+    report_key = "2026-08-20-premarket"
+    artifacts = [{"id": 99, "name": f"report-{report_key}", "expired": False, "created_at": "2026-08-20T02:00:00Z", "workflow_run": {"id": 999}}]
+
+    assert _select_valid_prior_artifact(artifacts, {99: {}}, report_key) is None
+    assert "prior_premarket_report_unavailable" in _step(_workflow(), "Extract prior candidate state")["run"]
 
 
 def all_run_content(workflow: dict) -> str:
@@ -183,7 +264,7 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
     by_name = {step["name"]: step for step in uploads}
 
     assert set(by_name) == {"Upload private report", "Upload diagnostic manifest", "Upload sent marker"}
-    assert by_name["Upload private report"]["with"]["name"] == "report-${{ steps.context.outputs.report_key }}"
+    assert by_name["Upload private report"]["with"]["name"] == "${{ steps.runner.outputs.report_artifact_name }}"
     assert by_name["Upload diagnostic manifest"]["with"]["name"] == "diagnostic-${{ steps.context.outputs.report_key }}"
     assert by_name["Upload sent marker"]["with"]["name"] == "sent-${{ steps.context.outputs.report_key }}"
     assert all(step["with"]["retention-days"] == "7" for step in uploads)
@@ -192,6 +273,8 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
     assert "steps.runner.outputs.runner_exit == '0'" in by_name["Upload sent marker"]["if"]
     assert "report.html" not in _step(workflow, "Write safe workflow summary")["run"]
     assert "report.txt" not in _step(workflow, "Write safe workflow summary")["run"]
+    runner = _step(workflow, "Run collaborative report")["run"]
+    assert "'test-report' if channel == 'test' else 'report'" in runner
 
 
 def test_env_example_and_documentation_are_synthetic_and_cover_secure_operation() -> None:
@@ -210,6 +293,10 @@ def test_env_example_and_documentation_are_synthetic_and_cover_secure_operation(
     assert "example.invalid" in env_example
     assert "@qq.com" not in env_example.lower()
     assert 'COLLAB_PORTFOLIO_JSON=[{"code":"000000","quantity":100,"cost_price":10.00}]' in env_example
+    assert "local delivery ledger remains the source of truth" not in documentation
+    assert "cross-run duplicate guard" in documentation
+    assert "Within a single run" in documentation
+    assert "test-report-<report-key>" in documentation
 
     for phrase in (
         "QQ",

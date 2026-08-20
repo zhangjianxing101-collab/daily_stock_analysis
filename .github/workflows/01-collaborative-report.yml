@@ -103,7 +103,6 @@ jobs:
           set -euo pipefail
           already_sent=false
           duplicate_check=available
-          prior_run_id=""
           if [ "$TEST_EMAIL" = "false" ]; then
             if artifacts="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=sent-$REPORT_KEY&per_page=100" --jq '.artifacts[] | select(.expired == false) | .name' 2>/dev/null)"; then
               if printf '%s\n' "$artifacts" | grep -Fxq "sent-$REPORT_KEY"; then
@@ -114,45 +113,71 @@ jobs:
             fi
           fi
           if [ "$MODE" = "postmarket" ]; then
-            if prior_candidate="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$PRIOR_REPORT_ARTIFACT&per_page=100" --jq '[.artifacts[] | select(.expired == false) | .workflow_run.id] | .[0] // empty' 2>/dev/null)"; then
-              if [[ "$prior_candidate" =~ ^[0-9]+$ ]]; then
-                prior_run_id="$prior_candidate"
-              fi
+            mkdir -p .workflow-artifacts
+            if gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$PRIOR_REPORT_ARTIFACT&per_page=100" > .workflow-artifacts/prior-artifact-metadata.json 2>/dev/null; then
+              PRIOR_REPORT_ARTIFACT="$PRIOR_REPORT_ARTIFACT" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          metadata_path = Path(".workflow-artifacts/prior-artifact-metadata.json")
+          candidates_path = Path(".workflow-artifacts/prior-artifact-candidates.tsv")
+          try:
+              pages = json.loads(metadata_path.read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              pages = []
+          expected_name = os.environ["PRIOR_REPORT_ARTIFACT"]
+          candidates = []
+          for page in pages if isinstance(pages, list) else []:
+              for artifact in page.get("artifacts", ()) if isinstance(page, dict) else ():
+                  if not isinstance(artifact, dict) or artifact.get("name") != expected_name or artifact.get("expired") is not False:
+                      continue
+                  artifact_id = str(artifact.get("id", ""))
+                  workflow_run = artifact.get("workflow_run")
+                  run_id = str(workflow_run.get("id", "")) if isinstance(workflow_run, dict) else ""
+                  created_at = artifact.get("created_at")
+                  if not artifact_id.isascii() or not artifact_id.isdigit() or not run_id.isascii() or not run_id.isdigit() or not isinstance(created_at, str):
+                      continue
+                  candidates.append((created_at, int(artifact_id), run_id, artifact_id))
+          candidates_path.write_text(
+              "".join(f"{run_id}\t{artifact_id}\n" for _, _, run_id, artifact_id in sorted(candidates, reverse=True)),
+              encoding="utf-8",
+          )
+          PY
             fi
           fi
           printf 'already_sent=%s\n' "$already_sent" >> "$GITHUB_OUTPUT"
           printf 'duplicate_check=%s\n' "$duplicate_check" >> "$GITHUB_OUTPUT"
-          printf 'prior_run_id=%s\n' "$prior_run_id" >> "$GITHUB_OUTPUT"
-
-      - name: Download prior premarket report
-        id: download-prior
-        if: ${{ steps.context.outputs.mode == 'postmarket' && steps.duplicate.outputs.prior_run_id != '' }}
-        continue-on-error: true
-        uses: actions/download-artifact@v7
-        with:
-          name: ${{ steps.context.outputs.prior_report_artifact }}
-          path: .prior-report-download
-          github-token: ${{ github.token }}
-          repository: ${{ github.repository }}
-          run-id: ${{ steps.duplicate.outputs.prior_run_id }}
 
       - name: Extract prior candidate state
         id: prior
         if: ${{ steps.context.outputs.mode == 'postmarket' }}
         env:
-          DOWNLOAD_OUTCOME: ${{ steps.download-prior.outcome }}
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.context.outputs.mode }}
           PRIOR_REPORT_KEY: ${{ steps.context.outputs.prior_report_artifact }}
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
         run: |
           set -euo pipefail
           prior_report=""
           prior_report_warning=""
-          if [ "$DOWNLOAD_OUTCOME" = "success" ] && [ -d .prior-report-download ]; then
-            python - <<'PY'
+          candidates_file=".workflow-artifacts/prior-artifact-candidates.tsv"
+          if [ "$MODE" = "postmarket" ] && [ -f "$candidates_file" ]; then
+            while IFS=$'\t' read -r run_id artifact_id; do
+              if ! [[ "$run_id" =~ ^[0-9]+$ && "$artifact_id" =~ ^[0-9]+$ ]]; then
+                continue
+              fi
+              download_root=".prior-report-download/$artifact_id"
+              mkdir -p "$download_root"
+              if ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name "$PRIOR_REPORT_KEY" --dir "$download_root" >/dev/null 2>&1; then
+                continue
+              fi
+              PRIOR_DOWNLOAD_ROOT="$download_root" python - <<'PY'
           import json
+          import os
           from pathlib import Path
 
-          root = Path(".prior-report-download").resolve()
+          root = Path(os.environ["PRIOR_DOWNLOAD_ROOT"]).resolve()
           output = Path(".prior-report.json").resolve()
           expected_key = __import__("os").environ["PRIOR_REPORT_KEY"].removeprefix("report-")
           expected_date = __import__("os").environ["REPORT_KEY"].rsplit("-", 1)[0]
@@ -192,9 +217,11 @@ jobs:
               )
               break
           PY
-            if [ -f .prior-report.json ]; then
-              prior_report=".prior-report.json"
-            fi
+              if [ -f .prior-report.json ]; then
+                prior_report=".prior-report.json"
+                break
+              fi
+            done < "$candidates_file"
           fi
           if [ -z "$prior_report" ]; then
             prior_report_warning=prior_premarket_report_unavailable
@@ -333,6 +360,7 @@ jobs:
               output.write(f"final_state={final_state}\n")
               output.write(f"report_available={'true' if report_available else 'false'}\n")
               output.write(f"report_channel={channel}\n")
+              output.write(f"report_artifact_name={'test-report' if channel == 'test' else 'report'}-{report_key}\n")
               output.write(f"runner_exit={os.environ['RUNNER_EXIT']}\n")
           PY
 
@@ -340,7 +368,7 @@ jobs:
         if: ${{ always() && steps.runner.outputs.report_available == 'true' }}
         uses: actions/upload-artifact@v6
         with:
-          name: report-${{ steps.context.outputs.report_key }}
+          name: ${{ steps.runner.outputs.report_artifact_name }}
           path: reports/collaborative/${{ steps.runner.outputs.report_channel }}/${{ steps.context.outputs.report_key }}
           retention-days: 7
 
