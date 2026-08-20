@@ -1,0 +1,393 @@
+name: Collaborative A-share report
+
+on:
+  schedule:
+    - cron: '0 1 * * 1-5'
+    - cron: '30 8 * * 1-5'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: Report mode
+        type: choice
+        options: [premarket, postmarket]
+        default: premarket
+        required: false
+      force:
+        description: Bypass only the delivery-window check
+        type: boolean
+        default: false
+        required: false
+      test_email:
+        description: Send a test-marked email without creating a sent marker
+        type: boolean
+        default: false
+        required: false
+
+permissions:
+  contents: read
+  actions: read
+
+concurrency:
+  group: collaborative-report-${{ github.event.schedule || inputs.mode }}
+  cancel-in-progress: false
+
+jobs:
+  deliver:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v5
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+      - name: Resolve report context
+        id: context
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          MANUAL_MODE: ${{ inputs.mode }}
+          SCHEDULE: ${{ github.event.schedule }}
+          FORCE_INPUT: ${{ inputs.force }}
+          TEST_EMAIL_INPUT: ${{ inputs.test_email }}
+        run: |
+          set -euo pipefail
+
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            case "$SCHEDULE" in
+              "0 1 * * 1-5") mode="premarket" ;;
+              "30 8 * * 1-5") mode="postmarket" ;;
+              *) exit 1 ;;
+            esac
+          else
+            case "$MANUAL_MODE" in
+              premarket|postmarket) mode="$MANUAL_MODE" ;;
+              *) exit 1 ;;
+            esac
+          fi
+
+          case "${FORCE_INPUT:-false}" in
+            true|false) force="${FORCE_INPUT:-false}" ;;
+            *) exit 1 ;;
+          esac
+          case "${TEST_EMAIL_INPUT:-false}" in
+            true|false) test_email="${TEST_EMAIL_INPUT:-false}" ;;
+            *) exit 1 ;;
+          esac
+
+          trading_date="$(TZ=Asia/Shanghai date +%F)"
+          report_key="$trading_date-$mode"
+          printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
+          printf 'force=%s\n' "$force" >> "$GITHUB_OUTPUT"
+          printf 'test_email=%s\n' "$test_email" >> "$GITHUB_OUTPUT"
+          printf 'report_key=%s\n' "$report_key" >> "$GITHUB_OUTPUT"
+          printf 'prior_report_artifact=%s\n' "report-$trading_date-premarket" >> "$GITHUB_OUTPUT"
+
+      - name: Check external sent marker
+        id: duplicate
+        env:
+          GH_TOKEN: ${{ github.token }}
+          MODE: ${{ steps.context.outputs.mode }}
+          PRIOR_REPORT_ARTIFACT: ${{ steps.context.outputs.prior_report_artifact }}
+          REPORT_KEY: ${{ steps.context.outputs.report_key }}
+          TEST_EMAIL: ${{ steps.context.outputs.test_email }}
+        run: |
+          set -euo pipefail
+          already_sent=false
+          duplicate_check=available
+          prior_run_id=""
+          if [ "$TEST_EMAIL" = "false" ]; then
+            if artifacts="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=sent-$REPORT_KEY&per_page=100" --jq '.artifacts[] | select(.expired == false) | .name' 2>/dev/null)"; then
+              if printf '%s\n' "$artifacts" | grep -Fxq "sent-$REPORT_KEY"; then
+                already_sent=true
+              fi
+            else
+              duplicate_check=unavailable
+            fi
+          fi
+          if [ "$MODE" = "postmarket" ]; then
+            if prior_candidate="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$PRIOR_REPORT_ARTIFACT&per_page=100" --jq '[.artifacts[] | select(.expired == false) | .workflow_run.id] | .[0] // empty' 2>/dev/null)"; then
+              if [[ "$prior_candidate" =~ ^[0-9]+$ ]]; then
+                prior_run_id="$prior_candidate"
+              fi
+            fi
+          fi
+          printf 'already_sent=%s\n' "$already_sent" >> "$GITHUB_OUTPUT"
+          printf 'duplicate_check=%s\n' "$duplicate_check" >> "$GITHUB_OUTPUT"
+          printf 'prior_run_id=%s\n' "$prior_run_id" >> "$GITHUB_OUTPUT"
+
+      - name: Download prior premarket report
+        id: download-prior
+        if: ${{ steps.context.outputs.mode == 'postmarket' && steps.duplicate.outputs.prior_run_id != '' }}
+        continue-on-error: true
+        uses: actions/download-artifact@v7
+        with:
+          name: ${{ steps.context.outputs.prior_report_artifact }}
+          path: .prior-report-download
+          github-token: ${{ github.token }}
+          repository: ${{ github.repository }}
+          run-id: ${{ steps.duplicate.outputs.prior_run_id }}
+
+      - name: Extract prior candidate state
+        id: prior
+        if: ${{ steps.context.outputs.mode == 'postmarket' }}
+        env:
+          DOWNLOAD_OUTCOME: ${{ steps.download-prior.outcome }}
+          PRIOR_REPORT_KEY: ${{ steps.context.outputs.prior_report_artifact }}
+          REPORT_KEY: ${{ steps.context.outputs.report_key }}
+        run: |
+          set -euo pipefail
+          prior_report=""
+          prior_report_warning=""
+          if [ "$DOWNLOAD_OUTCOME" = "success" ] && [ -d .prior-report-download ]; then
+            python - <<'PY'
+          import json
+          from pathlib import Path
+
+          root = Path(".prior-report-download").resolve()
+          output = Path(".prior-report.json").resolve()
+          expected_key = __import__("os").environ["PRIOR_REPORT_KEY"].removeprefix("report-")
+          expected_date = __import__("os").environ["REPORT_KEY"].rsplit("-", 1)[0]
+          required = (
+              "schema_version",
+              "report_key",
+              "mode",
+              "trading_date",
+              "generated_at",
+              "final_state",
+              "test_email",
+              "candidate_state",
+          )
+          for path in sorted(root.rglob("manifest.json")):
+              resolved = path.resolve()
+              if not resolved.is_relative_to(root):
+                  continue
+              try:
+                  payload = json.loads(resolved.read_text(encoding="utf-8"))
+              except (OSError, UnicodeError, json.JSONDecodeError):
+                  continue
+              if not isinstance(payload, dict) or any(key not in payload for key in required):
+                  continue
+              if (
+                  payload["schema_version"] != 1
+                  or payload["report_key"] != expected_key
+                  or payload["mode"] != "premarket"
+                  or payload["trading_date"] != expected_date
+                  or payload["final_state"] != "sent"
+                  or payload["test_email"] is not False
+                  or not isinstance(payload["candidate_state"], list)
+              ):
+                  continue
+              output.write_text(
+                  json.dumps({key: payload[key] for key in required}, ensure_ascii=False),
+                  encoding="utf-8",
+              )
+              break
+          PY
+            if [ -f .prior-report.json ]; then
+              prior_report=".prior-report.json"
+            fi
+          fi
+          if [ -z "$prior_report" ]; then
+            prior_report_warning=prior_premarket_report_unavailable
+          fi
+          printf 'prior_report=%s\n' "$prior_report" >> "$GITHUB_OUTPUT"
+          printf 'prior_report_warning=%s\n' "$prior_report_warning" >> "$GITHUB_OUTPUT"
+
+      - name: Run collaborative report
+        id: runner
+        env:
+          MODE: ${{ steps.context.outputs.mode }}
+          FORCE: ${{ steps.context.outputs.force }}
+          TEST_EMAIL: ${{ steps.context.outputs.test_email }}
+          REPORT_KEY: ${{ steps.context.outputs.report_key }}
+          ALREADY_SENT: ${{ steps.duplicate.outputs.already_sent }}
+          PRIOR_REPORT: ${{ steps.prior.outputs.prior_report }}
+          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
+          COLLAB_PORTFOLIO_JSON: ${{ secrets.COLLAB_PORTFOLIO_JSON }}
+          ANSPIRE_API_KEYS: ${{ secrets.ANSPIRE_API_KEYS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_API_KEYS: ${{ secrets.DEEPSEEK_API_KEYS }}
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEYS: ${{ secrets.OPENAI_API_KEYS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEYS: ${{ secrets.ANTHROPIC_API_KEYS }}
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          LLM_PRIMARY_API_KEY: ${{ secrets.LLM_PRIMARY_API_KEY }}
+          LLM_PRIMARY_API_KEYS: ${{ secrets.LLM_PRIMARY_API_KEYS }}
+          LLM_GEMINI_API_KEY: ${{ secrets.LLM_GEMINI_API_KEY }}
+          LLM_GEMINI_API_KEYS: ${{ secrets.LLM_GEMINI_API_KEYS }}
+          LLM_DEEPSEEK_API_KEY: ${{ secrets.LLM_DEEPSEEK_API_KEY }}
+          LLM_DEEPSEEK_API_KEYS: ${{ secrets.LLM_DEEPSEEK_API_KEYS }}
+          LLM_ANSPIRE_API_KEY: ${{ secrets.LLM_ANSPIRE_API_KEY }}
+          LLM_ANSPIRE_API_KEYS: ${{ secrets.LLM_ANSPIRE_API_KEYS }}
+          LLM_OPENAI_API_KEY: ${{ secrets.LLM_OPENAI_API_KEY }}
+          LLM_OPENAI_API_KEYS: ${{ secrets.LLM_OPENAI_API_KEYS }}
+          LLM_ANTHROPIC_API_KEY: ${{ secrets.LLM_ANTHROPIC_API_KEY }}
+          LLM_ANTHROPIC_API_KEYS: ${{ secrets.LLM_ANTHROPIC_API_KEYS }}
+          COLLAB_CAPITAL_CNY: ${{ vars.COLLAB_CAPITAL_CNY || '20000' }}
+          COLLAB_RISK_FRACTION: ${{ vars.COLLAB_RISK_FRACTION || '0.02' }}
+          COLLAB_SHORT_LIMIT: ${{ vars.COLLAB_SHORT_LIMIT || '5' }}
+          COLLAB_SWING_LIMIT: ${{ vars.COLLAB_SWING_LIMIT || '5' }}
+          COLLAB_SCREEN_PREFILTER: ${{ vars.COLLAB_SCREEN_PREFILTER || '120' }}
+          GENERATION_BACKEND: ${{ vars.GENERATION_BACKEND || 'litellm' }}
+          LITELLM_MODEL: ${{ vars.LITELLM_MODEL || 'gemini/gemini-2.5-flash' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022' }}
+          LLM_PRIMARY_MODELS: ${{ vars.LLM_PRIMARY_MODELS || 'gemini-2.5-flash' }}
+          LLM_GEMINI_MODELS: ${{ vars.LLM_GEMINI_MODELS || 'gemini-2.5-flash' }}
+          LLM_DEEPSEEK_MODELS: ${{ vars.LLM_DEEPSEEK_MODELS || 'deepseek-chat' }}
+          LLM_ANSPIRE_MODELS: ${{ vars.LLM_ANSPIRE_MODELS || 'Doubao-Seed-2.0-lite' }}
+          LLM_OPENAI_MODELS: ${{ vars.LLM_OPENAI_MODELS || 'gpt-4.1-mini' }}
+          LLM_ANTHROPIC_MODELS: ${{ vars.LLM_ANTHROPIC_MODELS || 'claude-3-5-sonnet-20241022' }}
+        run: |
+          set -euo pipefail
+          OUTPUT_DIR="reports/collaborative"
+          mkdir -p .workflow-artifacts
+          args=()
+          args+=(--mode "$MODE")
+          args+=(--output-dir "$OUTPUT_DIR")
+          if [ "$FORCE" = "true" ]; then
+            args+=(--force)
+          fi
+          if [ "$TEST_EMAIL" = "true" ]; then
+            args+=(--test-email)
+          fi
+          if [ "$ALREADY_SENT" = "true" ]; then
+            args+=(--already-sent)
+          fi
+          if [ -n "$PRIOR_REPORT" ]; then
+            args+=(--prior-report "$PRIOR_REPORT")
+          fi
+
+          set +e
+          python scripts/run_collaborative_report.py "${args[@]}" > .workflow-artifacts/runner-result.json
+          runner_exit=$?
+          set -e
+
+          RUNNER_EXIT="$runner_exit" OUTPUT_DIR="$OUTPUT_DIR" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          result_path = Path(".workflow-artifacts/runner-result.json")
+          try:
+              result = json.loads(result_path.read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              result = {}
+          report_key = os.environ["REPORT_KEY"]
+          final_state = result.get("final_state") if isinstance(result, dict) else None
+          if not isinstance(final_state, str):
+              final_state = "hard_failure"
+          channel = "test" if os.environ["TEST_EMAIL"] == "true" else "production"
+          report_root = Path(os.environ["OUTPUT_DIR"]) / channel / report_key
+          report_available = report_root.is_dir() and any(report_root.glob("attempts/*/report.html"))
+          diagnostic = {
+              "report_key": report_key,
+              "final_state": final_state,
+              "module_statuses": {},
+              "source_timestamps": {},
+              "warning_codes": [],
+          }
+          if report_root.is_dir():
+              for manifest_path in sorted(report_root.glob("attempts/*/manifest.json"), reverse=True):
+                  try:
+                      manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                  except (OSError, UnicodeError, json.JSONDecodeError):
+                      continue
+                  if not isinstance(manifest, dict) or manifest.get("report_key") != report_key:
+                      continue
+                  for key in ("module_statuses", "source_timestamps", "warning_codes"):
+                      diagnostic[key] = manifest.get(key, diagnostic[key])
+                  break
+          artifact_dir = Path(".workflow-artifacts")
+          (artifact_dir / "diagnostic-manifest.json").write_text(
+              json.dumps(diagnostic, ensure_ascii=False, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          sent_marker = (
+              os.environ["RUNNER_EXIT"] == "0"
+              and final_state == "sent"
+              and os.environ["TEST_EMAIL"] == "false"
+          )
+          if sent_marker:
+              (artifact_dir / "sent-marker.json").write_text(
+                  json.dumps({"final_state": "sent", "report_key": report_key}, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+          with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
+              output.write(f"final_state={final_state}\n")
+              output.write(f"report_available={'true' if report_available else 'false'}\n")
+              output.write(f"report_channel={channel}\n")
+              output.write(f"runner_exit={os.environ['RUNNER_EXIT']}\n")
+          PY
+
+      - name: Upload private report
+        if: ${{ always() && steps.runner.outputs.report_available == 'true' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: report-${{ steps.context.outputs.report_key }}
+          path: reports/collaborative/${{ steps.runner.outputs.report_channel }}/${{ steps.context.outputs.report_key }}
+          retention-days: 7
+
+      - name: Upload diagnostic manifest
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: diagnostic-${{ steps.context.outputs.report_key }}
+          path: .workflow-artifacts/diagnostic-manifest.json
+          retention-days: 7
+
+      - name: Upload sent marker
+        if: ${{ always() && steps.runner.outputs.final_state == 'sent' && steps.context.outputs.test_email == 'false' && steps.runner.outputs.runner_exit == '0' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: sent-${{ steps.context.outputs.report_key }}
+          path: .workflow-artifacts/sent-marker.json
+          retention-days: 7
+
+      - name: Write safe workflow summary
+        if: ${{ always() }}
+        env:
+          REPORT_KEY: ${{ steps.context.outputs.report_key }}
+          MODE: ${{ steps.context.outputs.mode }}
+          FINAL_STATE: ${{ steps.runner.outputs.final_state }}
+          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit }}
+          DUPLICATE_CHECK: ${{ steps.duplicate.outputs.duplicate_check }}
+          PRIOR_WARNING: ${{ steps.prior.outputs.prior_report_warning }}
+        run: |
+          {
+            printf '## Collaborative report\n\n'
+            printf -- '- report key: %s\n' "$REPORT_KEY"
+            printf -- '- mode: %s\n' "$MODE"
+            printf -- '- final state: %s\n' "$FINAL_STATE"
+            printf -- '- runner exit: %s\n' "$RUNNER_EXIT"
+            printf -- '- external duplicate check: %s\n' "$DUPLICATE_CHECK"
+            if [ -n "$PRIOR_WARNING" ]; then
+              printf -- '- prior state: %s\n' "$PRIOR_WARNING"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Fail when the runner failed
+        if: ${{ always() }}
+        env:
+          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit }}
+        run: |
+          set -euo pipefail
+          if [ "$RUNNER_EXIT" -ne 0 ]; then
+            exit "$RUNNER_EXIT"
+          fi
