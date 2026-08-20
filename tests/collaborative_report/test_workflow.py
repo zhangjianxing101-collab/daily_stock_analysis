@@ -70,15 +70,28 @@ def _external_delivery_gate(
     test_email: bool,
     sent_query_ok: bool,
     in_doubt_query_ok: bool,
+    claim_query_ok: bool,
     sent_exists: bool = False,
     in_doubt_exists: bool = False,
+    claim_exists: bool = False,
     reconcile_sent: bool = False,
+    claim_upload_ok: bool = True,
 ) -> dict[str, object]:
     """Model the workflow's production-only cross-run delivery barrier."""
 
     if test_email:
         return {"action": "deliver", "already_sent": False, "runner_runs": True, "diagnostic_only": False}
-    if not sent_query_ok or not in_doubt_query_ok:
+    if not sent_query_ok:
+        return {
+            "action": "blocked",
+            "already_sent": False,
+            "runner_runs": False,
+            "diagnostic_only": True,
+            "reason": "actions_marker_query_unavailable",
+        }
+    if sent_exists:
+        return {"action": "deliver", "already_sent": True, "runner_runs": True, "diagnostic_only": False}
+    if not in_doubt_query_ok:
         return {
             "action": "blocked",
             "already_sent": False,
@@ -96,8 +109,30 @@ def _external_delivery_gate(
             "diagnostic_only": True,
             "reason": "reconcile_required",
         }
-    if sent_exists:
-        return {"action": "deliver", "already_sent": True, "runner_runs": True, "diagnostic_only": False}
+    if not claim_query_ok:
+        return {
+            "action": "blocked",
+            "already_sent": False,
+            "runner_runs": False,
+            "diagnostic_only": True,
+            "reason": "actions_marker_query_unavailable",
+        }
+    if claim_exists:
+        return {
+            "action": "blocked",
+            "already_sent": False,
+            "runner_runs": False,
+            "diagnostic_only": True,
+            "reason": "claim_reconcile_required",
+        }
+    if not claim_upload_ok:
+        return {
+            "action": "blocked",
+            "already_sent": False,
+            "runner_runs": False,
+            "diagnostic_only": True,
+            "reason": "claim_upload_failed",
+        }
     return {"action": "deliver", "already_sent": False, "runner_runs": True, "diagnostic_only": False}
 
 
@@ -215,7 +250,12 @@ def test_actions_marker_query_outage_blocks_production_before_runner_and_keeps_o
     diagnostic = _step(workflow, "Upload diagnostic manifest")
     sent_marker = _step(workflow, "Upload sent marker")
 
-    blocked = _external_delivery_gate(test_email=False, sent_query_ok=False, in_doubt_query_ok=True)
+    blocked = _external_delivery_gate(
+        test_email=False,
+        sent_query_ok=False,
+        in_doubt_query_ok=True,
+        claim_query_ok=True,
+    )
     assert blocked == {
         "action": "blocked",
         "already_sent": False,
@@ -223,11 +263,17 @@ def test_actions_marker_query_outage_blocks_production_before_runner_and_keeps_o
         "diagnostic_only": True,
         "reason": "actions_marker_query_unavailable",
     }
-    test_email = _external_delivery_gate(test_email=True, sent_query_ok=False, in_doubt_query_ok=False)
+    test_email = _external_delivery_gate(
+        test_email=True,
+        sent_query_ok=False,
+        in_doubt_query_ok=False,
+        claim_query_ok=False,
+    )
     assert test_email["runner_runs"] is True
     assert "in-doubt-$REPORT_KEY" in duplicate_check["run"]
     assert "actions_marker_query_unavailable" in duplicate_check["run"]
-    assert runner["if"] == "${{ steps.duplicate.outputs.delivery_action == 'deliver' }}"
+    assert "steps.duplicate.outputs.delivery_action == 'deliver'" in runner["if"]
+    assert "steps.claim.outcome == 'success'" in runner["if"]
     assert "steps.runner.outputs.report_available" in private_report["if"]
     assert diagnostic["if"] == "${{ always() }}"
     assert "steps.duplicate.outputs.delivery_action" not in sent_marker["if"]
@@ -244,6 +290,7 @@ def test_in_doubt_marker_blocks_delivery_and_manual_reconcile_never_calls_runner
         test_email=False,
         sent_query_ok=True,
         in_doubt_query_ok=True,
+        claim_query_ok=True,
         in_doubt_exists=True,
     )
     assert blocked["action"] == "blocked"
@@ -252,15 +299,17 @@ def test_in_doubt_marker_blocks_delivery_and_manual_reconcile_never_calls_runner
         test_email=False,
         sent_query_ok=True,
         in_doubt_query_ok=True,
+        claim_query_ok=True,
         sent_exists=True,
         in_doubt_exists=True,
     )
-    assert stale_in_doubt["action"] == "blocked"
-    assert stale_in_doubt["reason"] == "reconcile_required"
+    assert stale_in_doubt["action"] == "deliver"
+    assert stale_in_doubt["already_sent"] is True
     reconcile_action = _external_delivery_gate(
         test_email=False,
         sent_query_ok=True,
         in_doubt_query_ok=True,
+        claim_query_ok=True,
         in_doubt_exists=True,
         reconcile_sent=True,
     )
@@ -272,8 +321,8 @@ def test_in_doubt_marker_blocks_delivery_and_manual_reconcile_never_calls_runner
         'if [ "$delivery_action" = "deliver" ] && [ "$TEST_EMAIL" = "false" ]; then',
         maxsplit=1,
     )[1]
-    assert decision_block.index('if [ "$in_doubt_exists" = "true" ]') < decision_block.index(
-        'if [ "$sent_exists" = "true" ]'
+    assert decision_block.index('if [ "$sent_exists" = "true" ]') < decision_block.index(
+        'if [ "$in_doubt_exists" = "true" ]'
     )
     assert "operator_action_required" in runner["run"]
     assert "in-doubt-${{ steps.context.outputs.report_key }}" == uploads["Upload in-doubt marker"]["with"]["name"]
@@ -282,6 +331,82 @@ def test_in_doubt_marker_blocks_delivery_and_manual_reconcile_never_calls_runner
     assert "steps.duplicate.outputs.delivery_action == 'reconcile'" in reconcile["if"]
     assert "run_collaborative_report.py" not in reconcile["run"]
     assert "sent-marker.json" in reconcile["run"]
+
+
+def test_production_claim_is_mandatory_before_runner_and_blocks_crash_retries() -> None:
+    workflow = _workflow()
+    duplicate_check = _step(workflow, "Check external sent marker")
+    claim = _step(workflow, "Upload production delivery claim")
+    claim_failure = _step(workflow, "Record claim upload failure")
+    runner = _step(workflow, "Run collaborative report")
+
+    post_smtp_crash = _external_delivery_gate(
+        test_email=False,
+        sent_query_ok=True,
+        in_doubt_query_ok=True,
+        claim_query_ok=True,
+        claim_exists=True,
+    )
+    assert post_smtp_crash == {
+        "action": "blocked",
+        "already_sent": False,
+        "runner_runs": False,
+        "diagnostic_only": True,
+        "reason": "claim_reconcile_required",
+    }
+    claim_upload_failure = _external_delivery_gate(
+        test_email=False,
+        sent_query_ok=True,
+        in_doubt_query_ok=True,
+        claim_query_ok=True,
+        claim_upload_ok=False,
+    )
+    assert claim_upload_failure["runner_runs"] is False
+    assert claim_upload_failure["reason"] == "claim_upload_failed"
+    sent_wins = _external_delivery_gate(
+        test_email=False,
+        sent_query_ok=True,
+        in_doubt_query_ok=False,
+        claim_query_ok=False,
+        sent_exists=True,
+    )
+    assert sent_wins["already_sent"] is True
+    in_doubt_wins = _external_delivery_gate(
+        test_email=False,
+        sent_query_ok=True,
+        in_doubt_query_ok=True,
+        claim_query_ok=True,
+        in_doubt_exists=True,
+        claim_exists=True,
+    )
+    assert in_doubt_wins["reason"] == "reconcile_required"
+    test_email = _external_delivery_gate(
+        test_email=True,
+        sent_query_ok=False,
+        in_doubt_query_ok=False,
+        claim_query_ok=False,
+        claim_exists=True,
+        claim_upload_ok=False,
+    )
+    assert test_email["runner_runs"] is True
+    assert "/actions/artifacts?name=claim-$REPORT_KEY" in duplicate_check["run"]
+    assert duplicate_check["run"].index("sent-$REPORT_KEY") < duplicate_check["run"].index("in-doubt-$REPORT_KEY")
+    assert duplicate_check["run"].index("in-doubt-$REPORT_KEY") < duplicate_check["run"].index("claim-$REPORT_KEY")
+    assert 'if [ "$delivery_action" = "deliver" ] && [ "$sent_exists" = "false" ]; then' in duplicate_check["run"]
+    assert 'if [ "$delivery_action" = "deliver" ] && [ "$sent_exists" = "false" ] && [ "$in_doubt_exists" = "false" ]; then' in duplicate_check["run"]
+    assert claim["with"]["name"] == "claim-${{ steps.context.outputs.report_key }}"
+    assert claim["with"]["path"] == ".workflow-artifacts/claim-marker.json"
+    assert claim["with"]["include-hidden-files"] == "true"
+    assert claim["with"]["retention-days"] == "7"
+    assert "steps.context.outputs.test_email == 'false'" in claim["if"]
+    assert _steps(workflow).index(claim) < _steps(workflow).index(runner)
+    assert "steps.claim.outcome == 'success'" in runner["if"]
+    assert "claim_upload_failed" in claim_failure["run"]
+    assert "failure()" in claim_failure["if"]
+    assert 'if [ "$block_reason" = "reconcile_required" ] || [ "$block_reason" = "claim_reconcile_required" ]; then' in duplicate_check["run"]
+    assert '"state": "claimed"' in _step(workflow, "Prepare production delivery claim")["run"]
+    assert '"timestamp"' in _step(workflow, "Prepare production delivery claim")["run"]
+    assert "EMAIL_" not in _step(workflow, "Prepare production delivery claim")["run"]
 
 
 def test_newer_test_artifact_cannot_obscure_an_older_production_prior_report() -> None:
@@ -384,10 +509,12 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
         "Upload diagnostic manifest",
         "Upload sent marker",
         "Upload in-doubt marker",
+        "Upload production delivery claim",
     }
     assert by_name["Upload private report"]["with"]["name"] == "${{ steps.runner.outputs.report_artifact_name }}"
     assert by_name["Upload diagnostic manifest"]["with"]["name"] == "diagnostic-${{ steps.context.outputs.report_key }}"
     assert by_name["Upload sent marker"]["with"]["name"] == "sent-${{ steps.context.outputs.report_key }}"
+    assert by_name["Upload production delivery claim"]["with"]["name"] == "claim-${{ steps.context.outputs.report_key }}"
     assert all(step["with"]["retention-days"] == "7" for step in uploads)
     assert "steps.runner.outputs.final_state == 'sent'" in by_name["Upload sent marker"]["if"]
     assert "steps.context.outputs.test_email == 'false'" in by_name["Upload sent marker"]["if"]
@@ -420,7 +547,9 @@ def test_env_example_and_documentation_are_synthetic_and_cover_secure_operation(
     assert "test-report-<report-key>" in documentation
     assert "reconcile_sent=true" in documentation
     assert "verify QQ delivery directly" in documentation
-    assert "delete only the matching `in-doubt-<report-key>` artifact" in documentation
+    assert "claim-<report-key>" in documentation
+    assert "confirming no message was delivered" in documentation
+    assert "Do not auto-clear or auto-retry claims" in documentation
     assert "does not resolve GitHub cloud markers" in documentation
 
     for phrase in (

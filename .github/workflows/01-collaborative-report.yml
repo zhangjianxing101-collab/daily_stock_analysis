@@ -123,6 +123,7 @@ jobs:
           duplicate_check=available
           sent_exists=false
           in_doubt_exists=false
+          claim_exists=false
           delivery_action=deliver
           block_reason=""
           blocked_final_state=""
@@ -138,24 +139,40 @@ jobs:
               delivery_action=blocked
               block_reason=actions_marker_query_unavailable
             fi
-            if artifacts="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=in-doubt-$REPORT_KEY&per_page=100" --jq '.artifacts[] | select(.expired == false) | .name' 2>/dev/null)"; then
-              if printf '%s\n' "$artifacts" | grep -Fxq "in-doubt-$REPORT_KEY"; then
-                in_doubt_exists=true
+            if [ "$delivery_action" = "deliver" ] && [ "$sent_exists" = "false" ]; then
+              if artifacts="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=in-doubt-$REPORT_KEY&per_page=100" --jq '.artifacts[] | select(.expired == false) | .name' 2>/dev/null)"; then
+                if printf '%s\n' "$artifacts" | grep -Fxq "in-doubt-$REPORT_KEY"; then
+                  in_doubt_exists=true
+                fi
+              else
+                duplicate_check=unavailable
+                delivery_action=blocked
+                block_reason=actions_marker_query_unavailable
               fi
-            else
-              duplicate_check=unavailable
-              delivery_action=blocked
-              block_reason=actions_marker_query_unavailable
+            fi
+            if [ "$delivery_action" = "deliver" ] && [ "$sent_exists" = "false" ] && [ "$in_doubt_exists" = "false" ]; then
+              if artifacts="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=claim-$REPORT_KEY&per_page=100" --jq '.artifacts[] | select(.expired == false) | .name' 2>/dev/null)"; then
+                if printf '%s\n' "$artifacts" | grep -Fxq "claim-$REPORT_KEY"; then
+                  claim_exists=true
+                fi
+              else
+                duplicate_check=unavailable
+                delivery_action=blocked
+                block_reason=actions_marker_query_unavailable
+              fi
             fi
           fi
           if [ "$delivery_action" = "deliver" ] && [ "$TEST_EMAIL" = "false" ]; then
-            if [ "$in_doubt_exists" = "true" ] && [ "$RECONCILE_SENT" = "true" ]; then
+            if [ "$sent_exists" = "true" ]; then
+              already_sent=true
+            elif [ "$in_doubt_exists" = "true" ] && [ "$RECONCILE_SENT" = "true" ]; then
               delivery_action=reconcile
             elif [ "$in_doubt_exists" = "true" ]; then
               delivery_action=blocked
               block_reason=reconcile_required
-            elif [ "$sent_exists" = "true" ]; then
-              already_sent=true
+            elif [ "$claim_exists" = "true" ]; then
+              delivery_action=blocked
+              block_reason=claim_reconcile_required
             elif [ "$RECONCILE_SENT" = "true" ]; then
               delivery_action=blocked
               block_reason=no_in_doubt_marker
@@ -163,7 +180,7 @@ jobs:
           fi
           if [ "$delivery_action" = "blocked" ]; then
             blocked_exit=1
-            if [ "$block_reason" = "reconcile_required" ]; then
+            if [ "$block_reason" = "reconcile_required" ] || [ "$block_reason" = "claim_reconcile_required" ]; then
               blocked_final_state=operator_action_required
             else
               blocked_final_state=hard_failure
@@ -226,10 +243,80 @@ jobs:
           printf 'duplicate_check=%s\n' "$duplicate_check" >> "$GITHUB_OUTPUT"
           printf 'sent_exists=%s\n' "$sent_exists" >> "$GITHUB_OUTPUT"
           printf 'in_doubt_exists=%s\n' "$in_doubt_exists" >> "$GITHUB_OUTPUT"
+          printf 'claim_exists=%s\n' "$claim_exists" >> "$GITHUB_OUTPUT"
           printf 'delivery_action=%s\n' "$delivery_action" >> "$GITHUB_OUTPUT"
           printf 'block_reason=%s\n' "$block_reason" >> "$GITHUB_OUTPUT"
           printf 'blocked_final_state=%s\n' "$blocked_final_state" >> "$GITHUB_OUTPUT"
           printf 'blocked_exit=%s\n' "$blocked_exit" >> "$GITHUB_OUTPUT"
+
+      - name: Prepare production delivery claim
+        id: claim_prepare
+        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && steps.context.outputs.test_email == 'false' && steps.duplicate.outputs.already_sent == 'false' }}
+        env:
+          REPORT_KEY: ${{ steps.context.outputs.report_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p .workflow-artifacts
+          REPORT_KEY="$REPORT_KEY" python - <<'PY'
+          import json
+          import os
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          Path(".workflow-artifacts/claim-marker.json").write_text(
+              json.dumps(
+                  {
+                      "report_key": os.environ["REPORT_KEY"],
+                      "state": "claimed",
+                      "timestamp": datetime.now(timezone.utc).isoformat(),
+                  },
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+
+      - name: Upload production delivery claim
+        id: claim
+        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && steps.context.outputs.test_email == 'false' && steps.duplicate.outputs.already_sent == 'false' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: claim-${{ steps.context.outputs.report_key }}
+          path: .workflow-artifacts/claim-marker.json
+          include-hidden-files: true
+          retention-days: 7
+
+      - name: Record claim upload failure
+        id: claim_failure
+        if: ${{ failure() && steps.claim.outcome == 'failure' }}
+        env:
+          REPORT_KEY: ${{ steps.context.outputs.report_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p .workflow-artifacts
+          REPORT_KEY="$REPORT_KEY" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path(".workflow-artifacts/diagnostic-manifest.json").write_text(
+              json.dumps(
+                  {
+                      "report_key": os.environ["REPORT_KEY"],
+                      "final_state": "hard_failure",
+                      "module_statuses": {},
+                      "source_timestamps": {},
+                      "warning_codes": ["claim_upload_failed"],
+                  },
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          printf 'final_state=hard_failure\n' >> "$GITHUB_OUTPUT"
+          printf 'exit_code=1\n' >> "$GITHUB_OUTPUT"
 
       - name: Extract prior candidate state
         id: prior
@@ -313,7 +400,7 @@ jobs:
 
       - name: Run collaborative report
         id: runner
-        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' }}
+        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
         env:
           MODE: ${{ steps.context.outputs.mode }}
           FORCE: ${{ steps.context.outputs.force }}
@@ -534,8 +621,8 @@ jobs:
         env:
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           MODE: ${{ steps.context.outputs.mode }}
-          FINAL_STATE: ${{ steps.runner.outputs.final_state || steps.duplicate.outputs.blocked_final_state || steps.reconcile.outputs.final_state }}
-          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.reconcile.outputs.exit_code || '0' }}
+          FINAL_STATE: ${{ steps.runner.outputs.final_state || steps.duplicate.outputs.blocked_final_state || steps.claim_failure.outputs.final_state || steps.reconcile.outputs.final_state }}
+          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
           DUPLICATE_CHECK: ${{ steps.duplicate.outputs.duplicate_check }}
           DELIVERY_ACTION: ${{ steps.duplicate.outputs.delivery_action }}
           BLOCK_REASON: ${{ steps.duplicate.outputs.block_reason }}
@@ -560,7 +647,7 @@ jobs:
       - name: Fail when the runner failed
         if: ${{ always() }}
         env:
-          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.reconcile.outputs.exit_code || '0' }}
+          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
         run: |
           set -euo pipefail
           if [ "$RUNNER_EXIT" -ne 0 ]; then
