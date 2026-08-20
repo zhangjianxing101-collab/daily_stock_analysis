@@ -22,13 +22,18 @@ on:
         type: boolean
         default: false
         required: false
+      reconcile_sent:
+        description: Record a verified in-doubt QQ delivery as sent without running the report
+        type: boolean
+        default: false
+        required: false
 
 permissions:
   contents: read
   actions: read
 
 concurrency:
-  group: collaborative-report-${{ github.event.schedule || inputs.mode }}
+  group: collaborative-report-${{ github.event_name == 'schedule' && (github.event.schedule == '0 1 * * 1-5' && 'premarket' || github.event.schedule == '30 8 * * 1-5' && 'postmarket' || 'invalid-schedule') || inputs.mode }}
   cancel-in-progress: false
 
 jobs:
@@ -58,6 +63,7 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
           FORCE_INPUT: ${{ inputs.force }}
           TEST_EMAIL_INPUT: ${{ inputs.test_email }}
+          RECONCILE_SENT_INPUT: ${{ inputs.reconcile_sent }}
         run: |
           set -euo pipefail
 
@@ -82,12 +88,23 @@ jobs:
             true|false) test_email="${TEST_EMAIL_INPUT:-false}" ;;
             *) exit 1 ;;
           esac
+          case "${RECONCILE_SENT_INPUT:-false}" in
+            true|false) reconcile_sent="${RECONCILE_SENT_INPUT:-false}" ;;
+            *) exit 1 ;;
+          esac
+          if [ "$EVENT_NAME" = "schedule" ] && [ "$reconcile_sent" = "true" ]; then
+            exit 1
+          fi
+          if [ "$test_email" = "true" ] && [ "$reconcile_sent" = "true" ]; then
+            exit 1
+          fi
 
           trading_date="$(TZ=Asia/Shanghai date +%F)"
           report_key="$trading_date-$mode"
           printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
           printf 'force=%s\n' "$force" >> "$GITHUB_OUTPUT"
           printf 'test_email=%s\n' "$test_email" >> "$GITHUB_OUTPUT"
+          printf 'reconcile_sent=%s\n' "$reconcile_sent" >> "$GITHUB_OUTPUT"
           printf 'report_key=%s\n' "$report_key" >> "$GITHUB_OUTPUT"
           printf 'prior_report_artifact=%s\n' "report-$trading_date-premarket" >> "$GITHUB_OUTPUT"
 
@@ -99,21 +116,80 @@ jobs:
           PRIOR_REPORT_ARTIFACT: ${{ steps.context.outputs.prior_report_artifact }}
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           TEST_EMAIL: ${{ steps.context.outputs.test_email }}
+          RECONCILE_SENT: ${{ steps.context.outputs.reconcile_sent }}
         run: |
           set -euo pipefail
           already_sent=false
           duplicate_check=available
+          sent_exists=false
+          in_doubt_exists=false
+          delivery_action=deliver
+          block_reason=""
+          blocked_final_state=""
+          blocked_exit=0
+          mkdir -p .workflow-artifacts
           if [ "$TEST_EMAIL" = "false" ]; then
             if artifacts="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=sent-$REPORT_KEY&per_page=100" --jq '.artifacts[] | select(.expired == false) | .name' 2>/dev/null)"; then
               if printf '%s\n' "$artifacts" | grep -Fxq "sent-$REPORT_KEY"; then
-                already_sent=true
+                sent_exists=true
               fi
             else
               duplicate_check=unavailable
+              delivery_action=blocked
+              block_reason=actions_marker_query_unavailable
+            fi
+            if artifacts="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=in-doubt-$REPORT_KEY&per_page=100" --jq '.artifacts[] | select(.expired == false) | .name' 2>/dev/null)"; then
+              if printf '%s\n' "$artifacts" | grep -Fxq "in-doubt-$REPORT_KEY"; then
+                in_doubt_exists=true
+              fi
+            else
+              duplicate_check=unavailable
+              delivery_action=blocked
+              block_reason=actions_marker_query_unavailable
             fi
           fi
-          if [ "$MODE" = "postmarket" ]; then
-            mkdir -p .workflow-artifacts
+          if [ "$delivery_action" = "deliver" ] && [ "$TEST_EMAIL" = "false" ]; then
+            if [ "$in_doubt_exists" = "true" ] && [ "$RECONCILE_SENT" = "true" ]; then
+              delivery_action=reconcile
+            elif [ "$in_doubt_exists" = "true" ]; then
+              delivery_action=blocked
+              block_reason=reconcile_required
+            elif [ "$sent_exists" = "true" ]; then
+              already_sent=true
+            elif [ "$RECONCILE_SENT" = "true" ]; then
+              delivery_action=blocked
+              block_reason=no_in_doubt_marker
+            fi
+          fi
+          if [ "$delivery_action" = "blocked" ]; then
+            blocked_exit=1
+            if [ "$block_reason" = "reconcile_required" ]; then
+              blocked_final_state=operator_action_required
+            else
+              blocked_final_state=hard_failure
+            fi
+            REPORT_KEY="$REPORT_KEY" BLOCK_REASON="$block_reason" BLOCKED_FINAL_STATE="$blocked_final_state" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          Path(".workflow-artifacts/diagnostic-manifest.json").write_text(
+              json.dumps(
+                  {
+                      "report_key": os.environ["REPORT_KEY"],
+                      "final_state": os.environ["BLOCKED_FINAL_STATE"],
+                      "module_statuses": {},
+                      "source_timestamps": {},
+                      "warning_codes": [os.environ["BLOCK_REASON"]],
+                  },
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          fi
+          if [ "$delivery_action" = "deliver" ] && [ "$MODE" = "postmarket" ]; then
             if gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$PRIOR_REPORT_ARTIFACT&per_page=100" > .workflow-artifacts/prior-artifact-metadata.json 2>/dev/null; then
               PRIOR_REPORT_ARTIFACT="$PRIOR_REPORT_ARTIFACT" python - <<'PY'
           import json
@@ -148,10 +224,16 @@ jobs:
           fi
           printf 'already_sent=%s\n' "$already_sent" >> "$GITHUB_OUTPUT"
           printf 'duplicate_check=%s\n' "$duplicate_check" >> "$GITHUB_OUTPUT"
+          printf 'sent_exists=%s\n' "$sent_exists" >> "$GITHUB_OUTPUT"
+          printf 'in_doubt_exists=%s\n' "$in_doubt_exists" >> "$GITHUB_OUTPUT"
+          printf 'delivery_action=%s\n' "$delivery_action" >> "$GITHUB_OUTPUT"
+          printf 'block_reason=%s\n' "$block_reason" >> "$GITHUB_OUTPUT"
+          printf 'blocked_final_state=%s\n' "$blocked_final_state" >> "$GITHUB_OUTPUT"
+          printf 'blocked_exit=%s\n' "$blocked_exit" >> "$GITHUB_OUTPUT"
 
       - name: Extract prior candidate state
         id: prior
-        if: ${{ steps.context.outputs.mode == 'postmarket' }}
+        if: ${{ steps.context.outputs.mode == 'postmarket' && steps.duplicate.outputs.delivery_action == 'deliver' }}
         env:
           GH_TOKEN: ${{ github.token }}
           MODE: ${{ steps.context.outputs.mode }}
@@ -231,6 +313,7 @@ jobs:
 
       - name: Run collaborative report
         id: runner
+        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' }}
         env:
           MODE: ${{ steps.context.outputs.mode }}
           FORCE: ${{ steps.context.outputs.force }}
@@ -356,13 +439,60 @@ jobs:
                   json.dumps({"final_state": "sent", "report_key": report_key}, sort_keys=True) + "\n",
                   encoding="utf-8",
               )
+          needs_reconcile = (
+              os.environ["TEST_EMAIL"] == "false"
+              and final_state in {"in_doubt", "operator_action_required"}
+          )
+          if needs_reconcile:
+              (artifact_dir / "in-doubt-marker.json").write_text(
+                  json.dumps({"final_state": final_state, "report_key": report_key}, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
           with Path(os.environ["GITHUB_OUTPUT"]).open("a", encoding="utf-8") as output:
               output.write(f"final_state={final_state}\n")
               output.write(f"report_available={'true' if report_available else 'false'}\n")
               output.write(f"report_channel={channel}\n")
               output.write(f"report_artifact_name={'test-report' if channel == 'test' else 'report'}-{report_key}\n")
+              output.write(f"needs_reconcile={'true' if needs_reconcile else 'false'}\n")
               output.write(f"runner_exit={os.environ['RUNNER_EXIT']}\n")
           PY
+
+      - name: Reconcile verified in-doubt delivery
+        id: reconcile
+        if: ${{ steps.duplicate.outputs.delivery_action == 'reconcile' }}
+        env:
+          REPORT_KEY: ${{ steps.context.outputs.report_key }}
+        run: |
+          set -euo pipefail
+          mkdir -p .workflow-artifacts
+          REPORT_KEY="$REPORT_KEY" python - <<'PY'
+          import json
+          import os
+          from pathlib import Path
+
+          artifact_dir = Path(".workflow-artifacts")
+          (artifact_dir / "sent-marker.json").write_text(
+              json.dumps({"final_state": "sent", "report_key": os.environ["REPORT_KEY"]}, sort_keys=True) + "\n",
+              encoding="utf-8",
+          )
+          (artifact_dir / "diagnostic-manifest.json").write_text(
+              json.dumps(
+                  {
+                      "report_key": os.environ["REPORT_KEY"],
+                      "final_state": "reconciled_sent",
+                      "module_statuses": {},
+                      "source_timestamps": {},
+                      "warning_codes": ["reconciled_after_operator_confirmation"],
+                  },
+                  sort_keys=True,
+              )
+              + "\n",
+              encoding="utf-8",
+          )
+          PY
+          printf 'reconciled=true\n' >> "$GITHUB_OUTPUT"
+          printf 'final_state=reconciled_sent\n' >> "$GITHUB_OUTPUT"
+          printf 'exit_code=0\n' >> "$GITHUB_OUTPUT"
 
       - name: Upload private report
         if: ${{ always() && steps.runner.outputs.report_available == 'true' }}
@@ -378,14 +508,25 @@ jobs:
         with:
           name: diagnostic-${{ steps.context.outputs.report_key }}
           path: .workflow-artifacts/diagnostic-manifest.json
+          include-hidden-files: true
           retention-days: 7
 
       - name: Upload sent marker
-        if: ${{ always() && steps.runner.outputs.final_state == 'sent' && steps.context.outputs.test_email == 'false' && steps.runner.outputs.runner_exit == '0' }}
+        if: ${{ always() && ((steps.runner.outputs.final_state == 'sent' && steps.context.outputs.test_email == 'false' && steps.runner.outputs.runner_exit == '0') || steps.reconcile.outputs.reconciled == 'true') }}
         uses: actions/upload-artifact@v6
         with:
           name: sent-${{ steps.context.outputs.report_key }}
           path: .workflow-artifacts/sent-marker.json
+          include-hidden-files: true
+          retention-days: 7
+
+      - name: Upload in-doubt marker
+        if: ${{ always() && steps.runner.outputs.needs_reconcile == 'true' && steps.context.outputs.test_email == 'false' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: in-doubt-${{ steps.context.outputs.report_key }}
+          path: .workflow-artifacts/in-doubt-marker.json
+          include-hidden-files: true
           retention-days: 7
 
       - name: Write safe workflow summary
@@ -393,9 +534,11 @@ jobs:
         env:
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           MODE: ${{ steps.context.outputs.mode }}
-          FINAL_STATE: ${{ steps.runner.outputs.final_state }}
-          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit }}
+          FINAL_STATE: ${{ steps.runner.outputs.final_state || steps.duplicate.outputs.blocked_final_state || steps.reconcile.outputs.final_state }}
+          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.reconcile.outputs.exit_code || '0' }}
           DUPLICATE_CHECK: ${{ steps.duplicate.outputs.duplicate_check }}
+          DELIVERY_ACTION: ${{ steps.duplicate.outputs.delivery_action }}
+          BLOCK_REASON: ${{ steps.duplicate.outputs.block_reason }}
           PRIOR_WARNING: ${{ steps.prior.outputs.prior_report_warning }}
         run: |
           {
@@ -405,6 +548,10 @@ jobs:
             printf -- '- final state: %s\n' "$FINAL_STATE"
             printf -- '- runner exit: %s\n' "$RUNNER_EXIT"
             printf -- '- external duplicate check: %s\n' "$DUPLICATE_CHECK"
+            printf -- '- delivery action: %s\n' "$DELIVERY_ACTION"
+            if [ -n "$BLOCK_REASON" ]; then
+              printf -- '- delivery status: %s\n' "$BLOCK_REASON"
+            fi
             if [ -n "$PRIOR_WARNING" ]; then
               printf -- '- prior state: %s\n' "$PRIOR_WARNING"
             fi
@@ -413,7 +560,7 @@ jobs:
       - name: Fail when the runner failed
         if: ${{ always() }}
         env:
-          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit }}
+          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.reconcile.outputs.exit_code || '0' }}
         run: |
           set -euo pipefail
           if [ "$RUNNER_EXIT" -ne 0 ]; then

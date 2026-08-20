@@ -65,6 +65,42 @@ def _select_valid_prior_artifact(artifacts: list[dict], manifests: dict[int, obj
     return None
 
 
+def _external_delivery_gate(
+    *,
+    test_email: bool,
+    sent_query_ok: bool,
+    in_doubt_query_ok: bool,
+    sent_exists: bool = False,
+    in_doubt_exists: bool = False,
+    reconcile_sent: bool = False,
+) -> dict[str, object]:
+    """Model the workflow's production-only cross-run delivery barrier."""
+
+    if test_email:
+        return {"action": "deliver", "already_sent": False, "runner_runs": True, "diagnostic_only": False}
+    if not sent_query_ok or not in_doubt_query_ok:
+        return {
+            "action": "blocked",
+            "already_sent": False,
+            "runner_runs": False,
+            "diagnostic_only": True,
+            "reason": "actions_marker_query_unavailable",
+        }
+    if in_doubt_exists and reconcile_sent:
+        return {"action": "reconcile", "already_sent": False, "runner_runs": False, "diagnostic_only": True}
+    if in_doubt_exists:
+        return {
+            "action": "blocked",
+            "already_sent": False,
+            "runner_runs": False,
+            "diagnostic_only": True,
+            "reason": "reconcile_required",
+        }
+    if sent_exists:
+        return {"action": "deliver", "already_sent": True, "runner_runs": True, "diagnostic_only": False}
+    return {"action": "deliver", "already_sent": False, "runner_runs": True, "diagnostic_only": False}
+
+
 def test_workflow_trigger_permissions_concurrency_and_toolchain_contract() -> None:
     workflow = _workflow()
     trigger = workflow["on"]
@@ -82,9 +118,11 @@ def test_workflow_trigger_permissions_concurrency_and_toolchain_contract() -> No
     assert inputs["force"]["default"] == "false"
     assert inputs["test_email"]["type"] == "boolean"
     assert inputs["test_email"]["default"] == "false"
+    assert inputs["reconcile_sent"]["type"] == "boolean"
+    assert inputs["reconcile_sent"]["default"] == "false"
     assert workflow["permissions"] == {"contents": "read", "actions": "read"}
     assert workflow["concurrency"] == {
-        "group": "collaborative-report-${{ github.event.schedule || inputs.mode }}",
+        "group": "collaborative-report-${{ github.event_name == 'schedule' && (github.event.schedule == '0 1 * * 1-5' && 'premarket' || github.event.schedule == '30 8 * * 1-5' && 'postmarket' || 'invalid-schedule') || inputs.mode }}",
         "cancel-in-progress": "false",
     }
 
@@ -109,6 +147,7 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
         "SCHEDULE": "${{ github.event.schedule }}",
         "FORCE_INPUT": "${{ inputs.force }}",
         "TEST_EMAIL_INPUT": "${{ inputs.test_email }}",
+        "RECONCILE_SENT_INPUT": "${{ inputs.reconcile_sent }}",
     }
     assert '"0 1 * * 1-5") mode="premarket"' in context["run"]
     assert '"30 8 * * 1-5") mode="postmarket"' in context["run"]
@@ -166,6 +205,83 @@ def test_external_marker_handoff_is_production_only_and_sent_marker_is_strict() 
     assert "steps.runner.outputs.final_state == 'sent'" in sent_marker["if"]
     assert "steps.context.outputs.test_email == 'false'" in sent_marker["if"]
     assert "steps.runner.outputs.runner_exit == '0'" in sent_marker["if"]
+
+
+def test_actions_marker_query_outage_blocks_production_before_runner_and_keeps_only_diagnostics() -> None:
+    workflow = _workflow()
+    duplicate_check = _step(workflow, "Check external sent marker")
+    runner = _step(workflow, "Run collaborative report")
+    private_report = _step(workflow, "Upload private report")
+    diagnostic = _step(workflow, "Upload diagnostic manifest")
+    sent_marker = _step(workflow, "Upload sent marker")
+
+    blocked = _external_delivery_gate(test_email=False, sent_query_ok=False, in_doubt_query_ok=True)
+    assert blocked == {
+        "action": "blocked",
+        "already_sent": False,
+        "runner_runs": False,
+        "diagnostic_only": True,
+        "reason": "actions_marker_query_unavailable",
+    }
+    test_email = _external_delivery_gate(test_email=True, sent_query_ok=False, in_doubt_query_ok=False)
+    assert test_email["runner_runs"] is True
+    assert "in-doubt-$REPORT_KEY" in duplicate_check["run"]
+    assert "actions_marker_query_unavailable" in duplicate_check["run"]
+    assert runner["if"] == "${{ steps.duplicate.outputs.delivery_action == 'deliver' }}"
+    assert "steps.runner.outputs.report_available" in private_report["if"]
+    assert diagnostic["if"] == "${{ always() }}"
+    assert "steps.duplicate.outputs.delivery_action" not in sent_marker["if"]
+
+
+def test_in_doubt_marker_blocks_delivery_and_manual_reconcile_never_calls_runner() -> None:
+    workflow = _workflow()
+    duplicate_check = _step(workflow, "Check external sent marker")
+    runner = _step(workflow, "Run collaborative report")
+    reconcile = _step(workflow, "Reconcile verified in-doubt delivery")
+    uploads = {step["name"]: step for step in _upload_steps(workflow)}
+
+    blocked = _external_delivery_gate(
+        test_email=False,
+        sent_query_ok=True,
+        in_doubt_query_ok=True,
+        in_doubt_exists=True,
+    )
+    assert blocked["action"] == "blocked"
+    assert blocked["reason"] == "reconcile_required"
+    stale_in_doubt = _external_delivery_gate(
+        test_email=False,
+        sent_query_ok=True,
+        in_doubt_query_ok=True,
+        sent_exists=True,
+        in_doubt_exists=True,
+    )
+    assert stale_in_doubt["action"] == "blocked"
+    assert stale_in_doubt["reason"] == "reconcile_required"
+    reconcile_action = _external_delivery_gate(
+        test_email=False,
+        sent_query_ok=True,
+        in_doubt_query_ok=True,
+        in_doubt_exists=True,
+        reconcile_sent=True,
+    )
+    assert reconcile_action["action"] == "reconcile"
+    assert reconcile_action["runner_runs"] is False
+    assert "in_doubt_exists" in duplicate_check["run"]
+    assert "reconcile_required" in duplicate_check["run"]
+    decision_block = duplicate_check["run"].split(
+        'if [ "$delivery_action" = "deliver" ] && [ "$TEST_EMAIL" = "false" ]; then',
+        maxsplit=1,
+    )[1]
+    assert decision_block.index('if [ "$in_doubt_exists" = "true" ]') < decision_block.index(
+        'if [ "$sent_exists" = "true" ]'
+    )
+    assert "operator_action_required" in runner["run"]
+    assert "in-doubt-${{ steps.context.outputs.report_key }}" == uploads["Upload in-doubt marker"]["with"]["name"]
+    assert "steps.runner.outputs.needs_reconcile == 'true'" in uploads["Upload in-doubt marker"]["if"]
+    assert "steps.context.outputs.test_email == 'false'" in uploads["Upload in-doubt marker"]["if"]
+    assert "steps.duplicate.outputs.delivery_action == 'reconcile'" in reconcile["if"]
+    assert "run_collaborative_report.py" not in reconcile["run"]
+    assert "sent-marker.json" in reconcile["run"]
 
 
 def test_newer_test_artifact_cannot_obscure_an_older_production_prior_report() -> None:
@@ -263,7 +379,12 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
     uploads = _upload_steps(workflow)
     by_name = {step["name"]: step for step in uploads}
 
-    assert set(by_name) == {"Upload private report", "Upload diagnostic manifest", "Upload sent marker"}
+    assert set(by_name) == {
+        "Upload private report",
+        "Upload diagnostic manifest",
+        "Upload sent marker",
+        "Upload in-doubt marker",
+    }
     assert by_name["Upload private report"]["with"]["name"] == "${{ steps.runner.outputs.report_artifact_name }}"
     assert by_name["Upload diagnostic manifest"]["with"]["name"] == "diagnostic-${{ steps.context.outputs.report_key }}"
     assert by_name["Upload sent marker"]["with"]["name"] == "sent-${{ steps.context.outputs.report_key }}"
@@ -297,6 +418,10 @@ def test_env_example_and_documentation_are_synthetic_and_cover_secure_operation(
     assert "cross-run duplicate guard" in documentation
     assert "Within a single run" in documentation
     assert "test-report-<report-key>" in documentation
+    assert "reconcile_sent=true" in documentation
+    assert "verify QQ delivery directly" in documentation
+    assert "delete only the matching `in-doubt-<report-key>` artifact" in documentation
+    assert "does not resolve GitHub cloud markers" in documentation
 
     for phrase in (
         "QQ",
