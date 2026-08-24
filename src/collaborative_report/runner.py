@@ -53,6 +53,7 @@ _PREMARKET_MAX_SOURCE_AGE = timedelta(days=4)
 class FinalState(str, Enum):
     SENT = "sent"
     TEST_SENT = "test_sent"
+    PREVIEWED = "previewed"
     DUPLICATE_SKIP = "duplicate_skip"
     NON_TRADING_DAY_SKIP = "non_trading_day_skip"
     OPERATOR_ACTION_REQUIRED = "operator_action_required"
@@ -1026,6 +1027,7 @@ def publish_report_artifacts(
     if manifest.get("report_key") != report_key or final_state not in {
         FinalState.SENT.value,
         FinalState.TEST_SENT.value,
+        FinalState.PREVIEWED.value,
         "prepared",
     }:
         raise ValueError("artifact manifest identity invalid")
@@ -1208,12 +1210,15 @@ def run_report(
     deps: RunnerDependencies | None = None,
     force: bool = False,
     test_email: bool = False,
+    preview_only: bool = False,
     already_sent: bool = False,
     prior_report: Path | str | None = None,
     output_dir: Path | str = "reports/collaborative",
 ) -> RunResult:
     """Run one report without leaking third-party exception text to its result."""
 
+    if preview_only and test_email:
+        return _failure("preview_test_email_conflict")
     normalized_mode = ReportMode(mode)
     active = deps or default_dependencies()
     now = active.clock()
@@ -1227,7 +1232,7 @@ def run_report(
     if not session.is_trading_day:
         return RunResult(EXIT_SUCCESS, FinalState.NON_TRADING_DAY_SKIP, session.report_key, {})
     ledger = None
-    if not test_email:
+    if not test_email and not preview_only:
         if already_sent:
             return RunResult(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP, session.report_key, {})
         try:
@@ -1603,7 +1608,7 @@ def run_report(
     except Exception:
         return _failure("report_render_failed", report_key=session.report_key, modules=modules)
 
-    final_state = FinalState.TEST_SENT if test_email else FinalState.SENT
+    final_state = FinalState.PREVIEWED if preview_only else (FinalState.TEST_SENT if test_email else FinalState.SENT)
     try:
         manifest = _redacted_manifest(
             session,
@@ -1625,6 +1630,29 @@ def run_report(
         )
     except Exception:
         return _failure("artifact_write_failed", report_key=session.report_key, modules=modules)
+
+    if preview_only:
+        manifest = dict(
+            manifest,
+            final_state=final_state.value,
+            module_statuses={name: result.status for name, result in modules.items()},
+            warning_codes=_warning_codes(modules),
+        )
+        try:
+            final_paths = artifact_finalizer(
+                output_dir,
+                report_key=session.report_key,
+                rendered=rendered,
+                manifest=manifest,
+                test_email=True,
+            )
+        except Exception:
+            return _failure("artifact_finalize_failed", report_key=session.report_key, modules=modules, paths=paths)
+        return RunResult(
+            EXIT_SUCCESS, final_state, session.report_key, modules,
+            final_paths.html_path, final_paths.text_path, final_paths.manifest_path,
+            screening.short_term, screening.swing, morning_candidates,
+        )
 
     claim_id: str | None = None
     if not test_email:
