@@ -1,7 +1,8 @@
 """Thin, typed REST client for the THS (Fuyao) market-data API.
 
-This module intentionally returns the provider's business payload unchanged.  The
-next integration layer owns A-share code normalization and market-data validation.
+This module validates the documented response shape before exposing a provider
+payload. The next integration layer owns A-share code normalization and
+market-data semantics.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 import requests
 
-from .settings import ThsSettings
+from .settings import DEFAULT_THS_BASE_URL, ThsSettings
 
 
 class ThsEndpoint(str, Enum):
@@ -142,16 +143,22 @@ def _requests_transport(
     timeout_seconds: float,
 ) -> ThsHttpResponse:
     try:
-        response = requests.get(url, headers=dict(headers), params=dict(params), timeout=timeout_seconds)
-    except requests.Timeout as exc:
-        raise TimeoutError from exc
-    except requests.RequestException as exc:
-        raise ConnectionError from exc
+        response = requests.get(
+            url,
+            headers=dict(headers),
+            params=dict(params),
+            timeout=timeout_seconds,
+            allow_redirects=False,
+        )
+    except requests.Timeout:
+        raise TimeoutError from None
+    except requests.RequestException:
+        raise ConnectionError from None
 
     try:
         payload = response.json()
-    except ValueError as exc:
-        raise ThsResponseError("THS API returned invalid JSON") from exc
+    except ValueError:
+        raise ThsResponseError("THS API returned invalid JSON") from None
     return ThsHttpResponse(status_code=response.status_code, payload=payload)
 
 
@@ -181,6 +188,75 @@ def _require_timestamp(name: str, value: int) -> int:
     return value
 
 
+def _is_timestamp(value: object) -> bool:
+    return type(value) is int and value >= 0
+
+
+def _require_item_list(data: Mapping[str, Any]) -> None:
+    items = data.get("item")
+    if not isinstance(items, list) or any(not isinstance(item, Mapping) for item in items):
+        raise ThsResponseError("THS API returned an invalid success payload")
+
+
+def _require_timestamped_items(data: Mapping[str, Any], *, nullable_timestamp: bool = False) -> None:
+    timestamp = data.get("timestamp")
+    if not _is_timestamp(timestamp) and not (nullable_timestamp and timestamp is None):
+        raise ThsResponseError("THS API returned an invalid success payload")
+    _require_item_list(data)
+
+
+def _require_hot_list_history(data: Mapping[str, Any]) -> None:
+    day = data.get("date")
+    if not isinstance(day, str) or fullmatch(r"[0-9]{4}-[0-9]{2}-[0-9]{2}", day) is None:
+        raise ThsResponseError("THS API returned an invalid success payload")
+    if not _is_timestamp(data.get("date_ms")):
+        raise ThsResponseError("THS API returned an invalid success payload")
+    _require_item_list(data)
+
+
+def _require_financial_indicators(data: Mapping[str, Any]) -> None:
+    thscode = data.get("thscode")
+    report = data.get("report")
+    abilities = data.get("abilities")
+    if (
+        not isinstance(thscode, str)
+        or not thscode.strip()
+        or not isinstance(report, str)
+        or fullmatch(r"[0-9]{4}-[1-4]", report) is None
+        or not isinstance(abilities, list)
+        or not abilities
+    ):
+        raise ThsResponseError("THS API returned an invalid success payload")
+    for ability in abilities:
+        if not isinstance(ability, Mapping):
+            raise ThsResponseError("THS API returned an invalid success payload")
+        ability_name = ability.get("ability")
+        indicators = ability.get("indicators")
+        if not isinstance(ability_name, str) or not ability_name.strip() or not isinstance(indicators, list):
+            raise ThsResponseError("THS API returned an invalid success payload")
+        for indicator in indicators:
+            if not isinstance(indicator, Mapping):
+                raise ThsResponseError("THS API returned an invalid success payload")
+            index_id = indicator.get("index_id")
+            value = indicator.get("value")
+            if (
+                not isinstance(index_id, str)
+                or not index_id.strip()
+                or not isinstance(value, (str, type(None)))
+            ):
+                raise ThsResponseError("THS API returned an invalid success payload")
+
+
+def _validate_success_data(endpoint: ThsEndpoint, data: Mapping[str, Any]) -> None:
+    if endpoint is ThsEndpoint.FINANCIAL_INDICATORS:
+        _require_financial_indicators(data)
+        return
+    if endpoint is ThsEndpoint.HOT_STOCK_LIST_HISTORY:
+        _require_hot_list_history(data)
+        return
+    _require_timestamped_items(data, nullable_timestamp=endpoint is ThsEndpoint.A_SHARE_SNAPSHOT)
+
+
 class ThsMarketDataClient:
     """Read-only THS client with bounded retries and a test-injectable transport."""
 
@@ -202,7 +278,7 @@ class ThsMarketDataClient:
     def a_share_snapshot(
         self, thscodes: Sequence[str] | None = None, *, limit: int = 100, offset: int = 0
     ) -> ThsApiResponse:
-        if thscodes:
+        if thscodes is not None:
             params: dict[str, str | int] = {"thscodes": self._join_codes(thscodes)}
         else:
             if not 1 <= limit <= 1000 or offset < 0:
@@ -305,7 +381,11 @@ class ThsMarketDataClient:
         return ",".join(normalized)
 
     def _get(self, endpoint: ThsEndpoint, params: Mapping[str, str | int]) -> ThsApiResponse:
-        if not self._settings.enabled or not self._settings.api_key:
+        if (
+            not self._settings.enabled
+            or not self._settings.api_key
+            or self._settings.base_url != DEFAULT_THS_BASE_URL
+        ):
             raise ThsConfigurationError("THS data provider is not configured")
 
         url = f"{self._settings.base_url}{endpoint.value}"
@@ -318,10 +398,10 @@ class ThsMarketDataClient:
                     params=params,
                     timeout_seconds=self._settings.timeout_seconds,
                 )
-                result = self._parse_response(response)
-            except (TimeoutError, ConnectionError) as exc:
+                result = self._parse_response(endpoint, response)
+            except (TimeoutError, ConnectionError):
                 if attempt == self._settings.max_retries:
-                    raise ThsNetworkError("THS network request failed") from exc
+                    raise ThsNetworkError("THS network request failed") from None
                 self._backoff(attempt)
                 continue
             except ThsApiError as exc:
@@ -334,16 +414,16 @@ class ThsMarketDataClient:
                 continue
             except ThsResponseError:
                 raise
-            except Exception as exc:
+            except Exception:
                 if attempt == self._settings.max_retries:
-                    raise ThsNetworkError("THS network request failed") from exc
+                    raise ThsNetworkError("THS network request failed") from None
                 self._backoff(attempt)
                 continue
             else:
                 return result
         raise AssertionError("retry loop must return or raise")
 
-    def _parse_response(self, response: ThsHttpResponse) -> ThsApiResponse:
+    def _parse_response(self, endpoint: ThsEndpoint, response: ThsHttpResponse) -> ThsApiResponse:
         if type(response.status_code) is not int:
             raise ThsResponseError("THS API returned an invalid HTTP status")
         if response.status_code not in range(200, 300):
@@ -371,6 +451,7 @@ class ThsMarketDataClient:
         data = response.payload.get("data")
         if not isinstance(data, Mapping):
             raise ThsResponseError("THS API returned an invalid success payload")
+        _validate_success_data(endpoint, data)
         return ThsApiResponse(data=data, request_id=request_id)
 
     def _backoff(self, attempt: int) -> None:

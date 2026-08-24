@@ -5,8 +5,6 @@ import math
 import os
 from dataclasses import dataclass, field
 from typing import Any
-from urllib.parse import urlparse
-
 from .models import Position
 
 
@@ -47,11 +45,10 @@ def _env_int(name: str, default: int) -> int:
 
 
 def _ths_base_url() -> str:
-    raw_value = os.environ.get("THS_BASE_URL", DEFAULT_THS_BASE_URL).strip().rstrip("/")
-    parsed = urlparse(raw_value)
-    if parsed.scheme != "https" or not parsed.netloc or parsed.path not in {"", "/"}:
-        raise ValueError("THS_BASE_URL must be an HTTPS origin")
-    return raw_value
+    raw_value = os.environ.get("THS_BASE_URL", DEFAULT_THS_BASE_URL)
+    if raw_value != DEFAULT_THS_BASE_URL:
+        raise ValueError("THS_BASE_URL must be exactly https://fuyao.aicubes.cn")
+    return DEFAULT_THS_BASE_URL
 
 
 @dataclass(frozen=True)

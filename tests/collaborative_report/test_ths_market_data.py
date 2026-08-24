@@ -1,10 +1,12 @@
 import os
+import traceback
 from collections.abc import Mapping
 from typing import Callable
 from unittest.mock import patch
 
 import pytest
 
+import src.collaborative_report.ths_market_data as ths_market_data
 from src.collaborative_report.settings import ThsSettings
 from src.collaborative_report.ths_market_data import (
     ThsAdjust,
@@ -31,8 +33,30 @@ def settings(**overrides: str) -> ThsSettings:
 def success(data: Mapping[str, object] | None = None) -> ThsHttpResponse:
     return ThsHttpResponse(
         200,
-        {"code": 0, "message": "success", "request_id": "request-123", "data": data or {"item": []}},
+        {
+            "code": 0,
+            "message": "success",
+            "request_id": "request-123",
+            "data": data if data is not None else {"timestamp": 1, "item": []},
+        },
     )
+
+
+def valid_response_data(url: str) -> Mapping[str, object]:
+    if url.endswith("/api/a-share/financials/indicators"):
+        return {
+            "thscode": "600000.SH",
+            "report": "2026-1",
+            "abilities": [
+                {
+                    "ability": "growth",
+                    "indicators": [{"index_id": "net_profit_yoy_growth_ratio", "value": "1.2"}],
+                }
+            ],
+        }
+    if url.endswith("/api/a-share/special-data/hot-stock-list-history"):
+        return {"date": "2026-08-24", "date_ms": 1, "item": []}
+    return {"timestamp": 1, "item": []}
 
 
 def test_settings_disable_provider_without_a_key_and_never_echo_invalid_key() -> None:
@@ -57,7 +81,6 @@ def test_settings_repr_does_not_include_api_key() -> None:
     ("overrides", "message"),
     [
         ({"THS_ENABLED": "sometimes"}, "THS_ENABLED must be a boolean"),
-        ({"THS_BASE_URL": "http://example.test"}, "THS_BASE_URL must be an HTTPS origin"),
         ({"THS_TIMEOUT_SECONDS": "0"}, "THS_TIMEOUT_SECONDS must be greater than 0 and at most 60"),
         ({"THS_MAX_RETRIES": "4"}, "THS_MAX_RETRIES must be between 0 and 3"),
     ],
@@ -65,6 +88,53 @@ def test_settings_repr_does_not_include_api_key() -> None:
 def test_settings_validate_provider_controls(overrides: dict[str, str], message: str) -> None:
     with pytest.raises(ValueError, match=f"^{message}$"):
         settings(**overrides)
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "http://fuyao.aicubes.cn",
+        "https://attacker.example",
+        "https://fuyao.aicubes.cn/",
+        "https://fuyao.aicubes.cn/api",
+        "https://fuyao.aicubes.cn?target=attacker.example",
+        "https://user@fuyao.aicubes.cn",
+    ],
+)
+def test_settings_only_accepts_the_exact_official_ths_origin(base_url: str) -> None:
+    with pytest.raises(ValueError, match="^THS_BASE_URL must be exactly https://fuyao.aicubes.cn$"):
+        settings(THS_BASE_URL=base_url)
+
+
+def test_requests_transport_disables_redirects(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls: list[dict[str, object]] = []
+
+    class Response:
+        status_code = 302
+
+        @staticmethod
+        def json() -> object:
+            return {"code": 0, "data": {"timestamp": 1, "item": []}}
+
+    def get(*args: object, **kwargs: object) -> Response:
+        calls.append({"args": args, "kwargs": kwargs})
+        return Response()
+
+    monkeypatch.setattr(ths_market_data.requests, "get", get)
+
+    ths_market_data._requests_transport(
+        url="https://fuyao.aicubes.cn/api/a-share/prices/snapshot",
+        headers={"X-api-key": TEST_API_KEY},
+        params={"thscodes": "600000.SH"},
+        timeout_seconds=10,
+    )
+
+    assert calls[0]["kwargs"] == {
+        "headers": {"X-api-key": TEST_API_KEY},
+        "params": {"thscodes": "600000.SH"},
+        "timeout": 10,
+        "allow_redirects": False,
+    }
 
 
 def test_snapshot_uses_api_key_header_and_parses_envelope() -> None:
@@ -148,7 +218,7 @@ def test_client_exposes_all_task_one_endpoints(
 
     def transport(**kwargs: object) -> ThsHttpResponse:
         calls.append(kwargs)
-        return success()
+        return success(valid_response_data(str(kwargs["url"])))
 
     operation(ThsMarketDataClient(settings(), transport=transport))
 
@@ -167,6 +237,16 @@ def test_client_requires_configuration_without_attempting_transport() -> None:
         client.hot_stock_list()
 
     assert calls == []
+
+
+def test_client_rejects_a_non_official_origin_before_sending_the_api_key() -> None:
+    client = ThsMarketDataClient(
+        ThsSettings(TEST_API_KEY, True, "https://attacker.example", 10, 0),
+        transport=lambda **kwargs: pytest.fail("transport should not run"),
+    )
+
+    with pytest.raises(ThsConfigurationError, match="^THS data provider is not configured$"):
+        client.hot_stock_list()
 
 
 def test_authentication_error_is_not_retried_and_does_not_leak_secret() -> None:
@@ -195,7 +275,7 @@ def test_retryable_api_error_retries_with_injected_sleep() -> None:
                 200,
                 {"code": 4001, "message": "slow down", "request_id": "first", "data": None},
             ),
-            success({"item": [{"rank": 1}]}),
+            success({"timestamp": 1, "item": [{"rank": 1}]}),
         ]
     )
     pauses: list[float] = []
@@ -239,6 +319,8 @@ def test_unexpected_transport_error_is_sanitized() -> None:
         ThsMarketDataClient(settings(THS_MAX_RETRIES="0"), transport=transport).hot_stock_list()
 
     assert TEST_API_KEY not in str(error.value)
+    formatted_traceback = "".join(traceback.format_exception(error.type, error.value, error.tb))
+    assert TEST_API_KEY not in formatted_traceback
 
 
 @pytest.mark.parametrize(
@@ -257,14 +339,66 @@ def test_malformed_or_non_retryable_http_responses_are_safe(response: ThsHttpRes
     assert TEST_API_KEY not in str(error.value)
 
 
+@pytest.mark.parametrize(
+    ("operation", "data"),
+    [
+        (lambda client: client.a_share_historical("600000.SH", start_ms=1, end_ms=2), {"item": []}),
+        (lambda client: client.hot_stock_list(), {"timestamp": 1, "item": ["not-an-object"]}),
+        (lambda client: client.hot_stock_list_history("2026-08-24"), {"timestamp": 1, "item": []}),
+        (
+            lambda client: client.financial_indicators("600000.SH", "2026-1"),
+            {"thscode": "600000.SH", "report": "2026-1", "abilities": [{"ability": "growth"}]},
+        ),
+        (
+            lambda client: client.financial_indicators("600000.SH", "2026-1"),
+            {"thscode": "600000.SH", "report": "2026-1", "abilities": []},
+        ),
+    ],
+)
+def test_success_payload_shapes_are_validated_by_endpoint(
+    operation: Callable[[ThsMarketDataClient], object], data: Mapping[str, object]
+) -> None:
+    with pytest.raises(ThsResponseError, match="^THS API returned an invalid success payload$"):
+        operation(ThsMarketDataClient(settings(), transport=lambda **kwargs: success(data)))
+
+
+def test_financial_indicator_payload_uses_its_documented_non_list_shape() -> None:
+    response = ThsMarketDataClient(
+        settings(),
+        transport=lambda **kwargs: success(valid_response_data("/api/a-share/financials/indicators")),
+    ).financial_indicators("600000.SH", "2026-1")
+
+    assert response.items == ()
+    assert response.data["abilities"] == [
+        {
+            "ability": "growth",
+            "indicators": [{"index_id": "net_profit_yoy_growth_ratio", "value": "1.2"}],
+        }
+    ]
+
+
 def test_bad_inputs_fail_before_a_network_request() -> None:
     client = ThsMarketDataClient(settings(), transport=lambda **kwargs: pytest.fail("transport should not run"))
 
     with pytest.raises(ValueError, match="^thscodes must not be empty$"):
         client.index_snapshot([])
+    with pytest.raises(ValueError, match="^thscodes must not be empty$"):
+        client.a_share_snapshot([])
     with pytest.raises(ValueError, match="^thscodes must be a sequence of codes$"):
         client.index_snapshot("000001.SH")
     with pytest.raises(ValueError, match="^end_ms must not be before start_ms$"):
         client.index_historical("886042.TI", start_ms=2, end_ms=1)
     with pytest.raises(ValueError, match="^report must have the format YYYY-1 through YYYY-4$"):
         client.financial_indicators("600000.SH", "2026-5")
+
+
+def test_none_stock_codes_requests_a_share_snapshot_pagination() -> None:
+    calls: list[dict[str, object]] = []
+
+    def transport(**kwargs: object) -> ThsHttpResponse:
+        calls.append(kwargs)
+        return success({"timestamp": None, "item": []})
+
+    ThsMarketDataClient(settings(), transport=transport).a_share_snapshot(None, limit=50, offset=10)
+
+    assert calls[0]["params"] == {"limit": 50, "offset": 10}
