@@ -30,6 +30,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--mode", choices=tuple(mode.value for mode in ReportMode))
     parser.add_argument("--force", action="store_true", help="Bypass only the scheduled delivery window")
     parser.add_argument("--test-email", action="store_true", help="Prefix the delivered subject as test-only")
+    parser.add_argument("--no-send", action="store_true", help="Generate artifacts only; never send email or update delivery state")
     parser.add_argument("--already-sent", action="store_true", help="Skip a completed production report identity")
     parser.add_argument("--prior-report", type=Path)
     parser.add_argument("--output-dir", type=Path)
@@ -147,7 +148,7 @@ def main(
         parser.error("--output-dir is required for report and ledger actions")
     operator_key = args.ledger_status or args.reconcile_sent or args.reconcile_failed
     if operator_key:
-        if args.mode is not None or args.force or args.test_email or args.already_sent or args.prior_report:
+        if args.mode is not None or args.force or args.test_email or args.no_send or args.already_sent or args.prior_report:
             parser.error("ledger operator actions cannot be combined with report-run arguments")
         ledger = LocalDeliveryLedger(args.output_dir)
         try:
@@ -203,6 +204,7 @@ def main(
         mode,
         force=args.force,
         test_email=args.test_email,
+        preview_only=args.no_send,
         already_sent=args.already_sent,
         prior_report=args.prior_report,
         output_dir=args.output_dir,

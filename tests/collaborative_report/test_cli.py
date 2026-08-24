@@ -60,6 +60,7 @@ def test_cli_passes_all_task_9_arguments_and_returns_success(tmp_path, capsys) -
         ReportMode.POSTMARKET,
         force=True,
         test_email=True,
+        preview_only=False,
         already_sent=True,
         prior_report=prior,
         output_dir=tmp_path,
