@@ -111,6 +111,32 @@ def test_all_supplied_module_warnings_render_once_in_html_and_text() -> None:
     assert "保留展示" in rendered.text
 
 
+def test_ths_evidence_sections_show_source_time_and_manual_confirmation_boundary() -> None:
+    rendered = render_report(
+        ReportMode.PREMARKET,
+        date(2026, 8, 19),
+        modules={
+            "ths_market_evidence": module(
+                "ths_market_evidence",
+                {"数据源": "ths.fuyao.hot_stock_list", "采集时间": OBSERVED_AT.isoformat(), "热榜命中数": 1},
+                "同花顺行业指数快照不可用，未参与候选排序",
+                status="partial",
+            ),
+            "ths_financial_evidence": module(
+                "ths_financial_evidence",
+                {"报告期": "2026-2", "覆盖数": 1, "正向增长证据数": 1},
+            ),
+        },
+    )
+
+    for output in (rendered.html, rendered.text):
+        assert "同花顺市场证据" in output
+        assert "同花顺基本面证据" in output
+        assert "ths.fuyao.hot_stock_list" in output
+        assert "同花顺行业指数快照不可用，未参与候选排序" in output
+        assert "人工确认后操作 / 不承诺收益 / 不自动下单" in output
+
+
 def test_non_ok_module_status_is_explicit_without_duplicating_warning() -> None:
     rendered = render_report(
         ReportMode.PREMARKET,

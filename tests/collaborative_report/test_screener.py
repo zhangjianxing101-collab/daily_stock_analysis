@@ -6,7 +6,12 @@ import pandas as pd
 import pytest
 
 from src.collaborative_report.market_data import MarketDataset, normalize_a_share_snapshot
-from src.collaborative_report.screener import ScreeningResult, prefilter_universe, screen_aggressive
+from src.collaborative_report.screener import (
+    ScreeningResult,
+    prefilter_universe,
+    rank_with_ths_evidence,
+    screen_aggressive,
+)
 
 
 OBSERVED_AT = datetime(2026, 8, 19, 8, 0, tzinfo=timezone.utc)
@@ -453,3 +458,28 @@ def test_screening_does_not_mutate_inputs_and_result_is_frozen() -> None:
 def test_naive_observed_at_is_rejected() -> None:
     with pytest.raises(ValueError, match="observed_at must be timezone-aware"):
         screen_aggressive(pd.DataFrame(), {}, {}, observed_at=datetime(2026, 8, 19))
+
+
+def test_ths_evidence_only_reorders_existing_technical_candidates() -> None:
+    technical = screen_aggressive(
+        pd.DataFrame([snapshot_row("000090"), snapshot_row("000091")]),
+        {"000090": bars(), "000091": bars()},
+        {},
+        observed_at=OBSERVED_AT,
+    ).short_term
+
+    ranked = rank_with_ths_evidence(
+        technical,
+        {
+            "000091": {"hot_list": True, "financial_positive": True, "index_support": True},
+            "not-a-candidate": {"hot_list": True, "financial_positive": True},
+        },
+    )
+
+    assert [item.code for item in ranked] == ["000091", "000090"]
+    assert ranked[0].score == min(technical[1].score + 5, 100)
+    assert ranked[0].stop_price == technical[1].stop_price
+    assert ranked[0].target_price == technical[1].target_price
+    assert "THS热榜证据" in ranked[0].matched_rules
+    assert "not-a-candidate" not in {item.code for item in ranked}
+    assert "THS热榜证据" not in technical[1].matched_rules

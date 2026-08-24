@@ -10,9 +10,29 @@ Add the following encrypted GitHub Secrets under **Settings -> Secrets and varia
 
 - `EMAIL_SENDER`, `EMAIL_PASSWORD`, and `EMAIL_RECEIVERS`
 - `COLLAB_PORTFOLIO_JSON`
+- `THS_API_KEY` for the optional 同花顺/福耀 market-data source
 - Any AI provider keys used by the report, such as `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`
 
 Do not place sender/receiver addresses, portfolio JSON, authorization codes, or AI keys in repository variables. The `.env.example` values are synthetic placeholders only.
+
+## 同花顺数据与人工查询
+
+When `THS_API_KEY` is configured, the collaborative report prefers 同花顺 data for A-share snapshots and daily bars, then falls back to the existing provider only for recoverable provider failures. Financial indicators, hot lists, and industry-index catalog data are shown as evidence with their source and collection time. They can only re-rank candidates that already passed the deterministic technical rules; they never create a candidate, change stop/target levels, place an order, or remove the requirement for manual confirmation. Missing, stale, invalid, or conflicting provider data is marked as unavailable or observation-only.
+
+Use the read-only local query interface for an explicit connectivity or data check. It prints normalized JSON and never prints `THS_API_KEY` or request headers:
+
+```bash
+python scripts/run_collaborative_report.py query quote 600000
+python scripts/run_collaborative_report.py query bars 600000 --expected-session 2026-08-21
+python scripts/run_collaborative_report.py query financials 600000 --report 2026-2
+python scripts/run_collaborative_report.py query hot-list --period day
+python scripts/run_collaborative_report.py query index catalog --tag industry
+python scripts/run_collaborative_report.py query index constituents 886042.TI
+python scripts/run_collaborative_report.py query index quote 886042.TI
+python scripts/run_collaborative_report.py query index bars 886042.TI --expected-session 2026-08-21
+```
+
+Queries are read-only data retrieval, not trading commands. Review returned data quality and confirm every investment decision manually.
 
 ## Repository variables
 

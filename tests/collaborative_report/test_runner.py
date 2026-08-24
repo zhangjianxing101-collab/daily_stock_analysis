@@ -38,6 +38,7 @@ from src.collaborative_report.runner import _production_mail_sender
 from src.collaborative_report.screener import ScreeningResult, screen_aggressive
 from src.collaborative_report.session import ReportSession, build_report_session, report_data_session
 from src.collaborative_report.settings import CollaborativeSettings
+from src.collaborative_report.ths_market_data import ThsMarketDataClient
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -524,6 +525,51 @@ def test_ai_failure_preserves_deterministic_candidates_and_delivery(tmp_path, de
     assert result.short_term_candidates == (candidate(),)
     assert deps.renderer.call_args.kwargs["short_term_candidates"] == (candidate(),)
     deps.mail_sender.assert_called_once()
+
+
+def test_ths_evidence_reorders_only_existing_candidates_and_is_reported(tmp_path, deps) -> None:
+    class EvidenceGateway(FakeGateway):
+        def get_ths_hot_stock_list(self):
+            return dataset(pd.DataFrame([{"ticker": CANDIDATE_CODE}]), "ths.fuyao.hot_stock_list")
+
+        def get_ths_index_catalog(self, tag):
+            return dataset(pd.DataFrame([{"thscode": "886042.TI"}]), "ths.fuyao.index_catalog")
+
+        def get_ths_index_snapshot(self, thscodes):
+            assert thscodes == ("886042.TI",)
+            return dataset(
+                pd.DataFrame([{"price_change_ratio_pct": 1.0}]),
+                "ths.fuyao.index_snapshot",
+            )
+
+        def get_ths_financial_indicators(self, code, report):
+            assert code == CANDIDATE_CODE
+            assert report == "2026-2"
+            return dataset(
+                pd.DataFrame([{"index_id": "net_profit_yoy_growth_ratio", "value": "1.2"}]),
+                "ths.fuyao.financial_indicators",
+            )
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=EvidenceGateway()),
+        output_dir=tmp_path,
+    )
+
+    selected = result.short_term_candidates[0]
+    assert selected.code == CANDIDATE_CODE
+    assert selected.score == 90
+    assert selected.stop_price == candidate().stop_price
+    assert selected.target_price == candidate().target_price
+    assert selected.matched_rules == (
+        "close_breaks_20d_high",
+        "THS热榜证据",
+        "THS基本面证据",
+        "THS指数环境证据",
+    )
+    assert result.modules["ths_market_evidence"].status == "ok"
+    assert result.modules["ths_market_evidence"].payload["数据源"] == "ths.fuyao.hot_stock_list"
+    assert result.modules["ths_financial_evidence"].payload["正向增长证据数"] == 1
 
 
 def test_real_gold_result_projects_without_losing_immutable_risk_checks(tmp_path, deps) -> None:
@@ -1350,6 +1396,7 @@ def test_default_dependencies_bind_production_collaborative_modules_without_runn
     assert production.ai_enricher is enrich_codes
     assert production.renderer is render_report
     assert isinstance(production.gateway, MarketDataGateway)
+    assert isinstance(production.gateway._ths_client, ThsMarketDataClient)
     assert production.gateway._clock is clock
     clock.assert_not_called()
 

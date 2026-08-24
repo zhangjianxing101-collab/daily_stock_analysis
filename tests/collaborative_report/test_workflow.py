@@ -454,6 +454,7 @@ def test_workflow_maps_secrets_and_variables_without_literal_personal_data() -> 
         "EMAIL_PASSWORD",
         "EMAIL_RECEIVERS",
         "COLLAB_PORTFOLIO_JSON",
+        "THS_API_KEY",
         "ANSPIRE_API_KEYS",
         "GEMINI_API_KEY",
         "GEMINI_API_KEYS",
@@ -551,6 +552,9 @@ def test_env_example_and_documentation_are_synthetic_and_cover_secure_operation(
     assert "confirming no message was delivered" in documentation
     assert "Do not auto-clear or auto-retry claims" in documentation
     assert "does not resolve GitHub cloud markers" in documentation
+    assert "THS_API_KEY" in documentation
+    assert "query quote" in documentation
+    assert "never create a candidate" in documentation
 
     for phrase in (
         "QQ",

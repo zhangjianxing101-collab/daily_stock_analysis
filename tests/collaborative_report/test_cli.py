@@ -6,9 +6,11 @@ from pathlib import Path
 from unittest.mock import Mock
 from zoneinfo import ZoneInfo
 
+import pandas as pd
 import pytest
 
 from src.collaborative_report.cli import main
+from src.collaborative_report.market_data import MarketDataset
 from src.collaborative_report.models import ReportMode
 from src.collaborative_report.report import RenderedReport
 from src.collaborative_report.runner import (
@@ -190,3 +192,76 @@ def test_cli_reconcile_sent_finalizes_attempt_and_invalid_transition_fails(tmp_p
         clock=lambda: NOW,
     ) == EXIT_FAILURE
     assert json.loads(capsys.readouterr().out)["error"] == "invalid_transition"
+
+
+class QueryGateway:
+    def __init__(self) -> None:
+        self.dataset = MarketDataset(
+            pd.DataFrame([{"code": "600000", "price": 10.0}]),
+            "ths.fuyao.a_share_snapshot",
+            NOW,
+        )
+
+    def get_a_share_snapshot(self, codes):
+        assert codes == ["600000"]
+        return self.dataset
+
+    def get_daily_bars(self, code, expected_session, *, days=160):
+        return self.dataset
+
+    def get_ths_financial_indicators(self, code, report):
+        return self.dataset
+
+    def get_ths_hot_stock_list(self, period):
+        return self.dataset
+
+    def get_ths_index_catalog(self, tag):
+        return self.dataset
+
+    def get_ths_index_constituents(self, thscode):
+        return self.dataset
+
+    def get_ths_index_snapshot(self, thscodes):
+        return self.dataset
+
+    def get_ths_index_bars(self, thscode, expected_session, *, days=160):
+        return self.dataset
+
+
+@pytest.mark.parametrize(
+    "argv",
+    [
+        ["query", "quote", "600000"],
+        ["query", "bars", "600000", "--expected-session", "2026-08-19"],
+        ["query", "financials", "600000", "--report", "2026-2"],
+        ["query", "hot-list", "--period", "day"],
+        ["query", "index", "catalog", "--tag", "industry"],
+        ["query", "index", "constituents", "886042.TI"],
+        ["query", "index", "quote", "886042.TI"],
+        ["query", "index", "bars", "886042.TI", "--expected-session", "2026-08-19"],
+    ],
+)
+def test_cli_query_subcommands_emit_normalized_json_without_report_or_mail(argv, capsys) -> None:
+    gateway = QueryGateway()
+
+    assert main(argv, query_gateway_factory=lambda: gateway) == EXIT_SUCCESS
+
+    assert json.loads(capsys.readouterr().out) == {
+        "data": [{"code": "600000", "price": 10.0}],
+        "observed_at": NOW.isoformat(),
+        "source": "ths.fuyao.a_share_snapshot",
+        "source_timestamp": None,
+        "warnings": [],
+    }
+
+
+def test_cli_query_failure_is_redacted_and_returns_failure(capsys) -> None:
+    secret = "not-for-output"
+    gateway = Mock()
+    gateway.get_a_share_snapshot.side_effect = RuntimeError(secret)
+
+    assert main(["query", "quote", "600000"], query_gateway_factory=lambda: gateway) == EXIT_FAILURE
+
+    output = capsys.readouterr().out
+    assert json.loads(output) == {"error": "query_unavailable", "query": "quote"}
+    assert secret not in output

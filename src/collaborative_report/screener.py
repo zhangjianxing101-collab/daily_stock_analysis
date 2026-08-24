@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
-from typing import Mapping
+from typing import Any, Mapping, Sequence
 
 import numpy as np
 import pandas as pd
@@ -300,6 +300,50 @@ def _select(pool: list[_RankedCandidate], limit: int) -> tuple[Candidate, ...]:
         seen.add(item.candidate.code)
         (watch if item.inaccessible else actionable).append(item.candidate)
     return tuple((actionable + watch)[:limit])
+
+
+def _evidence_bonus(evidence: Mapping[str, Any]) -> tuple[float, tuple[str, ...]]:
+    """Return bounded, non-decisive THS evidence for an existing candidate.
+
+    Technical eligibility and risk levels are deliberately calculated before this
+    function.  The optional evidence can only reorder candidates that already
+    passed the deterministic technical rules; it can never create a trade.
+    """
+
+    score = 0.0
+    rules: list[str] = []
+    if evidence.get("hot_list") is True:
+        score += 2.0
+        rules.append("THS热榜证据")
+    if evidence.get("financial_positive") is True:
+        score += 2.0
+        rules.append("THS基本面证据")
+    if evidence.get("index_support") is True:
+        score += 1.0
+        rules.append("THS指数环境证据")
+    return score, tuple(rules)
+
+
+def rank_with_ths_evidence(
+    candidates: Sequence[Candidate],
+    evidence_by_code: Mapping[str, Mapping[str, Any]],
+) -> tuple[Candidate, ...]:
+    """Re-rank existing candidates using bounded, advisory THS evidence only."""
+
+    ranked: list[Candidate] = []
+    for candidate in candidates:
+        evidence = evidence_by_code.get(candidate.code, {})
+        if not isinstance(evidence, Mapping):
+            evidence = {}
+        bonus, labels = _evidence_bonus(evidence)
+        if labels:
+            candidate = replace(
+                candidate,
+                score=min(candidate.score + bonus, 100.0),
+                matched_rules=tuple(dict.fromkeys((*candidate.matched_rules, *labels))),
+            )
+        ranked.append(candidate)
+    return tuple(sorted(ranked, key=lambda item: (-item.score, item.code)))
 
 
 def screen_aggressive(

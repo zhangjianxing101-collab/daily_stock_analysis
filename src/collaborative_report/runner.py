@@ -16,6 +16,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 
+import numpy as np
 import pandas as pd
 
 from .ai_bridge import enrich_codes
@@ -26,9 +27,10 @@ from .market_data import MarketDataGateway, MarketDataset
 from .models import Candidate, ModuleResult, Position, ReportMode
 from .report import RenderedReport, render_report
 from .risk import evaluate_position, suggested_board_lots
-from .screener import ScreeningResult, prefilter_universe, screen_aggressive
+from .screener import ScreeningResult, prefilter_universe, rank_with_ths_evidence, screen_aggressive
 from .session import SHANGHAI_TIMEZONE, ReportSession, build_report_session, report_data_session
-from .settings import CollaborativeSettings
+from .settings import CollaborativeSettings, ThsSettings
+from .ths_market_data import ThsIndexTag, ThsMarketDataClient
 
 
 # Process status is intentionally binary for GitHub Actions. Detailed outcomes live
@@ -418,7 +420,10 @@ def default_dependencies(*, clock: Callable[[], datetime] | None = None) -> Runn
         settings_loader=CollaborativeSettings.from_env,
         session_builder=build_report_session,
         clock=active_clock,
-        gateway=MarketDataGateway(clock=active_clock),
+        gateway=MarketDataGateway(
+            ths_client=ThsMarketDataClient(ThsSettings.from_env()),
+            clock=active_clock,
+        ),
         screener=screen_aggressive,
         risk_evaluator=evaluate_position,
         short_backtest=backtest_breakout,
@@ -472,6 +477,168 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
         "上涨家数": int((changes > 0).sum()),
         "下跌家数": int((changes < 0).sum()),
     }
+
+
+def _dataset_source_payload(dataset: MarketDataset) -> Mapping[str, Any]:
+    return {
+        "数据源": dataset.source,
+        "采集时间": dataset.observed_at.isoformat(),
+        "来源时间": dataset.source_timestamp.isoformat() if dataset.source_timestamp else "unavailable",
+        "记录数": int(len(dataset.frame)),
+    }
+
+
+def _canonical_evidence_code(value: object) -> str | None:
+    text = str(value).strip().upper()
+    if len(text) >= 6 and text[:6].isdigit() and (len(text) == 6 or text[6] == "."):
+        return text[:6]
+    return None
+
+
+def _positive_financial_indicator(dataset: MarketDataset) -> bool:
+    """Recognize only documented profitability growth fields, never infer from blanks."""
+
+    required = {"index_id", "value"}
+    if not required.issubset(dataset.frame.columns):
+        return False
+    supported = {"net_profit_yoy_growth_ratio", "net_profit_yoy_growth"}
+    for _, row in dataset.frame.iterrows():
+        if str(row.get("index_id", "")).strip() not in supported:
+            continue
+        try:
+            value = float(str(row.get("value", "")).replace("%", "").strip())
+        except (TypeError, ValueError, OverflowError):
+            continue
+        if math.isfinite(value) and value > 0:
+            return True
+    return False
+
+
+def _index_environment_support(dataset: MarketDataset) -> tuple[bool, int, int]:
+    for column in ("price_change_ratio_pct", "change_pct", "pct_chg", "涨跌幅"):
+        if column not in dataset.frame:
+            continue
+        values = pd.to_numeric(dataset.frame[column], errors="coerce")
+        values = values[np.isfinite(values)]
+        if not values.empty:
+            positive = int((values > 0).sum())
+            return positive * 2 > len(values), positive, int(len(values))
+    return False, 0, 0
+
+
+def _latest_completed_financial_report(day: date) -> str:
+    quarter = (day.month - 1) // 3
+    if quarter == 0:
+        return f"{day.year - 1}-4"
+    return f"{day.year}-{quarter}"
+
+
+def _ths_evidence(
+    gateway: Any,
+    candidate_codes: Sequence[str],
+    *,
+    trading_date: date,
+    observed_at: datetime,
+) -> tuple[Mapping[str, Mapping[str, Any]], ModuleResult, ModuleResult]:
+    """Collect advisory THS evidence without allowing it to generate candidates."""
+
+    evidence: dict[str, dict[str, Any]] = {code: {} for code in candidate_codes}
+    market_payload: dict[str, Any] = {"候选覆盖数": len(candidate_codes)}
+    market_warnings: list[str] = []
+    market_sources = 0
+    financial_payload: dict[str, Any] = {"报告期": _latest_completed_financial_report(trading_date)}
+    financial_warnings: list[str] = []
+
+    try:
+        hot = gateway.get_ths_hot_stock_list()
+        hot_codes = {
+            code
+            for column in ("ticker", "code", "thscode")
+            if column in hot.frame
+            for code in (hot.frame[column].map(_canonical_evidence_code).dropna().tolist())
+        }
+        for code in candidate_codes:
+            evidence[code]["hot_list"] = code in hot_codes
+        market_payload.update(_dataset_source_payload(hot))
+        market_payload["热榜命中数"] = sum(code in hot_codes for code in candidate_codes)
+        market_sources += 1
+    except Exception:
+        market_warnings.append("同花顺热榜数据不可用，未参与候选排序")
+
+    try:
+        catalog = gateway.get_ths_index_catalog(ThsIndexTag.INDUSTRY)
+        market_payload["行业指数目录"] = int(len(catalog.frame))
+        market_payload["指数数据源"] = catalog.source
+        market_payload["指数采集时间"] = catalog.observed_at.isoformat()
+        market_sources += 1
+        if "thscode" not in catalog.frame:
+            raise ValueError("THS index catalog missing codes")
+        index_codes = tuple(
+            dict.fromkeys(
+                str(value).strip()
+                for value in catalog.frame["thscode"]
+                if isinstance(value, str) and value.strip()
+            )
+        )[:10]
+        if not index_codes:
+            raise ValueError("THS index catalog empty")
+        index_snapshot = gateway.get_ths_index_snapshot(index_codes)
+        index_support, positive, sample_count = _index_environment_support(index_snapshot)
+        if sample_count == 0:
+            raise ValueError("THS index snapshot missing change data")
+        market_payload["行业指数样本数"] = sample_count
+        market_payload["正向行业指数数"] = positive
+        market_payload["指数环境"] = "偏强" if index_support else "中性或偏弱"
+        market_payload["指数快照数据源"] = index_snapshot.source
+        market_payload["指数快照采集时间"] = index_snapshot.observed_at.isoformat()
+        for code in candidate_codes:
+            evidence[code]["index_support"] = index_support
+    except Exception:
+        market_warnings.append("同花顺行业指数快照不可用，未参与候选排序")
+
+    report = _latest_completed_financial_report(trading_date)
+    available = 0
+    positive = 0
+    for code in candidate_codes:
+        try:
+            financials = gateway.get_ths_financial_indicators(code, report)
+            available += 1
+            if available == 1:
+                financial_payload.update(
+                    {
+                        "数据源": financials.source,
+                        "采集时间": financials.observed_at.isoformat(),
+                        "来源时间": financials.source_timestamp.isoformat()
+                        if financials.source_timestamp
+                        else "unavailable",
+                    }
+                )
+            is_positive = _positive_financial_indicator(financials)
+            evidence[code]["financial_positive"] = is_positive
+            positive += int(is_positive)
+        except Exception:
+            financial_warnings.append(f"{code}: 同花顺财务指标不可用，未参与候选排序")
+    financial_payload.update({"覆盖数": available, "正向增长证据数": positive})
+
+    market_status = "ok" if not market_warnings else ("partial" if market_sources else "unavailable")
+    financial_status = "ok" if available == len(candidate_codes) else ("partial" if available else "unavailable")
+    return (
+        evidence,
+        ModuleResult(
+            "ths_market_evidence",
+            market_status,
+            observed_at,
+            market_payload,
+            tuple(dict.fromkeys(market_warnings)),
+        ),
+        ModuleResult(
+            "ths_financial_evidence",
+            financial_status,
+            observed_at,
+            financial_payload,
+            tuple(dict.fromkeys(financial_warnings)) or (() if available else ("同花顺财务数据不可用，未参与候选排序",)),
+        ),
+    )
 
 
 def _snapshot_fetch_is_current(dataset: MarketDataset, session: ReportSession) -> bool:
@@ -1278,6 +1445,29 @@ def run_report(
             modules["screening"] = _unavailable(
                 "screening", session.now_shanghai, "筛选暂不可用，仅分析持仓"
             )
+
+    evidence_codes = tuple(dict.fromkeys(item.code for item in (*screening.short_term, *screening.swing)))
+    if evidence_codes:
+        evidence, market_evidence, financial_evidence = _ths_evidence(
+            active.gateway,
+            evidence_codes,
+            trading_date=session.trading_date,
+            observed_at=session.now_shanghai,
+        )
+        modules["ths_market_evidence"] = market_evidence
+        modules["ths_financial_evidence"] = financial_evidence
+        screening = ScreeningResult(
+            rank_with_ths_evidence(screening.short_term, evidence),
+            rank_with_ths_evidence(screening.swing, evidence),
+            screening.warnings,
+        )
+    else:
+        modules["ths_market_evidence"] = _unavailable(
+            "ths_market_evidence", session.now_shanghai, "无技术候选，同花顺市场证据未参与排序"
+        )
+        modules["ths_financial_evidence"] = _unavailable(
+            "ths_financial_evidence", session.now_shanghai, "无技术候选，同花顺财务证据未参与排序"
+        )
 
     backtest_codes = tuple(
         dict.fromkeys(candidate.code for candidate in (*screening.short_term, *screening.swing))

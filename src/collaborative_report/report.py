@@ -34,6 +34,8 @@ _MODULE_TITLES = {
     "backtests": "回测摘要",
     "ai": "AI分析",
     "screening": "筛选状态",
+    "ths_market_evidence": "同花顺市场证据",
+    "ths_financial_evidence": "同花顺基本面证据",
 }
 
 
