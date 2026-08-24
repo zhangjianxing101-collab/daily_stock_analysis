@@ -3,10 +3,28 @@
 import json
 import math
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
+from urllib.parse import urlparse
 
 from .models import Position
+
+
+DEFAULT_THS_BASE_URL = "https://fuyao.aicubes.cn"
+DEFAULT_THS_TIMEOUT_SECONDS = 10.0
+DEFAULT_THS_MAX_RETRIES = 2
+
+
+def _env_bool(name: str, default: bool) -> bool:
+    raw_value = os.environ.get(name)
+    if raw_value is None:
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in {"1", "true", "yes", "on"}:
+        return True
+    if normalized in {"0", "false", "no", "off"}:
+        return False
+    raise ValueError(f"{name} must be a boolean")
 
 
 def _env_float(name: str, default: float) -> float:
@@ -26,6 +44,46 @@ def _env_int(name: str, default: int) -> int:
         return int(raw_value)
     except (TypeError, ValueError) as exc:
         raise ValueError(f"{name} must be an integer") from exc
+
+
+def _ths_base_url() -> str:
+    raw_value = os.environ.get("THS_BASE_URL", DEFAULT_THS_BASE_URL).strip().rstrip("/")
+    parsed = urlparse(raw_value)
+    if parsed.scheme != "https" or not parsed.netloc or parsed.path not in {"", "/"}:
+        raise ValueError("THS_BASE_URL must be an HTTPS origin")
+    return raw_value
+
+
+@dataclass(frozen=True)
+class ThsSettings:
+    """Runtime-only settings for the THS REST data provider."""
+
+    api_key: str | None = field(repr=False)
+    enabled: bool
+    base_url: str
+    timeout_seconds: float
+    max_retries: int
+
+    @classmethod
+    def from_env(cls) -> "ThsSettings":
+        api_key = os.environ.get("THS_API_KEY", "").strip() or None
+        provider_enabled = _env_bool("THS_ENABLED", True)
+
+        timeout_seconds = _env_float("THS_TIMEOUT_SECONDS", DEFAULT_THS_TIMEOUT_SECONDS)
+        if not 0 < timeout_seconds <= 60:
+            raise ValueError("THS_TIMEOUT_SECONDS must be greater than 0 and at most 60")
+
+        max_retries = _env_int("THS_MAX_RETRIES", DEFAULT_THS_MAX_RETRIES)
+        if not 0 <= max_retries <= 3:
+            raise ValueError("THS_MAX_RETRIES must be between 0 and 3")
+
+        return cls(
+            api_key=api_key,
+            enabled=provider_enabled and api_key is not None,
+            base_url=_ths_base_url(),
+            timeout_seconds=timeout_seconds,
+            max_retries=max_retries,
+        )
 
 
 def _parse_position(value: Any) -> Position:
