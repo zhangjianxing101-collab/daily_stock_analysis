@@ -3,6 +3,7 @@
 Regression tests for single-stock notification behavior in StockAnalysisPipeline.
 """
 
+import inspect
 import os
 import tempfile
 import sys
@@ -142,6 +143,27 @@ class TestPipelineSingleStockNotify(unittest.TestCase):
         pipeline._send_notifications.assert_called_once()
         _, kwargs = pipeline._send_notifications.call_args
         self.assertTrue(kwargs["skip_push"])
+
+    def test_run_save_report_false_skips_local_report_and_returns_results(self):
+        parameter = inspect.signature(StockAnalysisPipeline.run).parameters["save_report"]
+        self.assertIs(parameter.kind, inspect.Parameter.KEYWORD_ONLY)
+        self.assertIs(parameter.default, True)
+
+        pipeline = self._build_batch_pipeline()
+        pipeline.process_single_stock = MagicMock(
+            side_effect=lambda code, **kwargs: _make_result(code)
+        )
+
+        results = pipeline.run(
+            stock_codes=["000001", "600519"],
+            dry_run=False,
+            send_notification=False,
+            save_report=False,
+        )
+
+        self.assertCountEqual([result.code for result in results], ["000001", "600519"])
+        pipeline._save_local_report.assert_not_called()
+        pipeline._send_notifications.assert_not_called()
 
     def test_process_single_stock_direct_path_keeps_notify_compatibility(self):
         pipeline = StockAnalysisPipeline.__new__(StockAnalysisPipeline)

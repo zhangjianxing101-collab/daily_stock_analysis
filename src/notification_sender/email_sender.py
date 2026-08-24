@@ -48,6 +48,30 @@ SMTP_CONFIGS = {
 }
 
 
+class EmailStrictDeliveryError(RuntimeError):
+    """Base error for the strict SMTP acceptance-aware API."""
+
+    def __init__(self, stage: str) -> None:
+        super().__init__(stage)
+        self.stage = stage
+
+
+class EmailPermanentPreAcceptanceFailure(EmailStrictDeliveryError):
+    """Message was definitely not accepted and retrying cannot fix the input/config."""
+
+
+class EmailAuthenticationFailure(EmailPermanentPreAcceptanceFailure):
+    """SMTP authentication was rejected before any send command."""
+
+
+class EmailTransientPreAcceptanceFailure(EmailStrictDeliveryError):
+    """Message was definitely not accepted and a later connection may succeed."""
+
+
+class EmailDeliveryAmbiguous(EmailStrictDeliveryError):
+    """The send command began, so server acceptance can no longer be ruled out."""
+
+
 class EmailSender:
     
     def __init__(self, config: Config):
@@ -113,6 +137,33 @@ class EmailSender:
         """Encode display name safely so non-ASCII sender names work across SMTP providers."""
         sender_name = self._email_config.get('sender_name') or '股票分析助手'
         return formataddr((str(Header(str(sender_name), 'utf-8')), sender))
+
+    def _open_server(
+        self, sender: str, timeout_seconds: Optional[float]
+    ) -> smtplib.SMTP:
+        """Open the provider-specific SMTP connection without handling credentials."""
+        domain = sender.split('@')[-1].lower()
+        smtp_config = SMTP_CONFIGS.get(domain)
+        if smtp_config:
+            smtp_server = smtp_config['server']
+            smtp_port = smtp_config['port']
+            use_ssl = smtp_config['ssl']
+            logger.info(f"自动识别邮箱类型: {domain} -> {smtp_server}:{smtp_port}")
+        else:
+            smtp_server = f"smtp.{domain}"
+            smtp_port = 465
+            use_ssl = True
+            logger.warning(f"未知邮箱类型 {domain}，尝试通用配置: {smtp_server}:{smtp_port}")
+        timeout = timeout_seconds or 30
+        if use_ssl:
+            return smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=timeout)
+        server = smtplib.SMTP(smtp_server, smtp_port, timeout=timeout)
+        try:
+            server.starttls()
+        except Exception:
+            self._close_server(server)
+            raise
+        return server
 
     @staticmethod
     def _close_server(server: Optional[smtplib.SMTP]) -> None:
@@ -182,46 +233,103 @@ class EmailSender:
             msg.attach(text_part)
             msg.attach(html_part)
             
-            # 自动识别 SMTP 配置
-            domain = sender.split('@')[-1].lower()
-            smtp_config = SMTP_CONFIGS.get(domain)
-            
-            if smtp_config:
-                smtp_server = smtp_config['server']
-                smtp_port = smtp_config['port']
-                use_ssl = smtp_config['ssl']
-                logger.info(f"自动识别邮箱类型: {domain} -> {smtp_server}:{smtp_port}")
-            else:
-                # 未知邮箱，尝试通用配置
-                smtp_server = f"smtp.{domain}"
-                smtp_port = 465
-                use_ssl = True
-                logger.warning(f"未知邮箱类型 {domain}，尝试通用配置: {smtp_server}:{smtp_port}")
-            
-            # 根据配置选择连接方式
-            if use_ssl:
-                # SSL 连接（端口 465）
-                server = smtplib.SMTP_SSL(smtp_server, smtp_port, timeout=timeout_seconds or 30)
-            else:
-                # TLS 连接（端口 587）
-                server = smtplib.SMTP(smtp_server, smtp_port, timeout=timeout_seconds or 30)
-                server.starttls()
-            
+            server = self._open_server(sender, timeout_seconds)
             server.login(sender, password)
             server.send_message(msg)
             
-            logger.info(f"邮件发送成功，收件人: {receivers}")
+            logger.info("邮件发送成功，收件人数: %d", len(receivers))
             return True
             
         except smtplib.SMTPAuthenticationError:
             logger.error("邮件发送失败：认证错误，请检查邮箱和授权码是否正确")
             return False
-        except smtplib.SMTPConnectError as e:
-            logger.error(f"邮件发送失败：无法连接 SMTP 服务器 - {e}")
+        except smtplib.SMTPConnectError:
+            logger.error("邮件发送失败：无法连接 SMTP 服务器")
             return False
         except Exception as e:
-            logger.error(f"发送邮件失败: {e}")
+            logger.error("发送邮件失败: %s", type(e).__name__)
             return False
+        finally:
+            self._close_server(server)
+
+    def send_html_email(
+        self,
+        html_content: str,
+        text_content: str,
+        subject: str,
+        receivers: Optional[List[str]] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> bool:
+        """Compatibility wrapper around the strict acceptance-aware path."""
+        try:
+            self.send_html_email_strict(
+                html_content,
+                text_content,
+                subject,
+                receivers=receivers,
+                timeout_seconds=timeout_seconds,
+            )
+            return True
+        except EmailAuthenticationFailure:
+            logger.error("邮件发送失败：认证错误，请检查邮箱和授权码是否正确")
+        except EmailTransientPreAcceptanceFailure:
+            logger.error("邮件发送失败：SMTP 连接暂不可用")
+        except EmailPermanentPreAcceptanceFailure:
+            logger.error("邮件发送失败：邮件配置或内容无效")
+        except EmailDeliveryAmbiguous:
+            logger.error("邮件发送结果不确定，需要人工核对")
+        return False
+
+    def send_html_email_strict(
+        self,
+        html_content: str,
+        text_content: str,
+        subject: str,
+        receivers: Optional[List[str]] = None,
+        timeout_seconds: Optional[float] = None,
+    ) -> None:
+        """Send once and preserve whether SMTP acceptance is still possible."""
+        if not self._is_email_configured():
+            raise EmailPermanentPreAcceptanceFailure("configuration")
+
+        sender = self._email_config['sender']
+        password = self._email_config['password']
+        selected_receivers = self._email_config['receivers'] if receivers is None else receivers
+        if not selected_receivers:
+            raise EmailPermanentPreAcceptanceFailure("recipients")
+        server: Optional[smtplib.SMTP] = None
+        try:
+            try:
+                msg = MIMEMultipart('alternative')
+                msg['Subject'] = Header(subject, 'utf-8')
+                msg['From'] = self._format_sender_address(sender)
+                msg['To'] = ', '.join(selected_receivers)
+                msg.attach(MIMEText(text_content, 'plain', 'utf-8'))
+                msg.attach(MIMEText(html_content, 'html', 'utf-8'))
+            except Exception:
+                raise EmailPermanentPreAcceptanceFailure("message_build") from None
+
+            try:
+                server = self._open_server(sender, timeout_seconds)
+            except (OSError, TimeoutError, ConnectionError, smtplib.SMTPException):
+                raise EmailTransientPreAcceptanceFailure("connect_or_starttls") from None
+            except Exception:
+                raise EmailPermanentPreAcceptanceFailure("connection_configuration") from None
+
+            try:
+                server.login(sender, password)
+            except smtplib.SMTPAuthenticationError:
+                raise EmailAuthenticationFailure("authentication") from None
+            except (OSError, TimeoutError, ConnectionError, smtplib.SMTPException):
+                raise EmailTransientPreAcceptanceFailure("login_transport") from None
+            except Exception:
+                raise EmailPermanentPreAcceptanceFailure("login_configuration") from None
+
+            try:
+                server.send_message(msg)
+            except Exception:
+                raise EmailDeliveryAmbiguous("send_message") from None
+            logger.info("邮件发送成功，收件人数: %d", len(selected_receivers))
         finally:
             self._close_server(server)
 
@@ -276,7 +384,7 @@ class EmailSender:
             logger.info("邮件（内联图片）发送成功，收件人: %s", receivers)
             return True
         except Exception as e:
-            logger.error("邮件（内联图片）发送失败: %s", e)
+            logger.error("邮件（内联图片）发送失败: %s", type(e).__name__)
             return False
         finally:
             self._close_server(server)

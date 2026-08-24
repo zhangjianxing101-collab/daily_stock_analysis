@@ -8,7 +8,7 @@ import sys
 import unittest
 from datetime import date, datetime, timezone
 from types import SimpleNamespace
-from unittest.mock import MagicMock, call
+from unittest.mock import MagicMock, call, patch
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
 
@@ -52,6 +52,17 @@ class TestPipelinePrefetchBehavior(unittest.TestCase):
         pipeline.fetcher_manager.prefetch_stock_names.assert_called_once_with(
             ["000001"], use_bulk=False
         )
+
+    @patch("src.core.pipeline.logger")
+    def test_run_logs_stock_count_without_stock_code_list(self, mock_logger):
+        pipeline = self._build_pipeline(process_result=None)
+
+        pipeline.run(stock_codes=["600519", "000001"], dry_run=True, send_notification=False)
+
+        logged = " ".join(str(call) for call in mock_logger.info.call_args_list)
+        self.assertIn("2", logged)
+        self.assertNotIn("600519", logged)
+        self.assertNotIn("000001", logged)
 
     def test_run_dry_run_counts_existing_data_by_effective_trading_date(self):
         pipeline = self._build_pipeline(process_result=None)

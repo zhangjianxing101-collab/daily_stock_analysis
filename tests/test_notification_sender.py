@@ -10,6 +10,7 @@ import hashlib
 import hmac
 import json
 import os
+import smtplib
 import sys
 import unittest
 from email.header import decode_header, make_header
@@ -38,6 +39,11 @@ from src.notification_sender import (
     TelegramSender,
     WechatSender,
     WECHAT_IMAGE_MAX_BYTES,
+)
+from src.notification_sender.email_sender import (
+    EmailAuthenticationFailure,
+    EmailDeliveryAmbiguous,
+    EmailTransientPreAcceptanceFailure,
 )
 
 
@@ -971,6 +977,42 @@ class TestEmailSender(unittest.TestCase):
         result = sender.send_to_email("body")
         self.assertFalse(result)
 
+    def test_send_html_returns_false_when_not_configured(self):
+        sender = EmailSender(_config())
+        self.assertFalse(sender.send_html_email("<p>body</p>", "body", "subject"))
+
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_strict_html_send_classifies_auth_rejection_as_definite(self, mock_smtp_ssl):
+        sender = EmailSender(_config(email_sender="a@qq.com", email_password="p"))
+        mock_smtp_ssl.return_value.login.side_effect = smtplib.SMTPAuthenticationError(535, b"no")
+
+        with self.assertRaises(EmailAuthenticationFailure):
+            sender.send_html_email_strict("<p>body</p>", "body", "subject")
+
+        mock_smtp_ssl.return_value.send_message.assert_not_called()
+
+    @mock.patch("smtplib.SMTP_SSL", side_effect=OSError("connect secret"))
+    def test_strict_html_send_classifies_connect_failure_as_safe_transient(self, _mock_smtp_ssl):
+        sender = EmailSender(_config(email_sender="a@qq.com", email_password="p"))
+
+        with self.assertRaises(EmailTransientPreAcceptanceFailure):
+            sender.send_html_email_strict("<p>body</p>", "body", "subject")
+
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_strict_html_send_classifies_send_message_exception_as_ambiguous(self, mock_smtp_ssl):
+        sender = EmailSender(_config(email_sender="a@qq.com", email_password="p"))
+        mock_smtp_ssl.return_value.send_message.side_effect = OSError("accepted maybe")
+
+        with self.assertRaises(EmailDeliveryAmbiguous):
+            sender.send_html_email_strict("<p>body</p>", "body", "subject")
+
+    def test_empty_receivers_fall_back_to_configured_sender_without_smtp(self):
+        sender = EmailSender(
+            _config(email_sender="sender@qq.com", email_password="auth", email_receivers=[])
+        )
+
+        self.assertEqual(sender.get_all_email_receivers(), ["sender@qq.com"])
+
     def test_get_receivers_for_stocks_no_groups_returns_default(self):
         cfg = _config(
             email_sender="a@qq.com",
@@ -1048,6 +1090,111 @@ class TestEmailSender(unittest.TestCase):
             "daily_stock_analysis股票分析助手",
         )
         server.quit.assert_called_once()
+
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_send_html_email_builds_plain_then_html_and_forwards_options(self, mock_smtp_ssl):
+        cfg = _config(
+            email_sender="a@qq.com",
+            email_password="secret-authorization-code",
+            email_receivers=["default@qq.com"],
+        )
+        sender = EmailSender(cfg)
+
+        result = sender.send_html_email(
+            "<strong>HTML正文</strong>",
+            "纯文本正文",
+            "A股盘前日报 2026-08-19",
+            receivers=["chosen@qq.com"],
+            timeout_seconds=7,
+        )
+
+        self.assertTrue(result)
+        mock_smtp_ssl.assert_called_once_with("smtp.qq.com", 465, timeout=7)
+        server = mock_smtp_ssl.return_value
+        server.login.assert_called_once_with("a@qq.com", "secret-authorization-code")
+        msg = server.send_message.call_args.args[0]
+        self.assertEqual(msg.get_content_subtype(), "alternative")
+        self.assertEqual(msg["To"], "chosen@qq.com")
+        parts = msg.get_payload()
+        self.assertEqual([part.get_content_subtype() for part in parts], ["plain", "html"])
+        self.assertEqual(parts[0].get_payload(decode=True).decode("utf-8"), "纯文本正文")
+        self.assertEqual(parts[1].get_payload(decode=True).decode("utf-8"), "<strong>HTML正文</strong>")
+        server.quit.assert_called_once()
+
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_send_html_email_uses_default_receivers(self, mock_smtp_ssl):
+        cfg = _config(
+            email_sender="a@qq.com",
+            email_password="p",
+            email_receivers=["one@qq.com", "two@qq.com"],
+        )
+        sender = EmailSender(cfg)
+
+        self.assertTrue(sender.send_html_email("<p>body</p>", "body", "subject"))
+
+        msg = mock_smtp_ssl.return_value.send_message.call_args.args[0]
+        self.assertEqual(msg["To"], "one@qq.com, two@qq.com")
+
+    @mock.patch("src.notification_sender.email_sender.logger")
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_send_html_email_success_log_contains_count_not_addresses(self, mock_smtp_ssl, mock_logger):
+        cfg = _config(
+            email_sender="private-sender@qq.com",
+            email_password="p",
+            email_receivers=["private-one@qq.com", "private-two@qq.com"],
+        )
+        sender = EmailSender(cfg)
+
+        self.assertTrue(sender.send_html_email("<p>body</p>", "body", "subject"))
+
+        logged = " ".join(str(call) for call in mock_logger.info.call_args_list)
+        self.assertIn("2", logged)
+        self.assertNotIn("private-one@qq.com", logged)
+        self.assertNotIn("private-two@qq.com", logged)
+
+    @mock.patch("smtplib.SMTP_SSL")
+    def test_send_html_email_rejects_explicit_empty_receivers_before_smtp(self, mock_smtp_ssl):
+        cfg = _config(
+            email_sender="a@qq.com",
+            email_password="p",
+            email_receivers=["default@qq.com"],
+        )
+        sender = EmailSender(cfg)
+
+        self.assertFalse(sender.send_html_email("<p>body</p>", "body", "subject", receivers=[]))
+
+        mock_smtp_ssl.assert_not_called()
+
+    @mock.patch("smtplib.SMTP")
+    def test_send_html_email_closes_smtp_when_starttls_raises(self, mock_smtp):
+        cfg = _config(
+            email_sender="a@gmail.com",
+            email_password="p",
+            email_receivers=["b@example.com"],
+        )
+        server = mock_smtp.return_value
+        server.starttls.side_effect = smtplib.SMTPException("TLS setup failed")
+        sender = EmailSender(cfg)
+
+        self.assertFalse(sender.send_html_email("<p>body</p>", "body", "subject"))
+
+        server.quit.assert_called_once()
+        server.login.assert_not_called()
+
+    @mock.patch("src.notification_sender.email_sender.logger")
+    @mock.patch("smtplib.SMTP_SSL", side_effect=RuntimeError("secret-authorization-code"))
+    def test_send_html_email_does_not_expose_credentials_in_errors(self, _mock_smtp_ssl, mock_logger):
+        cfg = _config(
+            email_sender="a@qq.com",
+            email_password="secret-authorization-code",
+            email_receivers=["b@qq.com"],
+        )
+        sender = EmailSender(cfg)
+
+        self.assertFalse(sender.send_html_email("<p>body</p>", "body", "subject"))
+
+        logged = " ".join(str(call) for call in mock_logger.error.call_args_list)
+        self.assertNotIn("secret-authorization-code", logged)
 
     @mock.patch("smtplib.SMTP_SSL")
     def test_send_to_email_strips_hidden_market_metadata(self, mock_smtp_ssl):

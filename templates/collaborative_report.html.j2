@@ -1,0 +1,102 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ subject }}</title>
+  <style>
+    body { margin: 0; padding: 0; background: #f3f4f6; color: #1f2937; font-family: Arial, "PingFang SC", "Microsoft YaHei", sans-serif; }
+    .report { width: 100%; max-width: 760px; margin: 0 auto; background: #ffffff; }
+    .header { padding: 22px 24px 16px; border-top: 5px solid #b42318; border-bottom: 1px solid #d1d5db; }
+    h1 { margin: 0; font-size: 24px; line-height: 1.35; letter-spacing: 0; }
+    .date { margin: 6px 0 0; color: #6b7280; font-size: 13px; }
+    .section { padding: 18px 24px; border-bottom: 1px solid #d1d5db; }
+    h2 { margin: 0 0 10px; font-size: 17px; line-height: 1.4; letter-spacing: 0; }
+    table { width: 100%; border-collapse: collapse; table-layout: fixed; font-size: 13px; }
+    th, td { padding: 8px 7px; border-bottom: 1px solid #e5e7eb; text-align: left; vertical-align: top; overflow-wrap: anywhere; }
+    th { background: #f9fafb; color: #4b5563; font-weight: 600; }
+    .key { width: 31%; color: #4b5563; }
+    .meta { margin: 8px 0 0; color: #6b7280; font-size: 12px; }
+    .warning { margin: 9px 0 0; padding-left: 9px; border-left: 3px solid #d97706; color: #92400e; font-size: 13px; }
+    .status { font-weight: 700; color: #166534; }
+    .watch { font-weight: 700; color: #92400e; }
+    .empty { color: #6b7280; font-size: 13px; }
+    .footer { padding: 18px 24px 24px; color: #4b5563; font-size: 12px; line-height: 1.7; }
+    .footer strong { color: #991b1b; }
+    @media only screen and (max-width: 600px) {
+      .header, .section, .footer { padding-left: 14px; padding-right: 14px; }
+      h1 { font-size: 21px; }
+      table.candidates, table.candidates tbody, table.candidates tr, table.candidates th, table.candidates td { display: block; width: auto; }
+      table.candidates thead { display: none; }
+      table.candidates tr { padding: 8px 0; border-bottom: 1px solid #d1d5db; }
+      table.candidates td { border: 0; padding: 3px 0; }
+      table.candidates td::before { content: attr(data-label) "："; color: #6b7280; font-weight: 600; }
+    }
+  </style>
+</head>
+<body>
+  <main class="report">
+    <header class="header">
+      <h1>{{ subject }}</h1>
+      <p class="date">报告日期 {{ report_date }}</p>
+    </header>
+
+    {% for section in sections %}
+    <section class="section">
+      <h2>{{ section.title }}</h2>
+      {% if section.rows %}
+      <table role="presentation">
+        <tbody>
+          {% for label, value in section.rows %}
+          <tr><td class="key">{{ label }}</td><td>{{ value }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="empty">暂无可用数据</p>{% endif %}
+      <p class="meta">数据时间：{{ section.observed_at }}</p>
+      {% if section.status != "ok" %}<p class="warning">模块状态：{{ section.status }}</p>{% endif %}
+      {% for warning in section.warnings %}<p class="warning">警告：{{ warning }}</p>{% endfor %}
+    </section>
+    {% endfor %}
+
+    {% if mode == "postmarket" %}
+    <section class="section">
+      <h2>早盘候选跟踪</h2>
+      {% if morning_rows %}
+      <table role="presentation"><thead><tr><th>代码</th><th>名称</th><th>状态</th></tr></thead><tbody>
+      {% for code, name, status in morning_rows %}<tr><td>{{ code }}</td><td>{{ name }}</td><td>{{ status }}</td></tr>{% endfor %}
+      </tbody></table>
+      {% else %}<p class="empty">{{ no_morning_status }}</p>{% endif %}
+    </section>
+    {% endif %}
+
+    {% for title, candidates in ((short_title, short_candidates), (swing_title, swing_candidates)) %}
+    <section class="section">
+      <h2>{{ title }}</h2>
+      {% if candidates %}
+      <table class="candidates" role="presentation">
+        <thead><tr><th>标的</th><th>状态</th><th>触发条件</th><th>止损</th><th>目标</th><th>依据与时间</th></tr></thead>
+        <tbody>
+        {% for item in candidates %}
+          <tr>
+            <td data-label="标的"><strong>{{ item.code }} {{ item.name }}</strong><br>{{ item.horizon }} / 评分 {{ item.score }} / 收盘 {{ item.close }}</td>
+            <td data-label="状态" class="{{ 'status' if item.actionable else 'watch' }}">{{ '等待人工确认' if item.actionable else '仅供观察' }}{% if item.warning %}<br>{{ item.warning }}{% endif %}</td>
+            <td data-label="触发条件">{{ item.trigger }}</td>
+            <td data-label="止损">{{ item.stop }}</td>
+            <td data-label="目标">{{ item.target }}</td>
+            <td data-label="依据与时间">{{ item.rules }}<br>{{ item.observed_at }} / {{ item.source }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="empty">暂无候选，保持观察。</p>{% endif %}
+    </section>
+    {% endfor %}
+
+    <footer class="footer">
+      <strong>{{ disclaimer_lines[0] }}</strong><br>
+      {% for line in disclaimer_lines[1:] %}{{ line }}{% if not loop.last %}<br>{% endif %}{% endfor %}
+    </footer>
+  </main>
+</body>
+</html>
