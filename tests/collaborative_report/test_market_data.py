@@ -1,5 +1,5 @@
 import traceback
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from unittest.mock import Mock, call, patch
 from zoneinfo import ZoneInfo
 
@@ -11,8 +11,10 @@ from src.collaborative_report.market_data import (
     MarketDataGateway,
     MarketDataset,
     normalize_a_share_snapshot,
+    normalize_a_share_thscode,
     validate_daily_bars,
 )
+from src.collaborative_report.ths_market_data import ThsApiResponse, ThsNetworkError, ThsResponseError
 
 
 SESSION = date(2026, 8, 19)
@@ -36,6 +38,223 @@ def daily_bars(rows: int = 60, *, end: str = "2026-08-19") -> pd.DataFrame:
             "Volume": np.arange(rows, dtype=float) + 1_000.0,
         }
     )
+
+
+def ths_response(items: list[dict[str, object]], timestamp_ms: int | None = None) -> ThsApiResponse:
+    if timestamp_ms is None:
+        timestamp_ms = int((OBSERVED_AT - timedelta(hours=1)).timestamp() * 1000)
+    return ThsApiResponse({"timestamp": timestamp_ms, "item": items}, None)
+
+
+def ths_snapshot_item(code: str = "600000") -> dict[str, object]:
+    return {
+        "thscode": f"{code}.SH",
+        "ticker": code,
+        "last_price": 10.0,
+        "price_change_ratio_pct": 1.2,
+        "volume": 1000,
+        "turnover": 10_000.0,
+    }
+
+
+def ths_bar_items(rows: int = 60) -> list[dict[str, object]]:
+    frame = daily_bars(rows)
+    return [
+        {
+            "date_ms": int(pd.Timestamp(row.Date, tz="Asia/Shanghai").timestamp() * 1000),
+            "open_price": row.Open,
+            "high_price": row.High,
+            "low_price": row.Low,
+            "close_price": row.Close,
+            "volume": row.Volume,
+        }
+        for row in frame.itertuples(index=False)
+    ]
+
+
+@pytest.mark.parametrize(
+    ("code", "thscode"),
+    [
+        ("600000", "600000.SH"),
+        ("688001", "688001.SH"),
+        ("000001", "000001.SZ"),
+        ("300001", "300001.SZ"),
+        ("430047", "430047.BJ"),
+        ("830001", "830001.BJ"),
+        ("920001", "920001.BJ"),
+    ],
+)
+def test_normalize_a_share_thscode_uses_only_documented_exchange_ranges(code: str, thscode: str) -> None:
+    assert normalize_a_share_thscode(code) == thscode
+
+
+@pytest.mark.parametrize("code", ["900001", "400001", "60000", "600000.SH", True])
+def test_normalize_a_share_thscode_rejects_unknown_or_non_six_digit_codes(code: object) -> None:
+    with pytest.raises(ValueError):
+        normalize_a_share_thscode(code)
+
+
+def test_ths_snapshot_is_preferred_and_preserves_source_timestamp() -> None:
+    client = Mock()
+    client.a_share_snapshot.return_value = ths_response([ths_snapshot_item()])
+    fallback = Mock()
+    gateway = MarketDataGateway(ths_client=client, snapshot_fetcher=fallback, clock=lambda: OBSERVED_AT)
+
+    result = gateway.get_a_share_snapshot(["600000"])
+
+    client.a_share_snapshot.assert_called_once_with(("600000.SH",))
+    fallback.assert_not_called()
+    assert result.source == "ths.fuyao.a_share_snapshot"
+    assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert result.frame.loc[0, "price"] == 10.0
+
+
+def test_ths_full_snapshot_reads_all_pages_before_returning_data() -> None:
+    client = Mock()
+    timestamp_ms = int((OBSERVED_AT - timedelta(hours=1)).timestamp() * 1000)
+    client.a_share_snapshot.side_effect = [
+        ThsApiResponse({"timestamp": timestamp_ms, "total": 2, "item": [ths_snapshot_item("600000")]}, None),
+        ThsApiResponse(
+            {"timestamp": timestamp_ms, "total": 2, "item": [{**ths_snapshot_item("000001"), "thscode": "000001.SZ"}]},
+            None,
+        ),
+    ]
+    gateway = MarketDataGateway(ths_client=client, snapshot_fetcher=Mock(), clock=lambda: OBSERVED_AT)
+
+    result = gateway.get_a_share_snapshot()
+
+    assert result.frame["code"].tolist() == ["600000", "000001"]
+    assert client.a_share_snapshot.call_args_list == [
+        call(None, limit=1000, offset=0),
+        call(None, limit=1000, offset=1),
+    ]
+
+
+def test_ths_snapshot_recoverable_failure_uses_existing_source_with_warning() -> None:
+    client = Mock()
+    client.a_share_snapshot.side_effect = ThsNetworkError("THS network request failed")
+    fallback = Mock(return_value=pd.DataFrame({"代码": ["000001"], "名称": ["A"], "最新价": [10]}))
+    gateway = MarketDataGateway(ths_client=client, snapshot_fetcher=fallback, clock=lambda: OBSERVED_AT)
+
+    result = gateway.get_a_share_snapshot()
+
+    fallback.assert_called_once_with()
+    assert result.source == "akshare.stock_zh_a_spot_em"
+    assert result.warnings == ("THS unavailable; existing snapshot source used", "snapshot source timestamp unavailable")
+
+
+@pytest.mark.parametrize(
+    "response",
+    [
+        ths_response([{"ticker": "600000"}]),
+        ths_response([{**ths_snapshot_item(), "last_price": 0}]),
+        ths_response([{**ths_snapshot_item(), "turnover": -1}]),
+    ],
+)
+def test_ths_snapshot_quality_failure_never_falls_back(response: ThsApiResponse) -> None:
+    client = Mock()
+    client.a_share_snapshot.return_value = response
+    fallback = Mock(return_value=pd.DataFrame({"代码": ["000001"], "最新价": [10]}))
+    gateway = MarketDataGateway(ths_client=client, snapshot_fetcher=fallback, clock=lambda: OBSERVED_AT)
+
+    with pytest.raises(ValueError, match="^THS snapshot"):
+        gateway.get_a_share_snapshot()
+
+    fallback.assert_not_called()
+
+
+def test_ths_malformed_response_never_falls_back() -> None:
+    client = Mock()
+    client.a_share_snapshot.side_effect = ThsResponseError("THS API returned an invalid success payload")
+    fallback = Mock()
+    gateway = MarketDataGateway(ths_client=client, snapshot_fetcher=fallback, clock=lambda: OBSERVED_AT)
+
+    with pytest.raises(ValueError, match="^THS snapshot data invalid$"):
+        gateway.get_a_share_snapshot()
+
+    fallback.assert_not_called()
+
+
+def test_ths_daily_bars_are_preferred_and_normalized() -> None:
+    client = Mock()
+    client.a_share_historical.return_value = ths_response(ths_bar_items())
+    fallback = Mock()
+    gateway = MarketDataGateway(ths_client=client, daily_fetcher=fallback, clock=lambda: OBSERVED_AT)
+
+    result = gateway.get_daily_bars("600000", expected_session=SESSION, days=160)
+
+    assert client.a_share_historical.call_args.args[0] == "600000.SH"
+    assert client.a_share_historical.call_args.kwargs["start_ms"] < client.a_share_historical.call_args.kwargs["end_ms"]
+    fallback.assert_not_called()
+    assert result.source == "ths.fuyao.a_share_historical"
+    assert result.frame.iloc[-1]["date"].date() == SESSION
+
+
+def test_ths_daily_bars_recoverable_failure_uses_existing_source_with_warning() -> None:
+    client = Mock()
+    client.a_share_historical.side_effect = ThsNetworkError("THS network request failed")
+    fallback = Mock(return_value=(daily_bars(), "fallback"))
+    gateway = MarketDataGateway(ths_client=client, daily_fetcher=fallback, clock=lambda: OBSERVED_AT)
+
+    result = gateway.get_daily_bars("600000", expected_session=SESSION)
+
+    fallback.assert_called_once_with("600000", days=160)
+    assert result.source == "fallback"
+    assert result.warnings == ("THS unavailable; existing daily source used",)
+
+
+def test_ths_daily_bars_quality_failure_never_falls_back() -> None:
+    client = Mock()
+    client.a_share_historical.return_value = ths_response([{**ths_bar_items()[0], "close_price": 0}])
+    fallback = Mock()
+    gateway = MarketDataGateway(ths_client=client, daily_fetcher=fallback, clock=lambda: OBSERVED_AT)
+
+    with pytest.raises(ValueError, match="^daily bars"):
+        gateway.get_daily_bars("600000", expected_session=SESSION)
+
+    fallback.assert_not_called()
+
+
+def test_ths_specialty_helpers_return_market_datasets_without_report_integration() -> None:
+    client = Mock()
+    client.financial_indicators.return_value = ThsApiResponse(
+        {
+            "thscode": "600000.SH",
+            "report": "2026-1",
+            "abilities": [{"ability": "growth", "indicators": [{"index_id": "profit_yoy", "value": "1.2"}]}],
+        },
+        None,
+    )
+    client.hot_stock_list.return_value = ths_response([{"rank": 1, "thscode": "600000.SH"}])
+    client.skyrocket_list.return_value = ths_response([{"rank": 1, "thscode": "600000.SH"}])
+    client.ths_index_catalog.return_value = ths_response([{"thscode": "886001.TI"}])
+    client.ths_index_constituents.return_value = ths_response([{"thscode": "600000.SH"}])
+    client.index_snapshot.return_value = ths_response([{"thscode": "000001.SH", "last_price": 1.0}])
+    client.index_historical.return_value = ths_response(ths_bar_items())
+    gateway = MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT)
+
+    datasets = [
+        gateway.get_ths_financial_indicators("600000", "2026-1"),
+        gateway.get_ths_hot_stock_list(),
+        gateway.get_ths_skyrocket_list(),
+        gateway.get_ths_index_catalog(),
+        gateway.get_ths_index_constituents("886001.TI"),
+        gateway.get_ths_index_snapshot(["000001.SH"]),
+        gateway.get_ths_index_bars("000001.SH", SESSION),
+    ]
+
+    assert [dataset.source for dataset in datasets] == [
+        "ths.fuyao.financial_indicators",
+        "ths.fuyao.hot_stock_list",
+        "ths.fuyao.skyrocket_list",
+        "ths.fuyao.index_catalog",
+        "ths.fuyao.index_constituents",
+        "ths.fuyao.index_snapshot",
+        "ths.fuyao.index_historical",
+    ]
+    assert datasets[0].frame.to_dict("records") == [
+        {"thscode": "600000.SH", "report": "2026-1", "ability": "growth", "index_id": "profit_yoy", "value": "1.2"}
+    ]
 
 
 def test_normalize_a_share_snapshot_maps_chinese_columns_and_numeric_values() -> None:

@@ -3,12 +3,25 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timezone
-from typing import Callable
+from datetime import date, datetime, timedelta, timezone
+from typing import Any, Callable, Mapping, Sequence
 
 import exchange_calendars
 import numpy as np
 import pandas as pd
+
+from .ths_market_data import (
+    ThsAuthenticationError,
+    ThsConfigurationError,
+    ThsDataUnavailableError,
+    ThsHotListPeriod,
+    ThsIndexTag,
+    ThsMarketDataClient,
+    ThsNetworkError,
+    ThsPermissionError,
+    ThsRateLimitError,
+    ThsResponseError,
+)
 
 
 _SNAPSHOT_COLUMNS = (
@@ -50,6 +63,15 @@ _SYMBOL_CALENDARS = {
     "HG=F": "CMES",
     "CL=F": "CMES",
 }
+_THS_SOURCE = "ths.fuyao"
+_RECOVERABLE_THS_ERRORS = (
+    ThsAuthenticationError,
+    ThsConfigurationError,
+    ThsDataUnavailableError,
+    ThsNetworkError,
+    ThsPermissionError,
+    ThsRateLimitError,
+)
 
 
 @dataclass(frozen=True)
@@ -112,6 +134,96 @@ def _canonical_code(value: object) -> str | None:
     if len(text) == 6 and text.isascii() and text.isdigit():
         return text
     return None
+
+
+def normalize_a_share_thscode(code: object) -> str:
+    """Return a documented THS A-share code without guessing the exchange."""
+
+    normalized = _canonical_code(code)
+    if normalized is None:
+        raise ValueError("A-share code must contain exactly six digits")
+
+    prefix = normalized[:3]
+    if prefix in {"600", "601", "603", "605", "688", "689"}:
+        return f"{normalized}.SH"
+    if prefix in {"000", "001", "002", "003", "300", "301"}:
+        return f"{normalized}.SZ"
+    if prefix.startswith(("43", "83", "87", "88", "92")):
+        return f"{normalized}.BJ"
+    raise ValueError("A-share code exchange is unknown")
+
+
+def _ths_timestamp(timestamp_ms: int | None, observed_at: datetime) -> tuple[datetime | None, tuple[str, ...]]:
+    if timestamp_ms is None:
+        return None, ("THS source timestamp unavailable",)
+    try:
+        timestamp = pd.Timestamp(timestamp_ms, unit="ms", tz="UTC").tz_convert("Asia/Shanghai").to_pydatetime()
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("THS source timestamp invalid") from None
+    if timestamp > observed_at:
+        raise ValueError("THS source timestamp is in the future")
+    return timestamp, ()
+
+
+def _ths_items_frame(items: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
+    return pd.DataFrame([dict(item) for item in items])
+
+
+def _normalize_ths_snapshot(items: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
+    raw = _ths_items_frame(items)
+    required = {"thscode", "ticker", "last_price", "price_change_ratio_pct", "volume", "turnover"}
+    if raw.empty:
+        raise ThsDataUnavailableError(3002)
+    if not required.issubset(raw.columns):
+        raise ValueError("THS snapshot missing required fields")
+
+    result = pd.DataFrame(
+        {
+            "code": raw["ticker"].map(_canonical_code),
+            "name": pd.Series(pd.NA, index=raw.index, dtype="string"),
+            "price": _numeric(raw["last_price"]),
+            "change_pct": _numeric(raw["price_change_ratio_pct"]),
+            "volume_ratio": pd.Series(pd.NA, index=raw.index, dtype="Float64"),
+            "turnover": pd.Series(pd.NA, index=raw.index, dtype="Float64"),
+            "amount": _numeric(raw["turnover"]),
+            "volume": _numeric(raw["volume"]),
+            "total_mv": pd.Series(pd.NA, index=raw.index, dtype="Float64"),
+        }
+    )
+    if result["code"].isna().any() or not result["price"].notna().all():
+        raise ValueError("THS snapshot contains unsafe prices")
+    if not np.isfinite(result["price"].to_numpy(dtype=float)).all() or (result["price"] <= 0).any():
+        raise ValueError("THS snapshot contains unsafe prices")
+    if result["code"].duplicated().any():
+        raise ValueError("THS snapshot contains duplicate codes")
+    for column in ("change_pct", "amount", "volume"):
+        values = result[column].to_numpy(dtype=float)
+        if not np.isfinite(values).all() or (column in {"amount", "volume"} and (values < 0).any()):
+            raise ValueError("THS snapshot contains invalid values")
+    return result.loc[:, _SNAPSHOT_COLUMNS].reset_index(drop=True)
+
+
+def _normalize_ths_daily_bars(items: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
+    raw = _ths_items_frame(items)
+    required = {"date_ms", "open_price", "high_price", "low_price", "close_price", "volume"}
+    if raw.empty:
+        raise ThsDataUnavailableError(3002)
+    if not required.issubset(raw.columns):
+        raise ValueError("THS daily bars missing required fields")
+    try:
+        dates = pd.to_datetime(raw["date_ms"], unit="ms", utc=True).dt.tz_convert("Asia/Shanghai").dt.tz_localize(None)
+    except (OverflowError, TypeError, ValueError):
+        raise ValueError("THS daily bars invalid dates") from None
+    return pd.DataFrame(
+        {
+            "date": dates,
+            "open": raw["open_price"],
+            "high": raw["high_price"],
+            "low": raw["low_price"],
+            "close": raw["close_price"],
+            "volume": raw["volume"],
+        }
+    )
 
 
 def normalize_a_share_snapshot(raw: pd.DataFrame) -> pd.DataFrame:
@@ -263,6 +375,7 @@ class MarketDataGateway:
         sector_names_fetcher: Callable[[], pd.DataFrame] | None = None,
         sector_members_fetcher: Callable[[str], pd.DataFrame] | None = None,
         yfinance_download: Callable[..., pd.DataFrame] | None = None,
+        ths_client: ThsMarketDataClient | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._snapshot_fetcher = snapshot_fetcher
@@ -270,12 +383,70 @@ class MarketDataGateway:
         self._sector_names_fetcher = sector_names_fetcher
         self._sector_members_fetcher = sector_members_fetcher
         self._yfinance_download = yfinance_download
+        self._ths_client = ths_client
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def _observed_at(self) -> datetime:
         return self._clock()
 
-    def get_a_share_snapshot(self) -> MarketDataset:
+    def _ths_snapshot(self, codes: Sequence[str] | None, observed_at: datetime) -> MarketDataset:
+        client = self._require_ths_client()
+        thscodes = None if codes is None else tuple(normalize_a_share_thscode(code) for code in codes)
+        if thscodes is not None:
+            response = client.a_share_snapshot(thscodes)
+            items = response.items
+            source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
+        else:
+            response, items = self._ths_all_snapshot_pages(client, observed_at)
+            source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
+        return MarketDataset(
+            _normalize_ths_snapshot(items),
+            _THS_SOURCE + ".a_share_snapshot",
+            observed_at,
+            warnings,
+            source_timestamp,
+        )
+
+    @staticmethod
+    def _ths_all_snapshot_pages(
+        client: ThsMarketDataClient, observed_at: datetime
+    ) -> tuple[Any, tuple[Mapping[str, Any], ...]]:
+        offset = 0
+        items: list[Mapping[str, Any]] = []
+        response: Any | None = None
+        expected_total: int | None = None
+        while expected_total is None or len(items) < expected_total:
+            response = client.a_share_snapshot(None, limit=1000, offset=offset)
+            total = response.data.get("total")
+            if type(total) is not int or total < 0:
+                raise ValueError("THS snapshot total invalid")
+            if expected_total is None:
+                expected_total = total
+            elif total != expected_total:
+                raise ValueError("THS snapshot total changed during pagination")
+            _ths_timestamp(response.timestamp_ms, observed_at)
+            page_items = response.items
+            if not page_items:
+                if expected_total == 0 and not items:
+                    raise ThsDataUnavailableError(3002)
+                raise ValueError("THS snapshot pagination incomplete")
+            items.extend(page_items)
+            if len(items) > expected_total:
+                raise ValueError("THS snapshot pagination invalid")
+            offset += len(page_items)
+        if response is None:
+            raise AssertionError("THS snapshot pagination must return a response")
+        return response, tuple(items)
+
+    def get_a_share_snapshot(self, codes: Sequence[str] | None = None) -> MarketDataset:
+        observed_at = self._observed_at()
+        fallback_warnings: tuple[str, ...] = ()
+        try:
+            return self._ths_snapshot(codes, observed_at)
+        except ThsResponseError:
+            raise ValueError("THS snapshot data invalid") from None
+        except _RECOVERABLE_THS_ERRORS:
+            fallback_warnings = ("THS unavailable; existing snapshot source used",)
         try:
             if self._snapshot_fetcher is None:
                 import akshare
@@ -294,12 +465,35 @@ class MarketDataGateway:
         return MarketDataset(
             normalized,
             "akshare.stock_zh_a_spot_em",
-            self._observed_at(),
-            warnings,
+            observed_at,
+            fallback_warnings + warnings,
             source_timestamp,
         )
 
+    def _ths_daily_bars(self, code: str, expected_session: date, days: int, observed_at: datetime) -> MarketDataset:
+        if type(days) is not int or days <= 0:
+            raise ValueError("days must be a positive integer")
+        thscode = normalize_a_share_thscode(code)
+        start = datetime.combine(expected_session - timedelta(days=days * 2), datetime.min.time(), tzinfo=timezone.utc)
+        end = datetime.combine(expected_session + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc) - timedelta(milliseconds=1)
+        response = self._require_ths_client().a_share_historical(
+            thscode,
+            start_ms=int(start.timestamp() * 1000),
+            end_ms=int(end.timestamp() * 1000),
+        )
+        source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
+        normalized = validate_daily_bars(_normalize_ths_daily_bars(response.items), expected_session)
+        return MarketDataset(normalized, _THS_SOURCE + ".a_share_historical", observed_at, warnings, source_timestamp)
+
     def get_daily_bars(self, code: str, expected_session: date, *, days: int = 160) -> MarketDataset:
+        observed_at = self._observed_at()
+        fallback_warnings: tuple[str, ...] = ()
+        try:
+            return self._ths_daily_bars(code, expected_session, days, observed_at)
+        except ThsResponseError:
+            raise ValueError("THS daily bars invalid") from None
+        except _RECOVERABLE_THS_ERRORS:
+            fallback_warnings = ("THS unavailable; existing daily source used",)
         try:
             if self._daily_fetcher is None:
                 from data_provider.base import DataFetcherManager
@@ -312,7 +506,72 @@ class MarketDataGateway:
         if raw is None or raw.empty:
             raise ValueError("daily provider returned empty data")
         normalized = validate_daily_bars(raw, expected_session)
-        return MarketDataset(normalized, str(source), self._observed_at())
+        return MarketDataset(normalized, str(source), observed_at, fallback_warnings)
+
+    def _require_ths_client(self) -> ThsMarketDataClient:
+        if self._ths_client is None:
+            raise ThsConfigurationError("THS data provider is not configured")
+        return self._ths_client
+
+    def _ths_dataset(self, source: str, response: Any, observed_at: datetime) -> MarketDataset:
+        source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
+        return MarketDataset(_ths_items_frame(response.items), source, observed_at, warnings, source_timestamp)
+
+    def get_ths_financial_indicators(self, code: str, report: str) -> MarketDataset:
+        response = self._require_ths_client().financial_indicators(normalize_a_share_thscode(code), report)
+        records = [
+            {
+                "thscode": response.data["thscode"],
+                "report": response.data["report"],
+                "ability": ability["ability"],
+                **indicator,
+            }
+            for ability in response.data["abilities"]
+            for indicator in ability["indicators"]
+        ]
+        return MarketDataset(
+            pd.DataFrame(records),
+            _THS_SOURCE + ".financial_indicators",
+            self._observed_at(),
+            ("THS source timestamp unavailable",),
+        )
+
+    def get_ths_hot_stock_list(self, period: ThsHotListPeriod = ThsHotListPeriod.DAY) -> MarketDataset:
+        observed_at = self._observed_at()
+        return self._ths_dataset(_THS_SOURCE + ".hot_stock_list", self._require_ths_client().hot_stock_list(period), observed_at)
+
+    def get_ths_skyrocket_list(self, period: ThsHotListPeriod = ThsHotListPeriod.DAY) -> MarketDataset:
+        observed_at = self._observed_at()
+        return self._ths_dataset(_THS_SOURCE + ".skyrocket_list", self._require_ths_client().skyrocket_list(period), observed_at)
+
+    def get_ths_index_catalog(self, tag: ThsIndexTag = ThsIndexTag.CONCEPT) -> MarketDataset:
+        observed_at = self._observed_at()
+        return self._ths_dataset(_THS_SOURCE + ".index_catalog", self._require_ths_client().ths_index_catalog(tag), observed_at)
+
+    def get_ths_index_constituents(self, thscode: str) -> MarketDataset:
+        observed_at = self._observed_at()
+        return self._ths_dataset(
+            _THS_SOURCE + ".index_constituents", self._require_ths_client().ths_index_constituents(thscode), observed_at
+        )
+
+    def get_ths_index_snapshot(self, thscodes: Sequence[str]) -> MarketDataset:
+        observed_at = self._observed_at()
+        return self._ths_dataset(_THS_SOURCE + ".index_snapshot", self._require_ths_client().index_snapshot(thscodes), observed_at)
+
+    def get_ths_index_bars(self, thscode: str, expected_session: date, *, days: int = 160) -> MarketDataset:
+        if type(days) is not int or days <= 0:
+            raise ValueError("days must be a positive integer")
+        observed_at = self._observed_at()
+        start = datetime.combine(expected_session - timedelta(days=days * 2), datetime.min.time(), tzinfo=timezone.utc)
+        end = datetime.combine(expected_session + timedelta(days=1), datetime.min.time(), tzinfo=timezone.utc) - timedelta(milliseconds=1)
+        response = self._require_ths_client().index_historical(
+            thscode,
+            start_ms=int(start.timestamp() * 1000),
+            end_ms=int(end.timestamp() * 1000),
+        )
+        source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
+        normalized = validate_daily_bars(_normalize_ths_daily_bars(response.items), expected_session)
+        return MarketDataset(normalized, _THS_SOURCE + ".index_historical", observed_at, warnings, source_timestamp)
 
     def get_leading_sector_codes(self, limit: int = 10) -> MarketDataset:
         try:
