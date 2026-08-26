@@ -1626,7 +1626,7 @@ def run_report(
             report_key=session.report_key,
             rendered=rendered,
             manifest=manifest,
-            test_email=test_email,
+            test_email=test_email or preview_only,
         )
     except Exception:
         return _failure("artifact_write_failed", report_key=session.report_key, modules=modules)

@@ -22,6 +22,11 @@ on:
         type: boolean
         default: false
         required: false
+      preview_only:
+        description: Generate report artifacts only; never send email
+        type: boolean
+        default: false
+        required: false
       reconcile_sent:
         description: Record a verified in-doubt QQ delivery as sent without running the report
         type: boolean
@@ -63,6 +68,7 @@ jobs:
           SCHEDULE: ${{ github.event.schedule }}
           FORCE_INPUT: ${{ inputs.force }}
           TEST_EMAIL_INPUT: ${{ inputs.test_email }}
+          PREVIEW_ONLY_INPUT: ${{ inputs.preview_only }}
           RECONCILE_SENT_INPUT: ${{ inputs.reconcile_sent }}
         run: |
           set -euo pipefail
@@ -88,6 +94,10 @@ jobs:
             true|false) test_email="${TEST_EMAIL_INPUT:-false}" ;;
             *) exit 1 ;;
           esac
+          case "${PREVIEW_ONLY_INPUT:-false}" in
+            true|false) preview_only="${PREVIEW_ONLY_INPUT:-false}" ;;
+            *) exit 1 ;;
+          esac
           case "${RECONCILE_SENT_INPUT:-false}" in
             true|false) reconcile_sent="${RECONCILE_SENT_INPUT:-false}" ;;
             *) exit 1 ;;
@@ -95,15 +105,17 @@ jobs:
           if [ "$EVENT_NAME" = "schedule" ] && [ "$reconcile_sent" = "true" ]; then
             exit 1
           fi
-          if [ "$test_email" = "true" ] && [ "$reconcile_sent" = "true" ]; then
+          if { [ "$test_email" = "true" ] || [ "$preview_only" = "true" ]; } && [ "$reconcile_sent" = "true" ]; then
             exit 1
           fi
+          if [ "$test_email" = "true" ] && [ "$preview_only" = "true" ]; then exit 1; fi
 
           trading_date="$(TZ=Asia/Shanghai date +%F)"
           report_key="$trading_date-$mode"
           printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
           printf 'force=%s\n' "$force" >> "$GITHUB_OUTPUT"
           printf 'test_email=%s\n' "$test_email" >> "$GITHUB_OUTPUT"
+          printf 'preview_only=%s\n' "$preview_only" >> "$GITHUB_OUTPUT"
           printf 'reconcile_sent=%s\n' "$reconcile_sent" >> "$GITHUB_OUTPUT"
           printf 'report_key=%s\n' "$report_key" >> "$GITHUB_OUTPUT"
           printf 'prior_report_artifact=%s\n' "report-$trading_date-premarket" >> "$GITHUB_OUTPUT"
@@ -116,6 +128,7 @@ jobs:
           PRIOR_REPORT_ARTIFACT: ${{ steps.context.outputs.prior_report_artifact }}
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           TEST_EMAIL: ${{ steps.context.outputs.test_email }}
+          PREVIEW_ONLY: ${{ steps.context.outputs.preview_only }}
           RECONCILE_SENT: ${{ steps.context.outputs.reconcile_sent }}
         run: |
           set -euo pipefail
@@ -129,7 +142,7 @@ jobs:
           blocked_final_state=""
           blocked_exit=0
           mkdir -p .workflow-artifacts
-          if [ "$TEST_EMAIL" = "false" ]; then
+          if [ "$TEST_EMAIL" = "false" ] && [ "$PREVIEW_ONLY" = "false" ]; then
             if artifacts="$(gh api --paginate "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=sent-$REPORT_KEY&per_page=100" --jq '.artifacts[] | select(.expired == false) | .name' 2>/dev/null)"; then
               if printf '%s\n' "$artifacts" | grep -Fxq "sent-$REPORT_KEY"; then
                 sent_exists=true
@@ -162,7 +175,7 @@ jobs:
               fi
             fi
           fi
-          if [ "$delivery_action" = "deliver" ] && [ "$TEST_EMAIL" = "false" ]; then
+          if [ "$delivery_action" = "deliver" ] && [ "$TEST_EMAIL" = "false" ] && [ "$PREVIEW_ONLY" = "false" ]; then
             if [ "$sent_exists" = "true" ]; then
               already_sent=true
             elif [ "$in_doubt_exists" = "true" ] && [ "$RECONCILE_SENT" = "true" ]; then
@@ -251,7 +264,7 @@ jobs:
 
       - name: Prepare production delivery claim
         id: claim_prepare
-        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && steps.context.outputs.test_email == 'false' && steps.duplicate.outputs.already_sent == 'false' }}
+        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && steps.context.outputs.test_email == 'false' && steps.context.outputs.preview_only == 'false' && steps.duplicate.outputs.already_sent == 'false' }}
         env:
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
         run: |
@@ -400,11 +413,12 @@ jobs:
 
       - name: Run collaborative report
         id: runner
-        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
+        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.context.outputs.preview_only == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
         env:
           MODE: ${{ steps.context.outputs.mode }}
           FORCE: ${{ steps.context.outputs.force }}
           TEST_EMAIL: ${{ steps.context.outputs.test_email }}
+          PREVIEW_ONLY: ${{ steps.context.outputs.preview_only }}
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           ALREADY_SENT: ${{ steps.duplicate.outputs.already_sent }}
           PRIOR_REPORT: ${{ steps.prior.outputs.prior_report }}
@@ -464,6 +478,9 @@ jobs:
           fi
           if [ "$TEST_EMAIL" = "true" ]; then
             args+=(--test-email)
+          fi
+          if [ "$PREVIEW_ONLY" = "true" ]; then
+            args+=(--no-send)
           fi
           if [ "$ALREADY_SENT" = "true" ]; then
             args+=(--already-sent)
