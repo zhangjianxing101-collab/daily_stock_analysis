@@ -508,7 +508,7 @@ jobs:
           final_state = result.get("final_state") if isinstance(result, dict) else None
           if not isinstance(final_state, str):
               final_state = "hard_failure"
-          channel = "test" if os.environ["TEST_EMAIL"] == "true" else "production"
+          channel = "test" if os.environ["TEST_EMAIL"] == "true" or os.environ.get("PREVIEW_ONLY") == "true" else "production"
           report_root = Path(os.environ["OUTPUT_DIR"]) / channel / report_key
           report_available = report_root.is_dir() and any(report_root.glob("attempts/*/report.html"))
           diagnostic = {
@@ -560,6 +560,20 @@ jobs:
               output.write(f"report_artifact_name={'test-report' if channel == 'test' else 'report'}-{report_key}\n")
               output.write(f"needs_reconcile={'true' if needs_reconcile else 'false'}\n")
               output.write(f"runner_exit={os.environ['RUNNER_EXIT']}\n")
+          PY
+
+          python - <<'PY' >> "$GITHUB_STEP_SUMMARY"
+          import json
+          from pathlib import Path
+
+          try:
+              diagnostic = json.loads(Path(".workflow-artifacts/diagnostic-manifest.json").read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              diagnostic = {"final_state": "hard_failure", "warning_codes": ["diagnostic_unavailable"]}
+          print("## Report runner diagnostic")
+          print("```json")
+          print(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True))
+          print("```")
           PY
 
       - name: Reconcile verified in-doubt delivery
