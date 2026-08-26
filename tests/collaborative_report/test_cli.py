@@ -74,6 +74,21 @@ def test_cli_passes_all_task_9_arguments_and_returns_success(tmp_path, capsys) -
     }
 
 
+def test_cli_includes_safe_runner_error_code(tmp_path, capsys) -> None:
+    runner = Mock(
+        return_value=RunResult(
+            exit_code=EXIT_FAILURE,
+            final_state=FinalState.HARD_FAILURE,
+            report_key="2026-08-19-premarket",
+            error_code="configuration_invalid",
+        )
+    )
+
+    assert main(["--mode", "premarket", "--output-dir", str(tmp_path)], runner=runner) == EXIT_FAILURE
+
+    assert json.loads(capsys.readouterr().out)["error_code"] == "configuration_invalid"
+
+
 @pytest.mark.parametrize(
     ("state", "exit_code"),
     [

@@ -490,8 +490,35 @@ jobs:
           fi
 
           set +e
-          python scripts/run_collaborative_report.py "${args[@]}" > .workflow-artifacts/runner-result.json
-          runner_exit=$?
+          python - <<'PY' > .workflow-artifacts/preflight-result.json
+          import json
+          import sys
+
+          code = None
+          if sys.version_info < (3, 11):
+              code = "runtime_python_incompatible"
+          else:
+              try:
+                  import exchange_calendars  # noqa: F401
+                  from src.collaborative_report.cli import main  # noqa: F401
+              except (ImportError, ModuleNotFoundError):
+                  code = "runtime_dependency_unavailable"
+              except (SyntaxError, TypeError):
+                  code = "runtime_python_incompatible"
+              except Exception:
+                  code = "runtime_bootstrap_failed"
+          if code is not None:
+              print(json.dumps({"error_code": code, "final_state": "hard_failure", "module_statuses": {}, "report_key": "unavailable"}, sort_keys=True))
+              raise SystemExit(1)
+          PY
+          preflight_exit=$?
+          if [ "$preflight_exit" -eq 0 ]; then
+            python scripts/run_collaborative_report.py "${args[@]}" > .workflow-artifacts/runner-result.json 2> .workflow-artifacts/runner-stderr.log
+            runner_exit=$?
+          else
+            cp .workflow-artifacts/preflight-result.json .workflow-artifacts/runner-result.json
+            runner_exit=$preflight_exit
+          fi
           set -e
 
           RUNNER_EXIT="$runner_exit" OUTPUT_DIR="$OUTPUT_DIR" python - <<'PY'
@@ -508,6 +535,9 @@ jobs:
           final_state = result.get("final_state") if isinstance(result, dict) else None
           if not isinstance(final_state, str):
               final_state = "hard_failure"
+          error_code = result.get("error_code") if isinstance(result, dict) else None
+          if not isinstance(error_code, str):
+              error_code = None
           channel = "test" if os.environ["TEST_EMAIL"] == "true" or os.environ.get("PREVIEW_ONLY") == "true" else "production"
           report_root = Path(os.environ["OUTPUT_DIR"]) / channel / report_key
           report_available = report_root.is_dir() and any(report_root.glob("attempts/*/report.html"))
@@ -518,6 +548,8 @@ jobs:
               "source_timestamps": {},
               "warning_codes": [],
           }
+          if error_code is not None:
+              diagnostic["error_code"] = error_code
           if report_root.is_dir():
               for manifest_path in sorted(report_root.glob("attempts/*/manifest.json"), reverse=True):
                   try:

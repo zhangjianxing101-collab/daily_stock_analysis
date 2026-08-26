@@ -194,6 +194,11 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
     assert 'args+=(--output-dir "$OUTPUT_DIR")' in runner["run"]
     assert '"${args[@]}"' in runner["run"]
     assert "set +e" in runner["run"]
+    assert "preflight-result.json" in runner["run"]
+    assert "runtime_dependency_unavailable" in runner["run"]
+    assert "runtime_python_incompatible" in runner["run"]
+    assert "runner-stderr.log" in runner["run"]
+    assert 'diagnostic["error_code"] = error_code' in runner["run"]
     assert "runner_exit=$?" in runner["run"]
     assert 'exit "$RUNNER_EXIT"' in final_gate["run"]
     assert "inputs." not in all_run_content
