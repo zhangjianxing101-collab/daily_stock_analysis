@@ -182,6 +182,7 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
         "SCHEDULE": "${{ github.event.schedule }}",
         "FORCE_INPUT": "${{ inputs.force }}",
         "TEST_EMAIL_INPUT": "${{ inputs.test_email }}",
+        "PREVIEW_ONLY_INPUT": "${{ inputs.preview_only }}",
         "RECONCILE_SENT_INPUT": "${{ inputs.reconcile_sent }}",
     }
     assert '"0 1 * * 1-5") mode="premarket"' in context["run"]
@@ -318,7 +319,7 @@ def test_in_doubt_marker_blocks_delivery_and_manual_reconcile_never_calls_runner
     assert "in_doubt_exists" in duplicate_check["run"]
     assert "reconcile_required" in duplicate_check["run"]
     decision_block = duplicate_check["run"].split(
-        'if [ "$delivery_action" = "deliver" ] && [ "$TEST_EMAIL" = "false" ]; then',
+        'if [ "$delivery_action" = "deliver" ] && [ "$TEST_EMAIL" = "false" ] && [ "$PREVIEW_ONLY" = "false" ]; then',
         maxsplit=1,
     )[1]
     assert decision_block.index('if [ "$sent_exists" = "true" ]') < decision_block.index(
