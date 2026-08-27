@@ -362,12 +362,15 @@ class RunResult:
     def to_public_dict(self) -> dict[str, Any]:
         """Return the only fields safe for CLI and workflow logs."""
 
-        return {
+        payload = {
             "report_key": self.report_key,
             "module_statuses": {name: result.status for name, result in self.modules.items()},
             "artifact_path": str(self.manifest_path) if self.manifest_path else None,
             "final_state": self.final_state.value,
         }
+        if self.error_code is not None:
+            payload["error_code"] = self.error_code
+        return payload
 
 
 @dataclass(frozen=True)
