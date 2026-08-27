@@ -42,7 +42,6 @@ def test_capital_defaults_to_twenty_thousand() -> None:
     "payload",
     [
         "not-json",
-        "[]",
         '[{"code":"bad"}]',
     ],
 )
@@ -52,10 +51,16 @@ def test_invalid_required_portfolio_payload_raises_value_error(payload: str) -> 
 
 
 @pytest.mark.parametrize("payload", [None, "", "{}", "null"])
-def test_portfolio_must_be_a_required_non_empty_json_list(payload: str | None) -> None:
+def test_portfolio_must_be_a_required_json_list(payload: str | None) -> None:
     environment = {} if payload is None else {"COLLAB_PORTFOLIO_JSON": payload}
     with patch.dict(os.environ, environment, clear=True), pytest.raises(ValueError):
         CollaborativeSettings.from_env()
+
+
+def test_empty_json_list_represents_a_cash_portfolio() -> None:
+    settings = load_settings(COLLAB_PORTFOLIO_JSON="[]")
+
+    assert settings.positions == ()
 
 
 @pytest.mark.parametrize(

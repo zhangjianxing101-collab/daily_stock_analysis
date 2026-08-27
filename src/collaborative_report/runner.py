@@ -1544,17 +1544,26 @@ def run_report(
             )
         except Exception:
             portfolio_warnings.append("持仓风险计算不可用")
-    modules["portfolio"] = ModuleResult(
-        "portfolio",
-        (
-            "ok"
-            if len(portfolio_payload) == len(settings.positions)
-            else ("partial" if portfolio_payload else "unavailable")
-        ),
-        session.now_shanghai,
-        portfolio_payload,
-        tuple(dict.fromkeys(portfolio_warnings)) or (() if portfolio_payload else ("数据不足，建议观望",)),
-    )
+    if not settings.positions:
+        modules["portfolio"] = ModuleResult(
+            "portfolio",
+            "ok",
+            session.now_shanghai,
+            {"status": "当前无持仓"},
+            ("当前无持仓",),
+        )
+    else:
+        modules["portfolio"] = ModuleResult(
+            "portfolio",
+            (
+                "ok"
+                if len(portfolio_payload) == len(settings.positions)
+                else ("partial" if portfolio_payload else "unavailable")
+            ),
+            session.now_shanghai,
+            portfolio_payload,
+            tuple(dict.fromkeys(portfolio_warnings)) or (() if portfolio_payload else ("数据不足，建议观望",)),
+        )
 
     current_market_value = sum(
         price * position.quantity

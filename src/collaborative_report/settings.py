@@ -114,8 +114,8 @@ def _parse_positions() -> tuple[Position, ...]:
         payload = json.loads(raw_value)
     except (TypeError, json.JSONDecodeError) as exc:
         raise ValueError("COLLAB_PORTFOLIO_JSON must be valid JSON") from exc
-    if not isinstance(payload, list) or not payload:
-        raise ValueError("COLLAB_PORTFOLIO_JSON must be a non-empty list")
+    if not isinstance(payload, list):
+        raise ValueError("COLLAB_PORTFOLIO_JSON must be a JSON list")
     return tuple(_parse_position(item) for item in payload)
 
 
