@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import pytest
 
 from src.collaborative_report.models import ReportMode
-from src.collaborative_report.session import ReportSession, build_report_session
+from src.collaborative_report.session import ReportSession, build_report_session, report_data_session
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -185,6 +185,10 @@ def test_calendar_lookup_failure_is_fail_closed() -> None:
             "src.collaborative_report.session.exchange_calendars.get_calendar",
             side_effect=LookupError("calendar missing"),
         ),
+        patch(
+            "src.collaborative_report.session._akshare_xshg_sessions",
+            side_effect=RuntimeError("trading calendar unavailable"),
+        ),
         pytest.raises(RuntimeError, match="^trading calendar unavailable$") as error,
     ):
         build_report_session(
@@ -192,7 +196,7 @@ def test_calendar_lookup_failure_is_fail_closed() -> None:
             datetime(2026, 8, 19, 9, 0, tzinfo=SHANGHAI),
         )
 
-    assert isinstance(error.value.__cause__, LookupError)
+    assert str(error.value) == "trading calendar unavailable"
 
 
 def test_calendar_session_failure_is_fail_closed() -> None:
@@ -200,6 +204,10 @@ def test_calendar_session_failure_is_fail_closed() -> None:
     calendar.is_session.side_effect = ValueError("unsupported date")
     with (
         patch("src.collaborative_report.session.exchange_calendars.get_calendar", return_value=calendar),
+        patch(
+            "src.collaborative_report.session._akshare_xshg_sessions",
+            side_effect=RuntimeError("trading calendar unavailable"),
+        ),
         pytest.raises(RuntimeError, match="^trading calendar unavailable$") as error,
     ):
         build_report_session(
@@ -207,7 +215,46 @@ def test_calendar_session_failure_is_fail_closed() -> None:
             datetime(2026, 8, 19, 16, 0, tzinfo=SHANGHAI),
         )
 
-    assert isinstance(error.value.__cause__, ValueError)
+    assert str(error.value) == "trading calendar unavailable"
+
+
+def test_akshare_fallback_accepts_only_explicit_trading_dates() -> None:
+    fallback_sessions = frozenset({date(2026, 8, 19), date(2026, 8, 20)})
+    with (
+        patch(
+            "src.collaborative_report.session.exchange_calendars.get_calendar",
+            side_effect=ValueError("coverage ended"),
+        ),
+        patch("src.collaborative_report.session._akshare_xshg_sessions", return_value=fallback_sessions),
+    ):
+        trading = build_report_session(
+            ReportMode.PREMARKET,
+            datetime(2026, 8, 19, 9, 0, tzinfo=SHANGHAI),
+        )
+        holiday = build_report_session(
+            ReportMode.PREMARKET,
+            datetime(2026, 8, 21, 9, 0, tzinfo=SHANGHAI),
+        )
+
+    assert trading.is_trading_day is True
+    assert holiday.is_trading_day is False
+
+
+def test_akshare_fallback_requires_postmarket_close() -> None:
+    fallback_sessions = frozenset({date(2026, 8, 19)})
+    with (
+        patch(
+            "src.collaborative_report.session.exchange_calendars.get_calendar",
+            side_effect=ValueError("coverage ended"),
+        ),
+        patch("src.collaborative_report.session._akshare_xshg_sessions", return_value=fallback_sessions),
+        pytest.raises(RuntimeError, match="^report data session incomplete$"),
+    ):
+        report_data_session(
+            ReportMode.POSTMARKET,
+            date(2026, 8, 19),
+            datetime(2026, 8, 19, 14, 59, tzinfo=SHANGHAI),
+        )
 
 
 def test_report_session_is_frozen() -> None:
