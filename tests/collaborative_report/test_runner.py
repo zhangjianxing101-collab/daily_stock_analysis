@@ -226,6 +226,24 @@ def test_calendar_and_delayed_scheduled_run_are_hard_failures(tmp_path, deps, me
     deps.mail_sender.assert_not_called()
 
 
+def test_incomplete_postmarket_data_has_a_distinct_safe_error_code(tmp_path, deps) -> None:
+    def incomplete(*args, **kwargs):
+        raise RuntimeError("report data session incomplete")
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, data_session_resolver=incomplete),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.exit_code == EXIT_FAILURE
+    assert result.final_state is FinalState.HARD_FAILURE
+    assert result.error_code == "report_data_incomplete"
+    deps.mail_sender.assert_not_called()
+
+
 def test_force_bypasses_only_window_gate(tmp_path, deps) -> None:
     session_builder = Mock(side_effect=deps.session_builder)
     stale_gateway = FakeGateway()

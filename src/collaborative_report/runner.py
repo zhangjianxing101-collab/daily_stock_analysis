@@ -1296,8 +1296,9 @@ def run_report(
             session.trading_date,
             session.now_shanghai,
         )
-    except Exception:
-        return _failure("calendar_unavailable", report_key=session.report_key)
+    except Exception as exc:
+        code = "report_data_incomplete" if str(exc) == "report data session incomplete" else "calendar_unavailable"
+        return _failure(code, report_key=session.report_key)
 
     modules: dict[str, ModuleResult] = {}
     prior_candidates: tuple[Mapping[str, Any], ...] = ()
