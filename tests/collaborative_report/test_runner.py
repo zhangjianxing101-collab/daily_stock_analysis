@@ -1347,6 +1347,23 @@ def test_settings_privacy_failure_is_closed_without_secret_in_result(tmp_path, d
     assert PORTFOLIO_CODE not in json.dumps(result.to_public_dict())
 
 
+def test_cash_portfolio_is_available_without_position_risk_evaluation(tmp_path, deps, settings) -> None:
+    cash_settings = replace(settings, positions=())
+    risk = Mock()
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, settings_loader=lambda: cash_settings, risk_evaluator=risk),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["portfolio"].status == "ok"
+    assert result.modules["portfolio"].payload == {"status": "当前无持仓"}
+    risk.assert_not_called()
+
+
 def test_portfolio_status_is_partial_when_only_some_positions_succeed(tmp_path, deps, settings) -> None:
     second_code = "600002"
     mixed = replace(settings, positions=(*settings.positions, Position(second_code, 100, 10.0)))
