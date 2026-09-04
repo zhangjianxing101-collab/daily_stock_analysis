@@ -712,6 +712,7 @@ def test_get_gold_bars_calls_yfinance_and_normalizes_ohlcv() -> None:
     download.assert_called_once_with(
         "GC=F",
         period="10y",
+        end="2026-08-19",
         interval="1d",
         auto_adjust=False,
         progress=False,
@@ -778,14 +779,29 @@ def test_get_gold_bars_rejects_incomplete_row_before_futures_cutoff() -> None:
 
 
 def test_get_gold_bars_accepts_local_date_after_futures_cutoff() -> None:
+    download = Mock(return_value=daily_bars(end="2026-08-19"))
     gateway = MarketDataGateway(
-        yfinance_download=lambda *args, **kwargs: daily_bars(end="2026-08-19"),
+        yfinance_download=download,
         clock=lambda: datetime(2026, 8, 19, 22, 1, tzinfo=timezone.utc),
     )
 
     result = gateway.get_gold_bars()
 
+    assert download.call_args.kwargs["end"] == "2026-08-20"
     assert result.frame.iloc[-1]["date"].date() == date(2026, 8, 19)
+
+
+def test_get_gold_bars_does_not_download_when_calendar_is_unavailable() -> None:
+    download = Mock()
+    gateway = MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT)
+
+    with (
+        patch("src.collaborative_report.market_data.exchange_calendars.get_calendar", side_effect=RuntimeError),
+        pytest.raises(ValueError, match="^market calendar unavailable$"),
+    ):
+        gateway.get_gold_bars()
+
+    download.assert_not_called()
 
 
 def test_get_gold_bars_rejects_stale_history() -> None:

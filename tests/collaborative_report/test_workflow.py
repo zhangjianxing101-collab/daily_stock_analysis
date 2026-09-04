@@ -460,7 +460,6 @@ def test_workflow_maps_secrets_and_variables_without_literal_personal_data() -> 
         "EMAIL_PASSWORD",
         "EMAIL_RECEIVERS",
         "COLLAB_PORTFOLIO_JSON",
-        "THS_API_KEY",
         "ANSPIRE_API_KEYS",
         "GEMINI_API_KEY",
         "GEMINI_API_KEYS",
@@ -487,6 +486,8 @@ def test_workflow_maps_secrets_and_variables_without_literal_personal_data() -> 
     }
     for key in secret_values:
         assert env[key] == f"${{{{ secrets.{key} }}}}"
+
+    assert env["THS_API_KEY"] == "${{ secrets.THS_API_KEY || secrets.THS }}"
 
     assert env["COLLAB_CAPITAL_CNY"] == "${{ vars.COLLAB_CAPITAL_CNY || '20000' }}"
     assert env["COLLAB_RISK_FRACTION"] == "${{ vars.COLLAB_RISK_FRACTION || '0.02' }}"

@@ -13,6 +13,11 @@ Add the following encrypted GitHub Secrets under **Settings -> Secrets and varia
 - `THS_API_KEY` for the optional 同花顺/福耀 market-data source
 - Any AI provider keys used by the report, such as `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`
 
+For existing GitHub setups that saved the market-data key as `THS`, the workflow
+uses that encrypted secret when `THS_API_KEY` is absent or empty. If both are set,
+`THS_API_KEY` takes precedence. No key is copied into repository variables or
+logs. Local runs continue to use the canonical `THS_API_KEY` environment variable.
+
 Do not place sender/receiver addresses, portfolio JSON, authorization codes, or AI keys in repository variables. The `.env.example` values are synthetic placeholders only.
 
 ## 同花顺数据与人工查询
@@ -33,6 +38,14 @@ python scripts/run_collaborative_report.py query index bars 886042.TI --expected
 ```
 
 Queries are read-only data retrieval, not trading commands. Review returned data quality and confirm every investment decision manually.
+
+## Gold history completeness
+
+Gold history downloads end exclusively on the day after the latest completed
+futures session. This avoids requesting the ongoing session's incomplete daily
+bar. Returned data must still pass all existing date, price, volume, sample-size,
+and freshness checks; a stale series or a provider response beyond the cutoff
+remains unavailable rather than being silently accepted.
 
 ## Repository variables
 

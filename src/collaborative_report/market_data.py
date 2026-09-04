@@ -686,10 +686,12 @@ class MarketDataGateway:
 
     def get_gold_bars(self) -> MarketDataset:
         observed_at = self._observed_at()
+        latest_completed = _latest_completed_session_date("GC=F", observed_at)
         try:
             raw = self._download(
                 "GC=F",
                 period="10y",
+                end=(latest_completed + timedelta(days=1)).isoformat(),
                 interval="1d",
                 auto_adjust=False,
                 progress=False,
@@ -699,7 +701,6 @@ class MarketDataGateway:
             raise ValueError("gold provider unavailable") from None
         if raw is None or raw.empty:
             raise ValueError("gold provider returned empty data")
-        latest_completed = _latest_completed_session_date("GC=F", observed_at)
         normalized = _validate_bar_series(
             raw,
             min_rows=60,

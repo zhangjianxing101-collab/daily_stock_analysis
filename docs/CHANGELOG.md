@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/).
 
 ## [Unreleased]
 
+- [修复] 协同日报兼容既有 GitHub `THS` 行情密钥名称，优先使用 `THS_API_KEY`；黄金历史请求限定到最后已收盘交易日，避免未完成日线导致整段数据被拒绝，仍严格校验时效与完整性。
+
 - [测试] LiteLLM 缓存兼容测试改为通过应用的缓存能力保护生成请求，并抓取实际 HTTP 请求验证未启用或未验证的缓存提示不会发送；不再依赖第三方库丢弃显式参数的旧行为。
 
 <!-- 新条目格式：- [类型] 描述（类型取值：新功能/改进/修复/文档/测试/chore）-->
