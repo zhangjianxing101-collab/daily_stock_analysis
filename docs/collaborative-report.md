@@ -41,6 +41,12 @@ Queries are read-only data retrieval, not trading commands. Review returned data
 
 ## Gold history completeness
 
+Empty or stale gold responses, or recognized connection/time-out failures, allow
+one alternate-range retry. It requests one extra leading calendar day with the
+same exclusive end. The entire response is validated before removing the padding
+and revalidating the canonical ten-year window. Responses are never spliced;
+integrity failures do not trigger recovery, and a second failure stays unavailable.
+
 Gold history downloads end exclusively on the day after the latest completed
 futures session. This avoids requesting the ongoing session's incomplete daily
 bar. Returned data must still pass all existing date, price, volume, sample-size,
@@ -53,6 +59,10 @@ Reports invalidated by clock or source-expiry checks are excluded from the
 workflow's report upload; their sanitized diagnostic manifest remains available.
 Provider logs expose only fixed THS failure categories and validated expected/actual
 bar dates, never exception text or response bodies.
+The workflow includes these allowlisted lines in `provider_diagnostics`. THS
+transport categories distinguish TLS, proxy, connect/read timeout, connection,
+and internal-client failures. TLS verification stays enabled, redirects remain
+disabled, and retry limits are unchanged.
 
 Source timestamps are checked against the time a response is received, not the
 time its request began. Each snapshot page is checked before another page can

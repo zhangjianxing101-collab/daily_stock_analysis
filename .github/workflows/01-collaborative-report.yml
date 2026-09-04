@@ -529,7 +529,7 @@ jobs:
 
           def safe_provider_diagnostics(stderr):
               patterns = (
-                  r"A-share primary source: ths_(?:authentication_failed|configuration_missing|data_unavailable|network_failed|tls_failed|proxy_failed|connect_timeout|read_timeout|connection_failed|internal_failure|permission_denied|rate_limited|unavailable)",
+                  r"A-share primary source: ths_(?:authentication_failed|configuration_missing|data_unavailable|network_failed|tls_failed|proxy_failed|connect_timeout|read_timeout|connection_failed|internal_failure|credential_encoding_failed|internal_type_error|internal_value_error|internal_attribute_error|permission_denied|rate_limited|unavailable)",
                   r"Daily bars stale: expected=\d{4}-\d{2}-\d{2} actual=\d{4}-\d{2}-\d{2}",
               )
               return sorted({line for line in stderr.splitlines() if any(re.fullmatch(pattern, line) for pattern in patterns)})

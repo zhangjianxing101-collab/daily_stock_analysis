@@ -78,6 +78,7 @@ _THS_NETWORK_FAILURE_CODES = {
     reason: f"ths_{reason}" for reason in (
         "network_failed", "tls_failed", "proxy_failed", "connect_timeout",
         "read_timeout", "connection_failed", "internal_failure",
+        "credential_encoding_failed", "internal_type_error", "internal_value_error", "internal_attribute_error",
     )
 }
 _RECOVERABLE_THS_ERRORS = (
@@ -725,24 +726,45 @@ class MarketDataGateway:
     def get_gold_bars(self) -> MarketDataset:
         observed_at = self._observed_at()
         latest_completed = _latest_completed_session_date("GC=F", observed_at)
-        try:
-            raw = self._download(
-                "GC=F",
-                period="10y",
-                end=(latest_completed + timedelta(days=1)).isoformat(),
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                timeout=15,
-            )
-        except Exception:
-            raise ValueError("gold provider unavailable") from None
-        if raw is None or raw.empty:
-            raise ValueError("gold provider returned empty data")
-        normalized = _validate_bar_series(
-            raw,
-            min_rows=60,
-            latest_allowed=latest_completed,
-            required_latest=latest_completed,
-        )
-        return MarketDataset(normalized, "yfinance:GC=F", self._received_at(observed_at))
+        end = latest_completed + timedelta(days=1)
+        canonical_start = (pd.Timestamp(end) - pd.DateOffset(years=10)).date()
+        for attempt in range(2):
+            window = {"period": "10y"} if attempt == 0 else {
+                "start": (canonical_start - timedelta(days=1)).isoformat(),
+            }
+            failure = None
+            try:
+                raw = self._download(
+                    "GC=F", **window, end=end.isoformat(), interval="1d",
+                    auto_adjust=False, progress=False, timeout=15,
+                )
+            except (TimeoutError, ConnectionError):
+                failure = "gold provider unavailable"
+                raw = None
+            except Exception:
+                raise ValueError("gold provider unavailable") from None
+            observed_at = self._received_at(observed_at)
+            if raw is None or raw.empty:
+                failure = failure or "gold provider returned empty data"
+            else:
+                try:
+                    normalized = _validate_bar_series(
+                        raw, min_rows=60, latest_allowed=latest_completed,
+                        required_latest=latest_completed,
+                    )
+                except ValueError as exc:
+                    if str(exc) != "daily bars stale":
+                        raise
+                    failure = "daily bars stale"
+                else:
+                    # Validate all rows before removing deliberate leading retry padding.
+                    normalized = _validate_bar_series(
+                        normalized.loc[normalized["date"] >= pd.Timestamp(canonical_start)],
+                        min_rows=60, latest_allowed=latest_completed, required_latest=latest_completed,
+                    )
+                    warnings = ("gold history recovered after bounded retry",) if attempt else ()
+                    return MarketDataset(normalized, "yfinance:GC=F", observed_at, warnings)
+            if attempt:
+                raise ValueError(failure) from None
+            logger.warning("Gold history: bounded_retry")
+        raise AssertionError("gold retry must return or raise")

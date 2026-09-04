@@ -105,6 +105,10 @@ _THS_NETWORK_REASONS = frozenset({
     "read_timeout",
     "connection_failed",
     "internal_failure",
+    "credential_encoding_failed",
+    "internal_type_error",
+    "internal_value_error",
+    "internal_attribute_error",
 })
 
 
@@ -412,6 +416,8 @@ class ThsMarketDataClient:
             or self._settings.base_url != DEFAULT_THS_BASE_URL
         ):
             raise ThsConfigurationError("THS data provider is not configured")
+        if not all(33 <= ord(character) <= 126 for character in self._settings.api_key):
+            raise ThsNetworkError("credential_encoding_failed")
 
         url = f"{self._settings.base_url}{endpoint.value}"
         headers = {"X-api-key": self._settings.api_key, "Accept": "application/json"}
@@ -444,6 +450,26 @@ class ThsMarketDataClient:
                 continue
             except ThsResponseError:
                 raise
+            except UnicodeEncodeError:
+                if attempt == self._settings.max_retries:
+                    raise ThsNetworkError("credential_encoding_failed") from None
+                self._backoff(attempt)
+                continue
+            except TypeError:
+                if attempt == self._settings.max_retries:
+                    raise ThsNetworkError("internal_type_error") from None
+                self._backoff(attempt)
+                continue
+            except ValueError:
+                if attempt == self._settings.max_retries:
+                    raise ThsNetworkError("internal_value_error") from None
+                self._backoff(attempt)
+                continue
+            except AttributeError:
+                if attempt == self._settings.max_retries:
+                    raise ThsNetworkError("internal_attribute_error") from None
+                self._backoff(attempt)
+                continue
             except Exception:
                 if attempt == self._settings.max_retries:
                     raise ThsNetworkError("internal_failure") from None

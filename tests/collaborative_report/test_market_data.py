@@ -871,6 +871,65 @@ def test_get_gold_bars_rejects_stale_history(caplog) -> None:
     assert "expected=" in caplog.text
 
 
+@pytest.mark.parametrize("first", ["stale", "empty", "timeout", "connection"])
+def test_gold_history_bounded_retry_recovers_only_complete_series(first) -> None:
+    complete = daily_bars(end="2026-08-18")
+    first_result = {
+        "stale": daily_bars(end="2026-08-17"), "empty": pd.DataFrame(),
+        "timeout": TimeoutError(), "connection": ConnectionError(),
+    }[first]
+    download = Mock(side_effect=[first_result, complete])
+    result = MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT).get_gold_bars()
+    assert download.call_count == 2
+    assert download.call_args_list[0].kwargs["end"] == download.call_args_list[1].kwargs["end"] == "2026-08-19"
+    assert download.call_args_list[1].kwargs["start"] == "2016-08-18"
+    assert "period" not in download.call_args_list[1].kwargs
+    assert result.frame.iloc[-1]["date"].date() == date(2026, 8, 18)
+    assert result.warnings == ("gold history recovered after bounded retry",)
+
+
+def test_gold_history_retry_does_not_change_analysis_window() -> None:
+    complete = daily_bars(end="2026-08-18")
+    padding = complete.iloc[[0]].assign(Date=pd.Timestamp("2016-08-18"))
+    padded = pd.concat([padding, complete], ignore_index=True)
+    primary = MarketDataGateway(yfinance_download=Mock(return_value=complete), clock=lambda: OBSERVED_AT).get_gold_bars()
+    retry = MarketDataGateway(
+        yfinance_download=Mock(side_effect=[pd.DataFrame(), padded]), clock=lambda: OBSERVED_AT,
+    ).get_gold_bars()
+    pd.testing.assert_frame_equal(primary.frame, retry.frame)
+
+
+def test_gold_history_retry_validates_padding_before_removing_it() -> None:
+    complete = daily_bars(end="2026-08-18")
+    invalid_padding = complete.iloc[[0]].assign(Date=pd.Timestamp("2016-08-18"), Volume=-1)
+    download = Mock(side_effect=[pd.DataFrame(), pd.concat([invalid_padding, complete], ignore_index=True)])
+    with pytest.raises(ValueError, match="daily bars invalid volume"):
+        MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT).get_gold_bars()
+    assert download.call_count == 2
+
+
+def test_gold_history_stale_retry_remains_unavailable() -> None:
+    download = Mock(return_value=daily_bars(end="2026-08-17"))
+    with pytest.raises(ValueError, match="daily bars stale"):
+        MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT).get_gold_bars()
+    assert download.call_count == 2
+
+
+@pytest.mark.parametrize("fault", ["volume", "future", "insufficient"])
+def test_gold_history_integrity_failure_never_triggers_retry(fault) -> None:
+    frame = daily_bars(end="2026-08-18")
+    if fault == "volume":
+        frame = frame.assign(Volume=-1)
+    elif fault == "future":
+        frame = daily_bars(end="2026-08-19")
+    else:
+        frame = frame.iloc[:59]
+    download = Mock(return_value=frame)
+    with pytest.raises(ValueError):
+        MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT).get_gold_bars()
+    download.assert_called_once()
+
+
 def test_market_dataset_requires_timezone_aware_observation() -> None:
     with pytest.raises(ValueError, match="^observed_at must be timezone-aware$"):
         MarketDataset(pd.DataFrame(), "test", datetime(2026, 8, 19))
