@@ -207,17 +207,27 @@ def _normalize_ths_snapshot(items: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
             "total_mv": pd.Series(pd.NA, index=raw.index, dtype="Float64"),
         }
     )
-    if result["code"].isna().any() or not result["price"].notna().all():
-        raise ValueError("THS snapshot contains unsafe prices")
-    if not np.isfinite(result["price"].to_numpy(dtype=float)).all() or (result["price"] <= 0).any():
+    if result["code"].isna().any():
         raise ValueError("THS snapshot contains unsafe prices")
     if result["code"].duplicated().any():
         raise ValueError("THS snapshot contains duplicate codes")
+    unquoted = (raw["last_price"].isna() & (
+        (raw["volume"].isna() | result["volume"].eq(0))
+        & (raw["turnover"].isna() | result["amount"].eq(0))
+    )).fillna(False)
+    excluded = int(unquoted.sum())
+    result = result.loc[~unquoted].copy()
+    if result.empty or not result["price"].notna().all():
+        raise ValueError("THS snapshot contains unsafe prices")
+    if not np.isfinite(result["price"].to_numpy(dtype=float)).all() or (result["price"] <= 0).any():
+        raise ValueError("THS snapshot contains unsafe prices")
     for column in ("change_pct", "amount", "volume"):
         values = result[column].to_numpy(dtype=float)
         if not np.isfinite(values).all() or (column in {"amount", "volume"} and (values < 0).any()):
             raise ValueError("THS snapshot contains invalid values")
-    return result.loc[:, _SNAPSHOT_COLUMNS].reset_index(drop=True)
+    result = result.loc[:, _SNAPSHOT_COLUMNS].reset_index(drop=True)
+    result.attrs.update(provider_row_count=len(raw), quarantined_row_count=excluded)
+    return result
 
 
 def _normalize_ths_daily_bars(items: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
@@ -397,6 +407,7 @@ class MarketDataGateway:
         sector_members_fetcher: Callable[[str], pd.DataFrame] | None = None,
         yfinance_download: Callable[..., pd.DataFrame] | None = None,
         ths_client: ThsMarketDataClient | None = None,
+        snapshot_supplement_fetcher: Callable[[Sequence[str]], Any] | None = None,
         clock: Callable[[], datetime] | None = None,
     ) -> None:
         self._snapshot_fetcher = snapshot_fetcher
@@ -405,6 +416,7 @@ class MarketDataGateway:
         self._sector_members_fetcher = sector_members_fetcher
         self._yfinance_download = yfinance_download
         self._ths_client = ths_client
+        self._snapshot_supplement_fetcher = snapshot_supplement_fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
 
     def _observed_at(self) -> datetime:
@@ -429,23 +441,92 @@ class MarketDataGateway:
             observed_at = self._received_at(observed_at)
             source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         else:
-            response, items, observed_at = self._ths_all_snapshot_pages(client, observed_at)
-            source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
+            items, observed_at, source_timestamp, warnings = self._ths_all_snapshot_pages(client, observed_at)
+        frame = _normalize_ths_snapshot(items)
+        if frame.attrs.get("quarantined_row_count", 0):
+            warnings = (*warnings, "ths_snapshot_unquoted_rows_excluded")
+        source = _THS_SOURCE + ".a_share_snapshot"
+        if self._snapshot_supplement_fetcher is not None:
+            frame, observed_at, source_timestamp, supplement_warnings = self._enrich_snapshot(
+                frame, observed_at, source_timestamp,
+            )
+            warnings = (*warnings, *supplement_warnings)
+            if frame.attrs.get("screening_complete_count", 0):
+                source += "+tencent"
         return MarketDataset(
-            _normalize_ths_snapshot(items),
-            _THS_SOURCE + ".a_share_snapshot",
+            frame,
+            source,
             observed_at,
             warnings,
             source_timestamp,
         )
 
+    def _enrich_snapshot(self, frame, observed_at, source_timestamp):
+        result = frame.copy(deep=True)
+        result.attrs["screening_complete_count"] = 0
+        warning = "snapshot_screening_fields_incomplete"
+        if source_timestamp is None:
+            return result, observed_at, source_timestamp, (warning,)
+        try:
+            supplement = self._snapshot_supplement_fetcher(tuple(result["code"]))
+        except Exception:
+            return result, self._received_at(observed_at), source_timestamp, (warning,)
+        received_at = self._received_at(observed_at)
+        try:
+            if (supplement.observed_at.tzinfo is None or supplement.observed_at.utcoffset() is None
+                    or not observed_at <= supplement.observed_at <= received_at):
+                raise ValueError("supplement acquisition time invalid")
+            records = supplement.frame
+            required = {"code", "name", "price", "volume_ratio", "turnover", "source_timestamp"}
+            if not required.issubset(records.columns) or records["code"].duplicated().any():
+                raise ValueError("supplement fields invalid")
+        except Exception:
+            return result, received_at, source_timestamp, (warning,)
+        # Session dates are always interpreted in the exchange's timezone.
+        exchange_tz = "Asia/Shanghai"
+        expected = pd.Timestamp(source_timestamp).tz_convert(exchange_tz).date()
+        indexed = records.set_index("code")
+        timestamps = []
+        for index, row in result.iterrows():
+            code = row["code"]
+            if code not in indexed.index:
+                continue
+            other = indexed.loc[code]
+            try:
+                stamp = pd.Timestamp(other["source_timestamp"])
+                if pd.isna(stamp) or stamp.tzinfo is None:
+                    continue
+                local = stamp.tz_convert(exchange_tz)
+                if local.date() != expected or local.hour < 15 or stamp > supplement.observed_at:
+                    continue
+                name = other["name"]
+                price, ratio, turnover = (float(other[key]) for key in ("price", "volume_ratio", "turnover"))
+                if (not isinstance(name, str) or not name.strip()
+                        or not np.isfinite([price, ratio, turnover]).all()
+                        or price <= 0 or ratio < 0 or turnover < 0
+                        or abs(price - float(row["price"])) > 0.01 + 1e-9):
+                    continue
+                result.loc[index, ["name", "volume_ratio", "turnover"]] = [name, ratio, turnover]
+                timestamps.append(stamp.to_pydatetime())
+            except (TypeError, ValueError, OverflowError):
+                continue
+        result.attrs["screening_complete_count"] = len(timestamps)
+        if timestamps:
+            source_timestamp = min(source_timestamp, *timestamps)
+            result.attrs["supplement_source"] = "tencent"
+            result.attrs["supplement_source_timestamp"] = min(timestamps).isoformat()
+        warnings = (warning,) if len(timestamps) < len(result) else ()
+        return result, received_at, source_timestamp, warnings
+
     def _ths_all_snapshot_pages(
         self, client: ThsMarketDataClient, observed_at: datetime
-    ) -> tuple[Any, tuple[Mapping[str, Any], ...], datetime]:
+    ) -> tuple[tuple[Mapping[str, Any], ...], datetime, datetime | None, tuple[str, ...]]:
         offset = 0
         items: list[Mapping[str, Any]] = []
         response: Any | None = None
         expected_total: int | None = None
+        timestamps: list[datetime | None] = []
+        warnings: list[str] = []
         while expected_total is None or len(items) < expected_total:
             response = client.a_share_snapshot(None, limit=1000, offset=offset)
             observed_at = self._received_at(observed_at)
@@ -456,7 +537,9 @@ class MarketDataGateway:
                 expected_total = total
             elif total != expected_total:
                 raise ValueError("THS snapshot total changed during pagination")
-            _ths_timestamp(response.timestamp_ms, observed_at)
+            timestamp, page_warnings = _ths_timestamp(response.timestamp_ms, observed_at)
+            timestamps.append(timestamp)
+            warnings.extend(page_warnings)
             page_items = response.items
             if not page_items:
                 if expected_total == 0 and not items:
@@ -468,7 +551,8 @@ class MarketDataGateway:
             offset += len(page_items)
         if response is None:
             raise AssertionError("THS snapshot pagination must return a response")
-        return response, tuple(items), observed_at
+        source_timestamp = min(timestamps) if all(stamp is not None for stamp in timestamps) else None
+        return tuple(items), observed_at, source_timestamp, tuple(dict.fromkeys(warnings))
 
     def get_a_share_snapshot(self, codes: Sequence[str] | None = None) -> MarketDataset:
         observed_at = self._observed_at()

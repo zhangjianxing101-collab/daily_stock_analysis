@@ -560,12 +560,19 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
         "Upload sent marker",
         "Upload in-doubt marker",
         "Upload production delivery claim",
+        "Upload safe provider quality counts",
     }
     assert by_name["Upload private report"]["with"]["name"] == "${{ steps.runner.outputs.report_artifact_name }}"
     assert by_name["Upload diagnostic manifest"]["with"]["name"] == "diagnostic-${{ steps.context.outputs.report_key }}"
     assert by_name["Upload sent marker"]["with"]["name"] == "sent-${{ steps.context.outputs.report_key }}"
     assert by_name["Upload production delivery claim"]["with"]["name"] == "claim-${{ steps.context.outputs.report_key }}"
-    assert all(step["with"]["retention-days"] == "7" for step in uploads)
+    assert all(step["with"]["retention-days"] == ("3" if step["name"] == "Upload safe provider quality counts" else "7")
+               for step in uploads)
+    probe = _step(workflow, "Probe provider quality for previews")
+    assert probe["if"] == "${{ steps.context.outputs.preview_only == 'true' }}"
+    assert set(probe["env"]) == {"THS_API_KEY"}
+    assert probe["timeout-minutes"] == "3"
+    assert by_name["Upload safe provider quality counts"]["with"]["path"] == ".workflow-artifacts/provider-quality.json"
     assert "steps.runner.outputs.final_state == 'sent'" in by_name["Upload sent marker"]["if"]
     assert "steps.context.outputs.test_email == 'false'" in by_name["Upload sent marker"]["if"]
     assert "steps.runner.outputs.runner_exit == '0'" in by_name["Upload sent marker"]["if"]

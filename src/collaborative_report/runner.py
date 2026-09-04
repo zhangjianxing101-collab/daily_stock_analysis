@@ -75,6 +75,7 @@ _DATA_FAILURE_CODES = {
 }
 _SAFE_DATA_FAILURE_CODES = frozenset(_DATA_FAILURE_CODES.values()) | {
     "snapshot_data_failed", "gold_data_failed", "gold_analysis_failed",
+    "ths_snapshot_unquoted_rows_excluded", "snapshot_screening_fields_incomplete",
 }
 
 
@@ -447,6 +448,8 @@ def _production_mail_sender(rendered: RenderedReport, *, test_email: bool = Fals
 
 
 def default_dependencies(*, clock: Callable[[], datetime] | None = None) -> RunnerDependencies:
+    from .snapshot_supplement import fetch_snapshot_supplement
+
     active_clock = clock or (lambda: datetime.now().astimezone())
     return RunnerDependencies(
         settings_loader=CollaborativeSettings.from_env,
@@ -454,6 +457,7 @@ def default_dependencies(*, clock: Callable[[], datetime] | None = None) -> Runn
         clock=active_clock,
         gateway=MarketDataGateway(
             ths_client=ThsMarketDataClient(ThsSettings.from_env()),
+            snapshot_supplement_fetcher=lambda codes: fetch_snapshot_supplement(list(codes), clock=active_clock),
             clock=active_clock,
         ),
         screener=screen_aggressive,
@@ -508,13 +512,19 @@ def _global_payload(dataset: MarketDataset) -> Mapping[str, Any]:
 
 def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[str, Any]:
     frame = dataset.frame
+    coverage = {}
+    if frame.attrs.get("quarantined_row_count", 0):
+        coverage["无报价剔除记录"] = int(frame.attrs["quarantined_row_count"])
+    if "screening_complete_count" in frame.attrs:
+        coverage["选股字段齐全记录"] = int(frame.attrs["screening_complete_count"])
     if not authoritative:
-        return {"股票数量": int(len(frame))}
+        return {"股票数量": int(len(frame)), **coverage}
     changes = pd.to_numeric(frame.get("change_pct", pd.Series(dtype=float)), errors="coerce")
     return {
         "股票数量": int(len(frame)),
         "上涨家数": int((changes > 0).sum()),
         "下跌家数": int((changes < 0).sum()),
+        **coverage,
     }
 
 
@@ -1461,7 +1471,7 @@ def run_report(
                     market_warnings = (*market_warnings, _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING)
             modules["market"] = ModuleResult(
                 "market",
-                "ok" if snapshot_source_is_authoritative else "partial",
+                "ok" if snapshot_source_is_authoritative and not snapshot.warnings else "partial",
                 snapshot.source_timestamp or snapshot.observed_at,
                 _market_payload(snapshot, authoritative=snapshot_source_is_authoritative),
                 tuple(dict.fromkeys(market_warnings)),
@@ -1562,7 +1572,8 @@ def run_report(
                 ),
                 screening.warnings,
             )
-            status = "partial" if history_failures or screening.warnings else "ok"
+            incomplete_fields = "snapshot_screening_fields_incomplete" in snapshot.warnings
+            status = "partial" if history_failures or screening.warnings or incomplete_fields else "ok"
             modules["screening"] = ModuleResult(
                 "screening",
                 status,

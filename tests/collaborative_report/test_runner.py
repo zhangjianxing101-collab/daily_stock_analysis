@@ -267,6 +267,19 @@ def test_calendar_worker_timeout_stops_production_before_data_and_mail(tmp_path,
     deps.mail_sender.assert_not_called()
 
 
+def test_incomplete_supplement_marks_market_and_screening_partial(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.snapshot.frame.attrs.update(quarantined_row_count=1, screening_complete_count=1)
+    gateway.snapshot = replace(gateway.snapshot, warnings=("snapshot_screening_fields_incomplete",))
+    result = run_report(ReportMode.PREMARKET, deps=replace(deps, gateway=gateway),
+                        force=True, preview_only=True, output_dir=tmp_path)
+    assert result.modules["market"].status == "partial"
+    assert result.modules["market"].payload["无报价剔除记录"] == 1
+    assert result.modules["market"].payload["选股字段齐全记录"] == 1
+    assert result.modules["screening"].status == "partial"
+    deps.mail_sender.assert_not_called()
+
+
 def test_force_bypasses_only_window_gate(tmp_path, deps) -> None:
     session_builder = Mock(side_effect=deps.session_builder)
     stale_gateway = FakeGateway()
