@@ -328,7 +328,8 @@ def test_repeated_lowering_from_shared_input_does_not_cross_pollute_results():
     assert original["messages"][0]["content"] == "stable rules"
 
 
-def test_litellm_openai_prompt_cache_key_is_not_passed_through_without_verified_capture():
+@pytest.mark.parametrize("hints_enabled", [False, True])
+def test_litellm_request_omits_unverified_application_cache_hints(hints_enabled):
     sanitized_env = os.environ.copy()
     for key in (
         "OPENAI_API_KEY",
@@ -355,8 +356,15 @@ def test_litellm_openai_prompt_cache_key_is_not_passed_through_without_verified_
     script = textwrap.dedent(
         """
         import json
+        import sys
         import threading
         from http.server import BaseHTTPRequestHandler, HTTPServer
+        from types import SimpleNamespace
+
+        from src.llm.provider_cache import (
+            ProviderCacheRouteContext,
+            apply_prompt_cache_hints,
+        )
 
         try:
             import litellm
@@ -404,16 +412,33 @@ def test_litellm_openai_prompt_cache_key_is_not_passed_through_without_verified_
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
         try:
-            litellm.completion(
-                model="openai/test-model",
-                api_base=f"http://127.0.0.1:{server.server_port}/v1",
-                api_key="sk-test",
-                messages=[{"role": "user", "content": "hello"}],
-                prompt_cache_key="cache-key",
-                max_tokens=1,
-                timeout=5,
-                num_retries=0,
+            hints_enabled = sys.argv[1] == "true"
+            request = apply_prompt_cache_hints(
+                {
+                    "model": "openai/test-model",
+                    "api_base": f"http://127.0.0.1:{server.server_port}/v1",
+                    "api_key": "sk-test",
+                    "messages": [{"role": "user", "content": "hello"}],
+                    "max_tokens": 1,
+                    "timeout": 5,
+                    "num_retries": 0,
+                },
+                ProviderCacheRouteContext(
+                    model="openai/test-model",
+                    provider="openai",
+                    api_surface="chat_completions",
+                ),
+                SimpleNamespace(
+                    llm_prompt_cache_hints_enabled=hints_enabled,
+                    llm_prompt_cache_diagnostics_level="off",
+                ),
             )
+            assert not request.hint_applied
+            assert request.disabled_reason == (
+                "capability_not_verified" if hints_enabled else "hints_disabled"
+            )
+            assert "prompt_cache_key" not in request.call_kwargs
+            litellm.completion(**request.call_kwargs)
             if not request_seen.wait(timeout=10):
                 raise AssertionError("LiteLLM did not send request to local capture server")
         finally:
@@ -425,7 +450,7 @@ def test_litellm_openai_prompt_cache_key_is_not_passed_through_without_verified_
     )
 
     completed = subprocess.run(
-        [sys.executable, "-c", script],
+        [sys.executable, "-c", script, str(hints_enabled).lower()],
         capture_output=True,
         env=sanitized_env,
         text=True,
