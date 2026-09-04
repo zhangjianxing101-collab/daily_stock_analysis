@@ -524,7 +524,15 @@ jobs:
           RUNNER_EXIT="$runner_exit" OUTPUT_DIR="$OUTPUT_DIR" python - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
+
+          def safe_provider_diagnostics(stderr):
+              patterns = (
+                  r"A-share primary source: ths_(?:authentication_failed|configuration_missing|data_unavailable|network_failed|permission_denied|rate_limited|unavailable)",
+                  r"Daily bars stale: expected=\d{4}-\d{2}-\d{2} actual=\d{4}-\d{2}-\d{2}",
+              )
+              return sorted({line for line in stderr.splitlines() if any(re.fullmatch(pattern, line) for pattern in patterns)})
 
           result_path = Path(".workflow-artifacts/runner-result.json")
           try:
@@ -555,6 +563,11 @@ jobs:
           }
           if error_code is not None:
               diagnostic["error_code"] = error_code
+          try:
+              stderr = Path(".workflow-artifacts/runner-stderr.log").read_text(encoding="utf-8")
+          except (OSError, UnicodeError):
+              stderr = ""
+          diagnostic["provider_diagnostics"] = safe_provider_diagnostics(stderr)
           if report_root.is_dir():
               for manifest_path in sorted(report_root.glob("attempts/*/manifest.json"), reverse=True):
                   try:

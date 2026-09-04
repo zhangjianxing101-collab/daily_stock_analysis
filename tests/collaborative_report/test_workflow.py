@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import re
 from pathlib import Path
 
 import pytest
@@ -30,6 +31,20 @@ def _step(workflow: dict, name: str) -> dict:
 
 def _upload_steps(workflow: dict) -> list[dict]:
     return [step for step in _steps(workflow) if step.get("uses") == "actions/upload-artifact@v6"]
+
+
+def test_provider_diagnostics_exclude_raw_errors_and_secrets() -> None:
+    run = _step(_workflow(), "Run collaborative report")["run"]
+    script = run.split('RUNNER_EXIT="$runner_exit" OUTPUT_DIR="$OUTPUT_DIR" python - <<\'PY\'\n', 1)[1].split("\nPY", 1)[0]
+    function = next(node for node in ast.parse(script).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "safe_provider_diagnostics")
+    namespace = {"re": re}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "workflow-diagnostics", "exec"), namespace)
+    valid = ["A-share primary source: ths_authentication_failed",
+             "Daily bars stale: expected=2026-09-03 actual=2026-09-02"]
+    unsafe = ["token=secret", "https://private.example", valid[0] + " secret",
+              "Daily bars stale: expected=secret actual=secret"]
+    assert namespace["safe_provider_diagnostics"]("\n".join(valid + unsafe)) == valid
 
 
 @pytest.mark.parametrize("error_code,expected", [
