@@ -372,9 +372,15 @@ def test_omitted_generated_at_uses_session_identity_without_inventing_time() -> 
 
 
 def test_calendar_failure_suppresses_levels() -> None:
-    with patch(
-        "src.collaborative_report.session.exchange_calendars.get_calendar",
-        side_effect=RuntimeError("calendar down"),
+    with (
+        patch(
+            "src.collaborative_report.session.exchange_calendars.get_calendar",
+            side_effect=RuntimeError("calendar down"),
+        ),
+        patch(
+            "src.collaborative_report.session._akshare_xshg_sessions",
+            side_effect=RuntimeError("trading calendar unavailable"),
+        ),
     ):
         rendered = render_report(
             ReportMode.PREMARKET,
@@ -389,6 +395,32 @@ def test_calendar_failure_suppresses_levels() -> None:
     for output in (rendered.html, rendered.text):
         assert "交易日历不可用，仅供观察" in output
         assert "放量突破10.60" not in output
+
+
+def test_primary_calendar_failure_with_valid_fallback_preserves_levels() -> None:
+    with (
+        patch(
+            "src.collaborative_report.session.exchange_calendars.get_calendar",
+            side_effect=RuntimeError("calendar down"),
+        ),
+        patch(
+            "src.collaborative_report.session._akshare_xshg_sessions",
+            return_value=frozenset({date(2026, 8, 14), date(2026, 8, 17)}),
+        ),
+    ):
+        rendered = render_report(
+            ReportMode.PREMARKET,
+            date(2026, 8, 17),
+            modules={},
+            short_term_candidates=(
+                candidate(observed_at=datetime(2026, 8, 17, 8, 55, tzinfo=SHANGHAI)),
+            ),
+            generated_at=datetime(2026, 8, 17, 9, 0, tzinfo=SHANGHAI),
+        )
+
+    for output in (rendered.html, rendered.text):
+        assert "交易日历不可用，仅供观察" not in output
+        assert "放量突破10.60" in output
 
 
 def test_html_and_text_share_complete_disclaimer_content() -> None:
