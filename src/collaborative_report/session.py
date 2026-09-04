@@ -1,8 +1,13 @@
 """Trading-session identity and delivery-window gating for reports."""
 
+import json
+import re
+import subprocess
+import sys
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
 from functools import lru_cache
+from pathlib import Path
 from zoneinfo import ZoneInfo
 
 import exchange_calendars
@@ -16,6 +21,8 @@ _DELIVERY_WINDOWS = {
     ReportMode.POSTMARKET: (time(16, 0), time(18, 30)),
 }
 _XSHG_CLOSE = time(15, 0)
+_AKSHARE_WORKER_PATH = Path(__file__).with_name("calendar_worker.py").resolve()
+_ISO_DATE_PATTERN = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 
 @dataclass(frozen=True)
@@ -42,30 +49,57 @@ def _xshg_calendar():
         raise RuntimeError("trading calendar unavailable") from exc
 
 
-@lru_cache(maxsize=1)
-def _akshare_xshg_sessions() -> frozenset[date]:
-    """Load only explicit China trading dates when the bundled calendar lacks coverage."""
+def _akshare_session_date(value: object) -> date:
+    if not isinstance(value, str) or not _ISO_DATE_PATTERN.fullmatch(value):
+        raise ValueError("AkShare session date must be YYYY-MM-DD")
+    return date.fromisoformat(value)
+
+
+def _load_akshare_xshg_sessions() -> frozenset[date]:
+    """Load validated explicit China trading dates through a bounded worker."""
 
     try:
-        import akshare
-
-        frame = akshare.tool_trade_date_hist_sina()
-        values = frame["trade_date"].tolist()
-        sessions = frozenset(
-            value.date()
-            if isinstance(value, datetime)
-            else (value if isinstance(value, date) else date.fromisoformat(str(value)[:10]))
-            for value in values
+        completed = subprocess.run(
+            [sys.executable, str(_AKSHARE_WORKER_PATH)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=30,
         )
-    except Exception as exc:
+        values = json.loads(completed.stdout)
+        if not isinstance(values, list):
+            raise ValueError("AkShare worker output must be a list")
+        sessions = frozenset(_akshare_session_date(value) for value in values)
+    except (OSError, subprocess.SubprocessError, ValueError, TypeError) as exc:
         raise RuntimeError("trading calendar unavailable") from exc
     if not sessions:
         raise RuntimeError("trading calendar unavailable")
     return sessions
 
 
-def _fallback_session_on_or_before(target: date) -> date:
+@lru_cache(maxsize=2)
+def _akshare_xshg_sessions_for_local_date(cache_date: date) -> frozenset[date]:
+    """Cache the fallback dataset only for the current and prior Shanghai dates."""
+
+    return _load_akshare_xshg_sessions()
+
+
+def _akshare_xshg_sessions(current_time: datetime | None = None) -> frozenset[date]:
+    """Return fallback sessions, refreshing automatically when Shanghai date changes."""
+
+    return _akshare_xshg_sessions_for_local_date(_shanghai_time(current_time).date())
+
+
+def _fallback_sessions_covering(target: date) -> frozenset[date]:
     sessions = _akshare_xshg_sessions()
+    if not sessions or not min(sessions) <= target <= max(sessions):
+        raise RuntimeError("trading calendar unavailable")
+    return sessions
+
+
+def _fallback_session_on_or_before(target: date) -> date:
+    sessions = _fallback_sessions_covering(target)
     eligible = [session for session in sessions if session <= target]
     if not eligible:
         raise RuntimeError("trading calendar unavailable")
@@ -77,7 +111,8 @@ def _fallback_report_data_session(
     report_date: date,
     generated_at: datetime | None,
 ) -> date:
-    sessions = _akshare_xshg_sessions()
+    coverage_target = report_date if mode is ReportMode.POSTMARKET else report_date - timedelta(days=1)
+    sessions = _fallback_sessions_covering(coverage_target)
     if mode is ReportMode.POSTMARKET:
         if report_date not in sessions:
             raise RuntimeError("report date is not an XSHG session")
@@ -107,6 +142,8 @@ def _latest_completed_session(calendar, current_time: datetime) -> date:
 def latest_completed_xshg_session(current_time: datetime) -> date:
     """Return the latest XSHG session closed by an actual aware instant."""
 
+    if current_time.tzinfo is None or current_time.utcoffset() is None:
+        raise ValueError("current_time must be timezone-aware")
     try:
         return _latest_completed_session(_xshg_calendar(), current_time)
     except RuntimeError:
@@ -164,8 +201,8 @@ def build_report_session(
     trading_date = now_shanghai.date()
     try:
         is_trading_day = bool(_xshg_calendar().is_session(trading_date))
-    except RuntimeError:
-        is_trading_day = trading_date in _akshare_xshg_sessions()
+    except (RuntimeError, ValueError):
+        is_trading_day = trading_date in _fallback_sessions_covering(trading_date)
 
     if scheduled and is_trading_day:
         window_start, window_end = _DELIVERY_WINDOWS[mode]

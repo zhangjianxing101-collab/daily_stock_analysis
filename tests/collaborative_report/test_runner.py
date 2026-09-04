@@ -1,6 +1,7 @@
 import json
 import runpy
 import stat
+import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
@@ -241,6 +242,28 @@ def test_incomplete_postmarket_data_has_a_distinct_safe_error_code(tmp_path, dep
     assert result.exit_code == EXIT_FAILURE
     assert result.final_state is FinalState.HARD_FAILURE
     assert result.error_code == "report_data_incomplete"
+    deps.mail_sender.assert_not_called()
+
+
+def test_calendar_worker_timeout_stops_production_before_data_and_mail(tmp_path, deps) -> None:
+    from src.collaborative_report import session as sessions
+
+    gateway = Mock()
+    local = replace(deps, session_builder=build_report_session, gateway=gateway)
+    sessions._akshare_xshg_sessions_for_local_date.cache_clear()
+    try:
+        with (
+            patch.object(sessions, "_xshg_calendar", side_effect=RuntimeError("unavailable")),
+            patch.object(sessions.subprocess, "run", side_effect=subprocess.TimeoutExpired("calendar", 30)),
+        ):
+            result = run_report(ReportMode.POSTMARKET, deps=local, output_dir=tmp_path)
+    finally:
+        sessions._akshare_xshg_sessions_for_local_date.cache_clear()
+
+    assert result.exit_code == EXIT_FAILURE
+    assert result.final_state is FinalState.HARD_FAILURE
+    assert result.error_code == "calendar_unavailable"
+    gateway.get_a_share_snapshot.assert_not_called()
     deps.mail_sender.assert_not_called()
 
 
