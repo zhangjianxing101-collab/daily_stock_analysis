@@ -48,6 +48,34 @@ _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING = "快照来源时间不可用，所�
 _REPORT_KEY_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})-(premarket|postmarket)")
 _POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=4)
 _PREMARKET_MAX_SOURCE_AGE = timedelta(days=4)
+_DATA_FAILURE_CODES = {
+    "stale snapshot": "snapshot_acquisition_time_invalid",
+    "THS source timestamp is in the future": "ths_timestamp_future",
+    "THS source timestamp invalid": "ths_timestamp_invalid",
+    "THS snapshot data invalid": "ths_snapshot_invalid",
+    "THS snapshot missing required fields": "ths_snapshot_fields_missing",
+    "THS snapshot contains unsafe prices": "ths_snapshot_prices_invalid",
+    "THS snapshot contains duplicate codes": "ths_snapshot_duplicate_codes",
+    "THS snapshot contains invalid values": "ths_snapshot_values_invalid",
+    "snapshot provider unavailable": "snapshot_provider_unavailable",
+    "snapshot provider returned empty data": "snapshot_provider_empty",
+    "provider acquisition clock invalid": "provider_clock_invalid",
+    "market calendar unavailable": "market_calendar_unavailable",
+    "gold provider unavailable": "gold_provider_unavailable",
+    "gold provider returned empty data": "gold_provider_empty",
+    "daily bars insufficient": "daily_bars_insufficient",
+    "daily bars invalid dates": "daily_bars_invalid_dates",
+    "daily bars duplicate dates": "daily_bars_duplicate_dates",
+    "daily bars non-monotonic dates": "daily_bars_unordered",
+    "daily bars future dates": "daily_bars_future_dates",
+    "daily bars invalid ohlc": "daily_bars_invalid_ohlc",
+    "daily bars invalid volume": "daily_bars_invalid_volume",
+    "daily bars missing columns": "daily_bars_missing_columns",
+    "daily bars stale": "daily_bars_stale",
+}
+_SAFE_DATA_FAILURE_CODES = frozenset(_DATA_FAILURE_CODES.values()) | {
+    "snapshot_data_failed", "gold_data_failed", "gold_analysis_failed",
+}
 
 
 class FinalState(str, Enum):
@@ -444,6 +472,13 @@ def _unavailable(name: str, observed_at: datetime, warning: str) -> ModuleResult
     return ModuleResult(name=name, status="unavailable", observed_at=observed_at, payload={}, warnings=(warning,))
 
 
+def _data_unavailable(
+    name: str, observed_at: datetime, warning: str, error: Exception, fallback: str,
+) -> ModuleResult:
+    code = _DATA_FAILURE_CODES.get(str(error), fallback)
+    return ModuleResult(name, "unavailable", observed_at, {}, (warning, code))
+
+
 def _module(name: str, observed_at: datetime, payload: Mapping[str, Any], *warnings: str) -> ModuleResult:
     return ModuleResult(name=name, status="ok", observed_at=observed_at, payload=payload, warnings=tuple(warnings))
 
@@ -645,11 +680,31 @@ def _ths_evidence(
     )
 
 
-def _snapshot_fetch_is_current(dataset: MarketDataset, session: ReportSession) -> bool:
+def _snapshot_fetch_is_current(
+    dataset: MarketDataset,
+    session: ReportSession,
+    *,
+    checked_at: datetime | None = None,
+) -> bool:
     observed_at = dataset.observed_at
+    checked = checked_at if checked_at is not None else session.now_shanghai
+    if (
+        observed_at.tzinfo is None
+        or observed_at.utcoffset() is None
+        or checked.tzinfo is None
+        or checked.utcoffset() is None
+        or session.now_shanghai.tzinfo is None
+        or session.now_shanghai.utcoffset() is None
+    ):
+        return False
+    observed_local = observed_at.astimezone(SHANGHAI_TIMEZONE)
+    checked_local = checked.astimezone(SHANGHAI_TIMEZONE)
+    session_start = session.now_shanghai.astimezone(SHANGHAI_TIMEZONE)
     return (
-        observed_at <= session.now_shanghai
-        and observed_at.astimezone(session.now_shanghai.tzinfo).date() == session.trading_date
+        observed_local <= checked_local
+        and observed_local.date() == session.trading_date
+        and checked_local.date() == session.trading_date
+        and checked_local >= session_start
     )
 
 
@@ -658,11 +713,31 @@ def _snapshot_source_is_authoritative(
     session: ReportSession,
     *,
     expected_session: date,
+    checked_at: datetime | None = None,
 ) -> bool:
     source = dataset.source_timestamp
-    if source is None or source > session.now_shanghai:
+    observed_at = dataset.observed_at
+    checked = checked_at if checked_at is not None else session.now_shanghai
+    if (
+        source is None
+        or source.tzinfo is None
+        or source.utcoffset() is None
+        or observed_at.tzinfo is None
+        or observed_at.utcoffset() is None
+        or checked.tzinfo is None
+        or checked.utcoffset() is None
+        or session.now_shanghai.tzinfo is None
+        or session.now_shanghai.utcoffset() is None
+    ):
         return False
     local = source.astimezone(SHANGHAI_TIMEZONE)
+    observed_local = observed_at.astimezone(SHANGHAI_TIMEZONE)
+    checked_local = checked.astimezone(SHANGHAI_TIMEZONE)
+    session_start = session.now_shanghai.astimezone(SHANGHAI_TIMEZONE)
+    if local > observed_local or local > checked_local:
+        return False
+    if checked_local.date() != session.trading_date or checked_local < session_start:
+        return False
     if local.date() != expected_session or local.time() < time(15, 0):
         return False
     maximum_age = (
@@ -670,7 +745,7 @@ def _snapshot_source_is_authoritative(
         if session.mode is ReportMode.POSTMARKET
         else _PREMARKET_MAX_SOURCE_AGE
     )
-    return session.now_shanghai - local <= maximum_age
+    return checked_local - local <= maximum_age
 
 
 def _portfolio_prices(snapshot: MarketDataset, positions: Sequence[Position]) -> dict[str, float]:
@@ -1090,7 +1165,7 @@ def _warning_codes(modules: Mapping[str, ModuleResult]) -> list[str]:
         for index, warning in enumerate(result.warnings, start=1):
             codes.append(
                 warning
-                if warning == _PRICE_CONFLICT_WARNING_CODE
+                if warning == _PRICE_CONFLICT_WARNING_CODE or warning in _SAFE_DATA_FAILURE_CODES
                 else f"{name}_warning_{index}"
             )
     return codes
@@ -1132,7 +1207,9 @@ def _redacted_manifest(
     portfolio_codes: set[str],
     test_email: bool,
     market_source_timestamp: str,
+    generated_at: datetime | None = None,
 ) -> dict[str, Any]:
+    generated = generated_at if generated_at is not None else session.now_shanghai
     source_timestamps = {
         name: result.observed_at.isoformat() for name, result in modules.items()
     }
@@ -1143,7 +1220,7 @@ def _redacted_manifest(
         "report_key": session.report_key,
         "mode": session.mode.value,
         "trading_date": session.trading_date.isoformat(),
-        "generated_at": session.now_shanghai.isoformat(),
+        "generated_at": generated.isoformat(),
         "final_state": final_state,
         "test_email": test_email,
         "module_statuses": {name: result.status for name, result in modules.items()},
@@ -1207,6 +1284,28 @@ def _session_identity_is_valid(session: ReportSession, mode: ReportMode) -> bool
     )
 
 
+def _clock_checkpoint(
+    session: ReportSession,
+    checked_at: datetime,
+    *,
+    previous: datetime,
+) -> datetime | None:
+    """Return a monotonic in-session Shanghai checkpoint, or fail closed."""
+
+    if (
+        checked_at.tzinfo is None
+        or checked_at.utcoffset() is None
+        or previous.tzinfo is None
+        or previous.utcoffset() is None
+    ):
+        return None
+    current = checked_at.astimezone(SHANGHAI_TIMEZONE)
+    prior = previous.astimezone(SHANGHAI_TIMEZONE)
+    if current.date() != session.trading_date or current < prior:
+        return None
+    return current
+
+
 def run_report(
     mode: ReportMode,
     *,
@@ -1224,7 +1323,10 @@ def run_report(
         return _failure("preview_test_email_conflict")
     normalized_mode = ReportMode(mode)
     active = deps or default_dependencies()
-    now = active.clock()
+    try:
+        now = active.clock()
+    except Exception:
+        return _failure("report_clock_invalid")
     try:
         session = active.session_builder(normalized_mode, now, scheduled=not force)
     except Exception as exc:
@@ -1232,6 +1334,9 @@ def run_report(
         return _failure(code)
     if not _session_identity_is_valid(session, normalized_mode):
         return _failure("report_identity_invalid")
+    checkpoint = _clock_checkpoint(session, now, previous=session.now_shanghai)
+    if checkpoint is None:
+        return _failure("report_clock_invalid", report_key=session.report_key)
     if not session.is_trading_day:
         return RunResult(EXIT_SUCCESS, FinalState.NON_TRADING_DAY_SKIP, session.report_key, {})
     ledger = None
@@ -1326,30 +1431,46 @@ def run_report(
     market_source_timestamp = "unavailable"
     try:
         snapshot = active.gateway.get_a_share_snapshot()
-        if not _snapshot_fetch_is_current(snapshot, session):
-            raise ValueError("stale snapshot")
-        snapshot_source_is_authoritative = _snapshot_source_is_authoritative(
-            snapshot,
-            session,
-            expected_session=expected_session,
-        )
-        if snapshot_source_is_authoritative and snapshot.source_timestamp is not None:
-            market_source_timestamp = snapshot.source_timestamp.isoformat()
-        market_warnings = snapshot.warnings
-        if not snapshot_source_is_authoritative:
-            market_warnings = (*market_warnings, _SNAPSHOT_AUTHORITY_WARNING_CODE)
-            if snapshot.source_timestamp is None:
-                market_warnings = (*market_warnings, _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING)
-        modules["market"] = ModuleResult(
-            "market",
-            "ok" if snapshot_source_is_authoritative else "partial",
-            snapshot.source_timestamp or snapshot.observed_at,
-            _market_payload(snapshot, authoritative=snapshot_source_is_authoritative),
-            tuple(dict.fromkeys(market_warnings)),
-        )
-    except Exception:
+    except Exception as exc:
         snapshot = None
-        modules["market"] = _unavailable("market", session.now_shanghai, "数据不足，建议观望")
+        modules["market"] = _data_unavailable(
+            "market", session.now_shanghai, "数据不足，建议观望", exc, "snapshot_data_failed",
+        )
+    else:
+        try:
+            checkpoint = _clock_checkpoint(session, active.clock(), previous=checkpoint)
+        except Exception:
+            return _failure("report_clock_invalid", report_key=session.report_key, modules=modules)
+        if checkpoint is None:
+            return _failure("report_clock_invalid", report_key=session.report_key, modules=modules)
+        try:
+            if not _snapshot_fetch_is_current(snapshot, session, checked_at=checkpoint):
+                raise ValueError("stale snapshot")
+            snapshot_source_is_authoritative = _snapshot_source_is_authoritative(
+                snapshot,
+                session,
+                expected_session=expected_session,
+                checked_at=checkpoint,
+            )
+            if snapshot_source_is_authoritative and snapshot.source_timestamp is not None:
+                market_source_timestamp = snapshot.source_timestamp.isoformat()
+            market_warnings = snapshot.warnings
+            if not snapshot_source_is_authoritative:
+                market_warnings = (*market_warnings, _SNAPSHOT_AUTHORITY_WARNING_CODE)
+                if snapshot.source_timestamp is None:
+                    market_warnings = (*market_warnings, _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING)
+            modules["market"] = ModuleResult(
+                "market",
+                "ok" if snapshot_source_is_authoritative else "partial",
+                snapshot.source_timestamp or snapshot.observed_at,
+                _market_payload(snapshot, authoritative=snapshot_source_is_authoritative),
+                tuple(dict.fromkeys(market_warnings)),
+            )
+        except Exception as exc:
+            snapshot = None
+            modules["market"] = _data_unavailable(
+                "market", session.now_shanghai, "数据不足，建议观望", exc, "snapshot_data_failed",
+            )
 
     portfolio_codes = {position.code for position in settings.positions}
     prices = _portfolio_prices(snapshot, settings.positions) if snapshot is not None else {}
@@ -1505,12 +1626,16 @@ def run_report(
         tuple(dict.fromkeys(backtest_warnings)) or (() if backtest_payload else ("策略回测暂不可用",)),
     )
 
+    gold_failure_stage = "gold_data_failed"
     try:
         gold_data = active.gateway.get_gold_bars()
+        gold_failure_stage = "gold_analysis_failed"
         gold = active.gold_analyzer(gold_data.frame, capital=settings.capital_cny)
         modules["gold"] = _module("gold", gold_data.observed_at, _as_payload(gold), *gold_data.warnings)
-    except Exception:
-        modules["gold"] = _unavailable("gold", session.now_shanghai, "黄金模块暂不可用")
+    except Exception as exc:
+        modules["gold"] = _data_unavailable(
+            "gold", session.now_shanghai, "黄金模块暂不可用", exc, gold_failure_stage,
+        )
 
     ai_codes = tuple(
         code
@@ -1608,6 +1733,20 @@ def run_report(
         )
 
     try:
+        generated_at = _clock_checkpoint(session, active.clock(), previous=checkpoint)
+    except Exception:
+        return _failure("report_clock_invalid", report_key=session.report_key, modules=modules)
+    if generated_at is None:
+        return _failure("report_clock_invalid", report_key=session.report_key, modules=modules)
+    checkpoint = generated_at
+    if snapshot_source_is_authoritative and not _snapshot_source_is_authoritative(
+        snapshot,
+        session,
+        expected_session=expected_session,
+        checked_at=generated_at,
+    ):
+        return _failure("snapshot_source_expired", report_key=session.report_key, modules=modules)
+    try:
         rendered = active.renderer(
             normalized_mode,
             session.trading_date,
@@ -1616,10 +1755,16 @@ def run_report(
             swing_candidates=screening.swing,
             morning_candidates=morning_candidates,
             subject_prefix=_TEST_SUBJECT_PREFIX if test_email else None,
-            generated_at=session.now_shanghai,
+            generated_at=generated_at,
         )
     except Exception:
         return _failure("report_render_failed", report_key=session.report_key, modules=modules)
+    try:
+        checkpoint = _clock_checkpoint(session, active.clock(), previous=checkpoint)
+    except Exception:
+        return _failure("report_clock_invalid", report_key=session.report_key, modules=modules)
+    if checkpoint is None:
+        return _failure("report_clock_invalid", report_key=session.report_key, modules=modules)
 
     final_state = FinalState.PREVIEWED if preview_only else (FinalState.TEST_SENT if test_email else FinalState.SENT)
     try:
@@ -1633,6 +1778,7 @@ def run_report(
             portfolio_codes=portfolio_codes,
             test_email=test_email,
             market_source_timestamp=market_source_timestamp,
+            generated_at=generated_at,
         )
         paths = artifact_writer(
             output_dir,
@@ -1643,6 +1789,19 @@ def run_report(
         )
     except Exception:
         return _failure("artifact_write_failed", report_key=session.report_key, modules=modules)
+    try:
+        checkpoint = _clock_checkpoint(session, active.clock(), previous=checkpoint)
+    except Exception:
+        return _failure("report_clock_invalid", report_key=session.report_key, modules=modules, paths=paths)
+    if checkpoint is None:
+        return _failure("report_clock_invalid", report_key=session.report_key, modules=modules, paths=paths)
+    if snapshot_source_is_authoritative and not _snapshot_source_is_authoritative(
+        snapshot,
+        session,
+        expected_session=expected_session,
+        checked_at=checkpoint,
+    ):
+        return _failure("snapshot_source_expired", report_key=session.report_key, modules=modules, paths=paths)
 
     if preview_only:
         manifest = dict(
@@ -1672,7 +1831,7 @@ def run_report(
         try:
             claim_id = ledger.claim(
                 session.report_key,
-                session.now_shanghai,
+                checkpoint,
                 attempt_id=paths.attempt_id,
             )
             if claim_id is None:
@@ -1683,7 +1842,7 @@ def run_report(
                     "delivery_reconciliation_required",
                     report_key=session.report_key,
                 )
-            ledger.begin_sending(session.report_key, claim_id, session.now_shanghai)
+            ledger.begin_sending(session.report_key, claim_id, checkpoint)
         except Exception:
             return _failure(
                 "delivery_state_unavailable",

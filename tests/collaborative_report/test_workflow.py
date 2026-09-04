@@ -2,8 +2,11 @@
 
 from __future__ import annotations
 
+import ast
+import re
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -28,6 +31,45 @@ def _step(workflow: dict, name: str) -> dict:
 
 def _upload_steps(workflow: dict) -> list[dict]:
     return [step for step in _steps(workflow) if step.get("uses") == "actions/upload-artifact@v6"]
+
+
+def test_provider_diagnostics_exclude_raw_errors_and_secrets() -> None:
+    run = _step(_workflow(), "Run collaborative report")["run"]
+    script = run.split('RUNNER_EXIT="$runner_exit" OUTPUT_DIR="$OUTPUT_DIR" python - <<\'PY\'\n', 1)[1].split("\nPY", 1)[0]
+    function = next(node for node in ast.parse(script).body
+                    if isinstance(node, ast.FunctionDef) and node.name == "safe_provider_diagnostics")
+    namespace = {"re": re}
+    exec(compile(ast.Module(body=[function], type_ignores=[]), "workflow-diagnostics", "exec"), namespace)
+    valid = ["A-share primary source: ths_authentication_failed",
+             "A-share primary source: ths_credential_encoding_failed",
+             "A-share primary source: ths_tls_failed",
+             "Daily bars stale: expected=2026-09-03 actual=2026-09-02"]
+    unsafe = ["token=secret", "https://private.example", valid[0] + " secret",
+              "Daily bars stale: expected=secret actual=secret"]
+    assert namespace["safe_provider_diagnostics"]("\n".join(valid + unsafe)) == valid
+
+
+@pytest.mark.parametrize("error_code,expected", [
+    ("report_clock_invalid", False),
+    ("snapshot_source_expired", False),
+    (None, True),
+])
+def test_invalidated_reports_are_not_uploaded(tmp_path, error_code, expected) -> None:
+    run = _step(_workflow(), "Run collaborative report")["run"]
+    script = run.split('RUNNER_EXIT="$runner_exit" OUTPUT_DIR="$OUTPUT_DIR" python - <<\'PY\'\n', 1)[1].split("\nPY", 1)[0]
+    assignments = [
+        node for node in ast.parse(script).body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id in {"report_invalidated", "report_available"}
+                for target in node.targets)
+    ]
+    assert len(assignments) == 2
+    attempt = tmp_path / "attempts" / "current"
+    attempt.mkdir(parents=True)
+    (attempt / "report.html").write_text("report", encoding="utf-8")
+    namespace = {"error_code": error_code, "report_root": tmp_path}
+    exec(compile(ast.Module(body=assignments, type_ignores=[]), "workflow-upload-gate", "exec"), namespace)
+    assert namespace["report_available"] is expected
 
 
 def _production_prior_candidates(artifacts: list[dict], artifact_name: str) -> list[dict]:
@@ -460,7 +502,6 @@ def test_workflow_maps_secrets_and_variables_without_literal_personal_data() -> 
         "EMAIL_PASSWORD",
         "EMAIL_RECEIVERS",
         "COLLAB_PORTFOLIO_JSON",
-        "THS_API_KEY",
         "ANSPIRE_API_KEYS",
         "GEMINI_API_KEY",
         "GEMINI_API_KEYS",
@@ -487,6 +528,8 @@ def test_workflow_maps_secrets_and_variables_without_literal_personal_data() -> 
     }
     for key in secret_values:
         assert env[key] == f"${{{{ secrets.{key} }}}}"
+
+    assert env["THS_API_KEY"] == "${{ secrets.THS_API_KEY || secrets.THS }}"
 
     assert env["COLLAB_CAPITAL_CNY"] == "${{ vars.COLLAB_CAPITAL_CNY || '20000' }}"
     assert env["COLLAB_RISK_FRACTION"] == "${{ vars.COLLAB_RISK_FRACTION || '0.02' }}"

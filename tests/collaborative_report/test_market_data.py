@@ -130,9 +130,61 @@ def test_ths_full_snapshot_reads_all_pages_before_returning_data() -> None:
     ]
 
 
-def test_ths_snapshot_recoverable_failure_uses_existing_source_with_warning() -> None:
+@pytest.mark.parametrize("kind", ["snapshot", "daily", "hot_list", "index"])
+def test_ths_validates_source_time_at_response_receipt(kind: str) -> None:
     client = Mock()
-    client.a_share_snapshot.side_effect = ThsNetworkError("THS network request failed")
+    source_time = OBSERVED_AT + timedelta(seconds=1)
+    received_at = OBSERVED_AT + timedelta(seconds=2)
+    response = ths_response(
+        ths_bar_items() if kind in {"daily", "index"} else [ths_snapshot_item()],
+        int(source_time.timestamp() * 1000),
+    )
+    client.a_share_snapshot.return_value = response
+    client.a_share_historical.return_value = response
+    client.hot_stock_list.return_value = response
+    client.index_historical.return_value = response
+    gateway = MarketDataGateway(ths_client=client, clock=Mock(side_effect=[OBSERVED_AT, received_at]))
+    if kind == "snapshot":
+        result = gateway.get_a_share_snapshot(["600000"])
+    elif kind == "daily":
+        result = gateway.get_daily_bars("600000", SESSION)
+    elif kind == "index":
+        result = gateway.get_ths_index_bars("886042.TI", SESSION)
+    else:
+        result = gateway.get_ths_hot_stock_list()
+    assert result.observed_at == received_at
+    assert result.source_timestamp == source_time
+
+
+def test_ths_pagination_rejects_future_page_before_requesting_next_page() -> None:
+    client = Mock()
+    response = ThsApiResponse({
+        "timestamp": int((OBSERVED_AT + timedelta(seconds=3)).timestamp() * 1000),
+        "total": 2,
+        "item": [ths_snapshot_item()],
+    }, None)
+    client.a_share_snapshot.return_value = response
+    gateway = MarketDataGateway(
+        ths_client=client,
+        clock=Mock(side_effect=[OBSERVED_AT, OBSERVED_AT + timedelta(seconds=1)]),
+    )
+    with pytest.raises(ValueError, match="THS source timestamp is in the future"):
+        gateway.get_a_share_snapshot()
+    assert client.a_share_snapshot.call_count == 1
+
+
+@pytest.mark.parametrize("received_at", [OBSERVED_AT - timedelta(seconds=1), OBSERVED_AT.replace(tzinfo=None)])
+def test_ths_rejects_invalid_receipt_clock(received_at: datetime) -> None:
+    client = Mock()
+    client.a_share_snapshot.return_value = ths_response([ths_snapshot_item()])
+    gateway = MarketDataGateway(ths_client=client, clock=Mock(side_effect=[OBSERVED_AT, received_at]))
+    with pytest.raises(ValueError, match="provider acquisition clock invalid"):
+        gateway.get_a_share_snapshot(["600000"])
+
+
+def test_ths_snapshot_recoverable_failure_uses_existing_source_with_warning(caplog) -> None:
+    client = Mock()
+    client.a_share_snapshot.side_effect = ThsNetworkError("https://private.example/?token=private-key")
     fallback = Mock(return_value=pd.DataFrame({"代码": ["000001"], "名称": ["A"], "最新价": [10]}))
     gateway = MarketDataGateway(ths_client=client, snapshot_fetcher=fallback, clock=lambda: OBSERVED_AT)
 
@@ -141,6 +193,9 @@ def test_ths_snapshot_recoverable_failure_uses_existing_source_with_warning() ->
     fallback.assert_called_once_with()
     assert result.source == "akshare.stock_zh_a_spot_em"
     assert result.warnings == ("THS unavailable; existing snapshot source used", "snapshot source timestamp unavailable")
+    assert "ths_network_failed" in caplog.text
+    assert "private-key" not in caplog.text
+    assert "private.example" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -712,6 +767,7 @@ def test_get_gold_bars_calls_yfinance_and_normalizes_ohlcv() -> None:
     download.assert_called_once_with(
         "GC=F",
         period="10y",
+        end="2026-08-19",
         interval="1d",
         auto_adjust=False,
         progress=False,
@@ -778,17 +834,32 @@ def test_get_gold_bars_rejects_incomplete_row_before_futures_cutoff() -> None:
 
 
 def test_get_gold_bars_accepts_local_date_after_futures_cutoff() -> None:
+    download = Mock(return_value=daily_bars(end="2026-08-19"))
     gateway = MarketDataGateway(
-        yfinance_download=lambda *args, **kwargs: daily_bars(end="2026-08-19"),
+        yfinance_download=download,
         clock=lambda: datetime(2026, 8, 19, 22, 1, tzinfo=timezone.utc),
     )
 
     result = gateway.get_gold_bars()
 
+    assert download.call_args.kwargs["end"] == "2026-08-20"
     assert result.frame.iloc[-1]["date"].date() == date(2026, 8, 19)
 
 
-def test_get_gold_bars_rejects_stale_history() -> None:
+def test_get_gold_bars_does_not_download_when_calendar_is_unavailable() -> None:
+    download = Mock()
+    gateway = MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT)
+
+    with (
+        patch("src.collaborative_report.market_data.exchange_calendars.get_calendar", side_effect=RuntimeError),
+        pytest.raises(ValueError, match="^market calendar unavailable$"),
+    ):
+        gateway.get_gold_bars()
+
+    download.assert_not_called()
+
+
+def test_get_gold_bars_rejects_stale_history(caplog) -> None:
     gateway = MarketDataGateway(
         yfinance_download=lambda *args, **kwargs: daily_bars(end="2026-07-31"),
         clock=lambda: OBSERVED_AT,
@@ -796,6 +867,67 @@ def test_get_gold_bars_rejects_stale_history() -> None:
 
     with pytest.raises(ValueError, match="^daily bars stale$"):
         gateway.get_gold_bars()
+    assert "actual=2026-07-31" in caplog.text
+    assert "expected=" in caplog.text
+
+
+@pytest.mark.parametrize("first", ["stale", "empty", "timeout", "connection"])
+def test_gold_history_bounded_retry_recovers_only_complete_series(first) -> None:
+    complete = daily_bars(end="2026-08-18")
+    first_result = {
+        "stale": daily_bars(end="2026-08-17"), "empty": pd.DataFrame(),
+        "timeout": TimeoutError(), "connection": ConnectionError(),
+    }[first]
+    download = Mock(side_effect=[first_result, complete])
+    result = MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT).get_gold_bars()
+    assert download.call_count == 2
+    assert download.call_args_list[0].kwargs["end"] == download.call_args_list[1].kwargs["end"] == "2026-08-19"
+    assert download.call_args_list[1].kwargs["start"] == "2016-08-18"
+    assert "period" not in download.call_args_list[1].kwargs
+    assert result.frame.iloc[-1]["date"].date() == date(2026, 8, 18)
+    assert result.warnings == ("gold history recovered after bounded retry",)
+
+
+def test_gold_history_retry_does_not_change_analysis_window() -> None:
+    complete = daily_bars(end="2026-08-18")
+    padding = complete.iloc[[0]].assign(Date=pd.Timestamp("2016-08-18"))
+    padded = pd.concat([padding, complete], ignore_index=True)
+    primary = MarketDataGateway(yfinance_download=Mock(return_value=complete), clock=lambda: OBSERVED_AT).get_gold_bars()
+    retry = MarketDataGateway(
+        yfinance_download=Mock(side_effect=[pd.DataFrame(), padded]), clock=lambda: OBSERVED_AT,
+    ).get_gold_bars()
+    pd.testing.assert_frame_equal(primary.frame, retry.frame)
+
+
+def test_gold_history_retry_validates_padding_before_removing_it() -> None:
+    complete = daily_bars(end="2026-08-18")
+    invalid_padding = complete.iloc[[0]].assign(Date=pd.Timestamp("2016-08-18"), Volume=-1)
+    download = Mock(side_effect=[pd.DataFrame(), pd.concat([invalid_padding, complete], ignore_index=True)])
+    with pytest.raises(ValueError, match="daily bars invalid volume"):
+        MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT).get_gold_bars()
+    assert download.call_count == 2
+
+
+def test_gold_history_stale_retry_remains_unavailable() -> None:
+    download = Mock(return_value=daily_bars(end="2026-08-17"))
+    with pytest.raises(ValueError, match="daily bars stale"):
+        MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT).get_gold_bars()
+    assert download.call_count == 2
+
+
+@pytest.mark.parametrize("fault", ["volume", "future", "insufficient"])
+def test_gold_history_integrity_failure_never_triggers_retry(fault) -> None:
+    frame = daily_bars(end="2026-08-18")
+    if fault == "volume":
+        frame = frame.assign(Volume=-1)
+    elif fault == "future":
+        frame = daily_bars(end="2026-08-19")
+    else:
+        frame = frame.iloc[:59]
+    download = Mock(return_value=frame)
+    with pytest.raises(ValueError):
+        MarketDataGateway(yfinance_download=download, clock=lambda: OBSERVED_AT).get_gold_bars()
+    download.assert_called_once()
 
 
 def test_market_dataset_requires_timezone_aware_observation() -> None:

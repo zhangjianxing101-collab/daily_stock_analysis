@@ -5,7 +5,7 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
@@ -624,6 +624,42 @@ def test_real_gold_result_projects_without_losing_immutable_risk_checks(tmp_path
     assert result.modules["gold"].payload["risk_checks"]["single_trade_risk_limit"] == 0.02
 
 
+@pytest.mark.parametrize("message,expected", [
+    ("daily bars stale", "daily_bars_stale"),
+    ("daily bars invalid ohlc", "daily_bars_invalid_ohlc"),
+    ("THS source timestamp is in the future", "ths_timestamp_future"),
+    ("THS source timestamp invalid", "ths_timestamp_invalid"),
+    ("THS snapshot missing required fields", "ths_snapshot_fields_missing"),
+    ("THS snapshot contains unsafe prices", "ths_snapshot_prices_invalid"),
+    ("THS snapshot contains duplicate codes", "ths_snapshot_duplicate_codes"),
+    ("THS snapshot contains invalid values", "ths_snapshot_values_invalid"),
+    ("provider acquisition clock invalid", "provider_clock_invalid"),
+    ("https://private.invalid/?token=secret", "gold_data_failed"),
+])
+def test_gold_failure_diagnostics_are_allowlisted(tmp_path, deps, message, expected) -> None:
+    from src.collaborative_report.runner import _warning_codes
+
+    deps.gateway.get_gold_bars = Mock(side_effect=ValueError(message))
+    result = run_report(ReportMode.POSTMARKET, deps=deps, preview_only=True, output_dir=tmp_path)
+
+    assert expected in result.modules["gold"].warnings
+    assert expected in _warning_codes(result.modules)
+    assert "private.invalid" not in repr(result.modules["gold"])
+    assert "secret" not in repr(result.modules["gold"])
+    deps.mail_sender.assert_not_called()
+
+
+def test_gold_analysis_failure_has_distinct_safe_diagnostic(tmp_path, deps) -> None:
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gold_analyzer=Mock(side_effect=RuntimeError("private details"))),
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+    assert "gold_analysis_failed" in result.modules["gold"].warnings
+    assert "private details" not in repr(result.modules["gold"])
+
+
 def test_data_failure_warns_watch_only_and_never_fabricates_success(tmp_path, deps) -> None:
     gateway = FakeGateway()
     gateway.get_a_share_snapshot = Mock(side_effect=ValueError("API_KEY=secret"))
@@ -648,6 +684,215 @@ def test_renderer_receives_session_generation_time(tmp_path, deps) -> None:
 
     assert deps.renderer.call_args.kwargs["generated_at"] == NOW
     assert deps.renderer.call_args.args[:2] == (ReportMode.POSTMARKET, date(2026, 8, 19))
+
+
+def test_advancing_clock_uses_one_generation_time_for_real_renderer_and_manifest(tmp_path, deps) -> None:
+    generated_at = NOW + timedelta(minutes=2)
+    renderer = Mock(wraps=render_report)
+    clock = Mock(side_effect=(
+        NOW,
+        NOW + timedelta(minutes=1),
+        generated_at,
+        NOW + timedelta(minutes=3),
+        NOW + timedelta(minutes=4),
+    ))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, clock=clock, renderer=renderer),
+        output_dir=tmp_path,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert renderer.call_args.kwargs["generated_at"] == generated_at
+    assert manifest["generated_at"] == generated_at.isoformat()
+
+
+def test_snapshot_receipt_time_and_authority_age_guards_reject_future_data() -> None:
+    from src.collaborative_report.runner import (
+        _snapshot_fetch_is_current,
+        _snapshot_source_is_authoritative,
+    )
+
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+    gateway = FakeGateway()
+    assert not _snapshot_fetch_is_current(
+        replace(gateway.snapshot, observed_at=NOW + timedelta(seconds=1)),
+        session,
+        checked_at=NOW,
+    )
+    assert not _snapshot_source_is_authoritative(
+        replace(gateway.snapshot, source_timestamp=NOW + timedelta(seconds=1)),
+        session,
+        expected_session=NOW.date(),
+        checked_at=NOW,
+    )
+    assert not _snapshot_source_is_authoritative(
+        replace(
+            gateway.snapshot,
+            observed_at=NOW,
+            source_timestamp=NOW + timedelta(seconds=1),
+        ),
+        session,
+        expected_session=NOW.date(),
+        checked_at=NOW + timedelta(seconds=2),
+    )
+
+    close_snapshot = replace(gateway.snapshot, source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI))
+    boundary = datetime(2026, 8, 19, 19, 0, tzinfo=SHANGHAI)
+    assert _snapshot_source_is_authoritative(
+        close_snapshot, session, expected_session=NOW.date(), checked_at=boundary
+    )
+    assert not _snapshot_source_is_authoritative(
+        close_snapshot,
+        session,
+        expected_session=NOW.date(),
+        checked_at=boundary + timedelta(seconds=1),
+    )
+
+    premarket = ReportSession(
+        ReportMode.PREMARKET,
+        datetime(2026, 8, 23, 15, 0, tzinfo=SHANGHAI),
+        date(2026, 8, 23),
+        True,
+        "2026-08-23-premarket",
+    )
+    prior_close = replace(close_snapshot, source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI))
+    premarket_boundary = datetime(2026, 8, 23, 15, 0, tzinfo=SHANGHAI)
+    assert _snapshot_source_is_authoritative(
+        prior_close,
+        premarket,
+        expected_session=date(2026, 8, 19),
+        checked_at=premarket_boundary,
+    )
+    assert not _snapshot_source_is_authoritative(
+        prior_close,
+        premarket,
+        expected_session=date(2026, 8, 19),
+        checked_at=premarket_boundary + timedelta(seconds=1),
+    )
+
+
+def test_future_snapshot_source_is_never_promoted_after_its_receipt_time(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.snapshot = replace(
+        gateway.snapshot,
+        source_timestamp=NOW + timedelta(minutes=1),
+    )
+    clock = Mock(side_effect=(
+        NOW,
+        NOW,
+        NOW + timedelta(minutes=2),
+        NOW + timedelta(minutes=3),
+        NOW + timedelta(minutes=4),
+    ))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, clock=clock, gateway=gateway),
+        output_dir=tmp_path,
+    )
+
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert result.modules["market"].status == "partial"
+    assert manifest["source_timestamps"]["market"] == "unavailable"
+    deps.mail_sender.assert_called_once()
+
+
+@pytest.mark.parametrize("clock_values", [
+    (NOW, NOW + timedelta(days=1)),
+    (NOW, NOW, NOW, NOW + timedelta(days=1)),
+    (NOW, NOW - timedelta(seconds=1)),
+    (datetime(2026, 8, 19, 16, 30),),
+])
+def test_invalid_advancing_clock_stops_before_delivery_claim(tmp_path, deps, clock_values) -> None:
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, clock=Mock(side_effect=clock_values)),
+        output_dir=tmp_path,
+    )
+
+    assert result.exit_code == EXIT_FAILURE
+    assert result.error_code == "report_clock_invalid"
+    assert LocalDeliveryLedger(tmp_path).record("2026-08-19-postmarket") is None
+    deps.mail_sender.assert_not_called()
+
+
+def test_authoritative_snapshot_expiry_stops_before_delivery_claim(tmp_path, deps) -> None:
+    start = datetime(2026, 8, 19, 18, 50, tzinfo=SHANGHAI)
+    gateway = FakeGateway()
+    gateway.snapshot = replace(
+        gateway.snapshot,
+        source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI),
+    )
+    clock = Mock(side_effect=(
+        start,
+        start,
+        start,
+        start,
+        datetime(2026, 8, 19, 19, 0, 1, tzinfo=SHANGHAI),
+    ))
+    session_builder = lambda mode, current_time, scheduled: ReportSession(
+        mode,
+        start,
+        start.date(),
+        True,
+        f"{start.date().isoformat()}-{mode.value}",
+    )
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        force=True,
+        deps=replace(deps, clock=clock, gateway=gateway, session_builder=session_builder),
+        output_dir=tmp_path,
+    )
+
+    assert result.exit_code == EXIT_FAILURE
+    assert result.error_code == "snapshot_source_expired"
+    assert LocalDeliveryLedger(tmp_path).record("2026-08-19-postmarket") is None
+    deps.mail_sender.assert_not_called()
+
+
+def test_authoritative_snapshot_expiry_stops_before_rendering(tmp_path, deps) -> None:
+    start = datetime(2026, 8, 19, 18, 50, tzinfo=SHANGHAI)
+    gateway = FakeGateway()
+    gateway.snapshot = replace(
+        gateway.snapshot,
+        source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI),
+    )
+    renderer = Mock(wraps=deps.renderer)
+    clock = Mock(side_effect=(
+        start,
+        start,
+        datetime(2026, 8, 19, 19, 0, 1, tzinfo=SHANGHAI),
+    ))
+    session_builder = lambda mode, current_time, scheduled: ReportSession(
+        mode,
+        start,
+        start.date(),
+        True,
+        f"{start.date().isoformat()}-{mode.value}",
+    )
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        force=True,
+        deps=replace(
+            deps,
+            clock=clock,
+            gateway=gateway,
+            renderer=renderer,
+            session_builder=session_builder,
+        ),
+        output_dir=tmp_path,
+    )
+
+    assert result.exit_code == EXIT_FAILURE
+    assert result.error_code == "snapshot_source_expired"
+    assert result.html_path is None
+    assert LocalDeliveryLedger(tmp_path).record("2026-08-19-postmarket") is None
+    renderer.assert_not_called()
+    deps.mail_sender.assert_not_called()
 
 
 def test_postmarket_classifies_trigger_invalidated_watch_and_stale() -> None:

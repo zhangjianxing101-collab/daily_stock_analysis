@@ -133,8 +133,44 @@ def test_requests_transport_disables_redirects(monkeypatch: pytest.MonkeyPatch) 
         "headers": {"X-api-key": TEST_API_KEY},
         "params": {"thscodes": "600000.SH"},
         "timeout": 10,
+        "verify": True,
         "allow_redirects": False,
     }
+
+
+@pytest.mark.parametrize(
+    ("request_error", "reason"),
+    [
+        (ths_market_data.requests.exceptions.SSLError, "tls_failed"),
+        (ths_market_data.requests.exceptions.ProxyError, "proxy_failed"),
+        (ths_market_data.requests.exceptions.ConnectTimeout, "connect_timeout"),
+        (ths_market_data.requests.exceptions.ReadTimeout, "read_timeout"),
+        (ths_market_data.requests.exceptions.ConnectionError, "connection_failed"),
+    ],
+)
+def test_requests_transport_maps_network_errors_without_leaking_provider_text(
+    monkeypatch: pytest.MonkeyPatch,
+    request_error: type[Exception],
+    reason: str,
+) -> None:
+    secret = "transport-secret-token"
+
+    def get(*args: object, **kwargs: object) -> object:
+        raise request_error(secret)
+
+    monkeypatch.setattr(ths_market_data.requests, "get", get)
+
+    with pytest.raises(ThsNetworkError) as error:
+        ths_market_data._requests_transport(
+            url="https://fuyao.aicubes.cn/api/a-share/prices/snapshot",
+            headers={"X-api-key": TEST_API_KEY},
+            params={"thscodes": "600000.SH"},
+            timeout_seconds=10,
+        )
+
+    assert error.value.reason == reason
+    assert secret not in str(error.value)
+    assert secret not in "".join(traceback.format_exception(error.type, error.value, error.tb))
 
 
 def test_snapshot_uses_api_key_header_and_parses_envelope() -> None:
@@ -249,6 +285,17 @@ def test_client_rejects_a_non_official_origin_before_sending_the_api_key() -> No
         client.hot_stock_list()
 
 
+@pytest.mark.parametrize("api_key", ["contains space", "contains\nnewline", "contains-\u2603"])
+def test_client_rejects_unencodable_header_credentials_without_sending_them(api_key: str) -> None:
+    transport = lambda **kwargs: pytest.fail("transport should not run")
+
+    with pytest.raises(ThsNetworkError) as error:
+        ThsMarketDataClient(settings(THS_API_KEY=api_key), transport=transport).hot_stock_list()
+
+    assert error.value.reason == "credential_encoding_failed"
+    assert api_key not in str(error.value)
+
+
 def test_authentication_error_is_not_retried_and_does_not_leak_secret() -> None:
     calls = 0
 
@@ -293,9 +340,10 @@ def test_timeout_retries_then_raises_safe_network_error() -> None:
     def timeout(**kwargs: object) -> ThsHttpResponse:
         raise TimeoutError
 
-    with pytest.raises(ThsNetworkError, match="^THS network request failed$"):
+    with pytest.raises(ThsNetworkError, match="^THS network request failed$") as error:
         ThsMarketDataClient(settings(THS_MAX_RETRIES="1"), transport=timeout, sleep=pauses.append).hot_stock_list()
 
+    assert error.value.reason == "network_failed"
     assert pauses == [0.1]
 
 
@@ -318,9 +366,77 @@ def test_unexpected_transport_error_is_sanitized() -> None:
     with pytest.raises(ThsNetworkError) as error:
         ThsMarketDataClient(settings(THS_MAX_RETRIES="0"), transport=transport).hot_stock_list()
 
+    assert error.value.reason == "internal_failure"
+    assert str(error.value) == "THS client internal failure"
     assert TEST_API_KEY not in str(error.value)
     formatted_traceback = "".join(traceback.format_exception(error.type, error.value, error.tb))
     assert TEST_API_KEY not in formatted_traceback
+
+
+@pytest.mark.parametrize(
+    ("error_factory", "reason"),
+    [
+        (
+            lambda secret: UnicodeEncodeError("ascii", secret, 0, 1, "not encodable"),
+            "credential_encoding_failed",
+        ),
+        (TypeError, "internal_type_error"),
+        (ValueError, "internal_value_error"),
+        (AttributeError, "internal_attribute_error"),
+    ],
+)
+def test_internal_transport_errors_have_fixed_redacted_reasons(
+    error_factory: Callable[[str], Exception], reason: str
+) -> None:
+    secret = "internal-transport-secret"
+
+    def transport(**kwargs: object) -> ThsHttpResponse:
+        raise error_factory(secret)
+
+    with pytest.raises(ThsNetworkError) as error:
+        ThsMarketDataClient(settings(THS_MAX_RETRIES="0"), transport=transport).hot_stock_list()
+
+    assert error.value.reason == reason
+    assert secret not in str(error.value)
+    assert secret not in "".join(traceback.format_exception(error.type, error.value, error.tb))
+
+
+def test_internal_reason_uses_the_existing_retry_policy() -> None:
+    calls = 0
+    pauses: list[float] = []
+
+    def transport(**kwargs: object) -> ThsHttpResponse:
+        nonlocal calls
+        calls += 1
+        raise ValueError("internal-transport-secret")
+
+    with pytest.raises(ThsNetworkError) as error:
+        ThsMarketDataClient(
+            settings(THS_MAX_RETRIES="1"), transport=transport, sleep=pauses.append
+        ).hot_stock_list()
+
+    assert error.value.reason == "internal_value_error"
+    assert calls == 2
+    assert pauses == [0.1]
+
+
+def test_network_reason_survives_the_existing_retry_policy() -> None:
+    calls = 0
+    pauses: list[float] = []
+
+    def transport(**kwargs: object) -> ThsHttpResponse:
+        nonlocal calls
+        calls += 1
+        raise ThsNetworkError("read_timeout")
+
+    with pytest.raises(ThsNetworkError) as error:
+        ThsMarketDataClient(
+            settings(THS_MAX_RETRIES="1"), transport=transport, sleep=pauses.append
+        ).hot_stock_list()
+
+    assert error.value.reason == "read_timeout"
+    assert calls == 2
+    assert pauses == [0.1]
 
 
 @pytest.mark.parametrize(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import logging
 from typing import Any, Callable, Mapping, Sequence
 
 import exchange_calendars
@@ -64,6 +65,22 @@ _SYMBOL_CALENDARS = {
     "CL=F": "CMES",
 }
 _THS_SOURCE = "ths.fuyao"
+logger = logging.getLogger(__name__)
+_THS_FAILURE_CODES = {
+    ThsAuthenticationError: "ths_authentication_failed",
+    ThsConfigurationError: "ths_configuration_missing",
+    ThsDataUnavailableError: "ths_data_unavailable",
+    ThsNetworkError: "ths_network_failed",
+    ThsPermissionError: "ths_permission_denied",
+    ThsRateLimitError: "ths_rate_limited",
+}
+_THS_NETWORK_FAILURE_CODES = {
+    reason: f"ths_{reason}" for reason in (
+        "network_failed", "tls_failed", "proxy_failed", "connect_timeout",
+        "read_timeout", "connection_failed", "internal_failure",
+        "credential_encoding_failed", "internal_type_error", "internal_value_error", "internal_attribute_error",
+    )
+}
 _RECOVERABLE_THS_ERRORS = (
     ThsAuthenticationError,
     ThsConfigurationError,
@@ -335,6 +352,10 @@ def _validate_bar_series(
     _validate_bar_values(normalized)
     ascending = normalized.sort_values("date", kind="stable").reset_index(drop=True)
     if required_latest is not None and ascending.iloc[-1]["date"].date() != required_latest:
+        logger.warning(
+            "Daily bars stale: expected=%s actual=%s",
+            required_latest.isoformat(), ascending.iloc[-1]["date"].date().isoformat(),
+        )
         raise ValueError("daily bars stale")
     return ascending
 
@@ -389,15 +410,26 @@ class MarketDataGateway:
     def _observed_at(self) -> datetime:
         return self._clock()
 
+    def _received_at(self, requested_at: datetime) -> datetime:
+        received_at = self._observed_at()
+        if (
+            requested_at.tzinfo is None or requested_at.utcoffset() is None
+            or received_at.tzinfo is None or received_at.utcoffset() is None
+            or received_at < requested_at
+        ):
+            raise ValueError("provider acquisition clock invalid")
+        return received_at
+
     def _ths_snapshot(self, codes: Sequence[str] | None, observed_at: datetime) -> MarketDataset:
         client = self._require_ths_client()
         thscodes = None if codes is None else tuple(normalize_a_share_thscode(code) for code in codes)
         if thscodes is not None:
             response = client.a_share_snapshot(thscodes)
             items = response.items
+            observed_at = self._received_at(observed_at)
             source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         else:
-            response, items = self._ths_all_snapshot_pages(client, observed_at)
+            response, items, observed_at = self._ths_all_snapshot_pages(client, observed_at)
             source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         return MarketDataset(
             _normalize_ths_snapshot(items),
@@ -407,16 +439,16 @@ class MarketDataGateway:
             source_timestamp,
         )
 
-    @staticmethod
     def _ths_all_snapshot_pages(
-        client: ThsMarketDataClient, observed_at: datetime
-    ) -> tuple[Any, tuple[Mapping[str, Any], ...]]:
+        self, client: ThsMarketDataClient, observed_at: datetime
+    ) -> tuple[Any, tuple[Mapping[str, Any], ...], datetime]:
         offset = 0
         items: list[Mapping[str, Any]] = []
         response: Any | None = None
         expected_total: int | None = None
         while expected_total is None or len(items) < expected_total:
             response = client.a_share_snapshot(None, limit=1000, offset=offset)
+            observed_at = self._received_at(observed_at)
             total = response.data.get("total")
             if type(total) is not int or total < 0:
                 raise ValueError("THS snapshot total invalid")
@@ -436,7 +468,7 @@ class MarketDataGateway:
             offset += len(page_items)
         if response is None:
             raise AssertionError("THS snapshot pagination must return a response")
-        return response, tuple(items)
+        return response, tuple(items), observed_at
 
     def get_a_share_snapshot(self, codes: Sequence[str] | None = None) -> MarketDataset:
         observed_at = self._observed_at()
@@ -445,7 +477,11 @@ class MarketDataGateway:
             return self._ths_snapshot(codes, observed_at)
         except ThsResponseError:
             raise ValueError("THS snapshot data invalid") from None
-        except _RECOVERABLE_THS_ERRORS:
+        except _RECOVERABLE_THS_ERRORS as exc:
+            code = _THS_FAILURE_CODES.get(type(exc), "ths_unavailable")
+            if isinstance(exc, ThsNetworkError):
+                code = _THS_NETWORK_FAILURE_CODES.get(exc.reason, "ths_network_failed")
+            logger.warning("A-share primary source: %s", code)
             fallback_warnings = ("THS unavailable; existing snapshot source used",)
         try:
             if self._snapshot_fetcher is None:
@@ -465,7 +501,7 @@ class MarketDataGateway:
         return MarketDataset(
             normalized,
             "akshare.stock_zh_a_spot_em",
-            observed_at,
+            self._received_at(observed_at),
             fallback_warnings + warnings,
             source_timestamp,
         )
@@ -481,6 +517,7 @@ class MarketDataGateway:
             start_ms=int(start.timestamp() * 1000),
             end_ms=int(end.timestamp() * 1000),
         )
+        observed_at = self._received_at(observed_at)
         source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         normalized = validate_daily_bars(_normalize_ths_daily_bars(response.items), expected_session)
         return MarketDataset(normalized, _THS_SOURCE + ".a_share_historical", observed_at, warnings, source_timestamp)
@@ -506,7 +543,7 @@ class MarketDataGateway:
         if raw is None or raw.empty:
             raise ValueError("daily provider returned empty data")
         normalized = validate_daily_bars(raw, expected_session)
-        return MarketDataset(normalized, str(source), observed_at, fallback_warnings)
+        return MarketDataset(normalized, str(source), self._received_at(observed_at), fallback_warnings)
 
     def _require_ths_client(self) -> ThsMarketDataClient:
         if self._ths_client is None:
@@ -514,6 +551,7 @@ class MarketDataGateway:
         return self._ths_client
 
     def _ths_dataset(self, source: str, response: Any, observed_at: datetime) -> MarketDataset:
+        observed_at = self._received_at(observed_at)
         source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         return MarketDataset(_ths_items_frame(response.items), source, observed_at, warnings, source_timestamp)
 
@@ -569,6 +607,7 @@ class MarketDataGateway:
             start_ms=int(start.timestamp() * 1000),
             end_ms=int(end.timestamp() * 1000),
         )
+        observed_at = self._received_at(observed_at)
         source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         normalized = validate_daily_bars(_normalize_ths_daily_bars(response.items), expected_session)
         return MarketDataset(normalized, _THS_SOURCE + ".index_historical", observed_at, warnings, source_timestamp)
@@ -686,24 +725,46 @@ class MarketDataGateway:
 
     def get_gold_bars(self) -> MarketDataset:
         observed_at = self._observed_at()
-        try:
-            raw = self._download(
-                "GC=F",
-                period="10y",
-                interval="1d",
-                auto_adjust=False,
-                progress=False,
-                timeout=15,
-            )
-        except Exception:
-            raise ValueError("gold provider unavailable") from None
-        if raw is None or raw.empty:
-            raise ValueError("gold provider returned empty data")
         latest_completed = _latest_completed_session_date("GC=F", observed_at)
-        normalized = _validate_bar_series(
-            raw,
-            min_rows=60,
-            latest_allowed=latest_completed,
-            required_latest=latest_completed,
-        )
-        return MarketDataset(normalized, "yfinance:GC=F", observed_at)
+        end = latest_completed + timedelta(days=1)
+        canonical_start = (pd.Timestamp(end) - pd.DateOffset(years=10)).date()
+        for attempt in range(2):
+            window = {"period": "10y"} if attempt == 0 else {
+                "start": (canonical_start - timedelta(days=1)).isoformat(),
+            }
+            failure = None
+            try:
+                raw = self._download(
+                    "GC=F", **window, end=end.isoformat(), interval="1d",
+                    auto_adjust=False, progress=False, timeout=15,
+                )
+            except (TimeoutError, ConnectionError):
+                failure = "gold provider unavailable"
+                raw = None
+            except Exception:
+                raise ValueError("gold provider unavailable") from None
+            observed_at = self._received_at(observed_at)
+            if raw is None or raw.empty:
+                failure = failure or "gold provider returned empty data"
+            else:
+                try:
+                    normalized = _validate_bar_series(
+                        raw, min_rows=60, latest_allowed=latest_completed,
+                        required_latest=latest_completed,
+                    )
+                except ValueError as exc:
+                    if str(exc) != "daily bars stale":
+                        raise
+                    failure = "daily bars stale"
+                else:
+                    # Validate all rows before removing deliberate leading retry padding.
+                    normalized = _validate_bar_series(
+                        normalized.loc[normalized["date"] >= pd.Timestamp(canonical_start)],
+                        min_rows=60, latest_allowed=latest_completed, required_latest=latest_completed,
+                    )
+                    warnings = ("gold history recovered after bounded retry",) if attempt else ()
+                    return MarketDataset(normalized, "yfinance:GC=F", observed_at, warnings)
+            if attempt:
+                raise ValueError(failure) from None
+            logger.warning("Gold history: bounded_retry")
+        raise AssertionError("gold retry must return or raise")

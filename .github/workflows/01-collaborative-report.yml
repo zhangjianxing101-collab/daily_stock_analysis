@@ -426,7 +426,7 @@ jobs:
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
           COLLAB_PORTFOLIO_JSON: ${{ secrets.COLLAB_PORTFOLIO_JSON }}
-          THS_API_KEY: ${{ secrets.THS_API_KEY }}
+          THS_API_KEY: ${{ secrets.THS_API_KEY || secrets.THS }}
           ANSPIRE_API_KEYS: ${{ secrets.ANSPIRE_API_KEYS }}
           GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
           GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
@@ -524,7 +524,15 @@ jobs:
           RUNNER_EXIT="$runner_exit" OUTPUT_DIR="$OUTPUT_DIR" python - <<'PY'
           import json
           import os
+          import re
           from pathlib import Path
+
+          def safe_provider_diagnostics(stderr):
+              patterns = (
+                  r"A-share primary source: ths_(?:authentication_failed|configuration_missing|data_unavailable|network_failed|tls_failed|proxy_failed|connect_timeout|read_timeout|connection_failed|internal_failure|credential_encoding_failed|internal_type_error|internal_value_error|internal_attribute_error|permission_denied|rate_limited|unavailable)",
+                  r"Daily bars stale: expected=\d{4}-\d{2}-\d{2} actual=\d{4}-\d{2}-\d{2}",
+              )
+              return sorted({line for line in stderr.splitlines() if any(re.fullmatch(pattern, line) for pattern in patterns)})
 
           result_path = Path(".workflow-artifacts/runner-result.json")
           try:
@@ -540,7 +548,12 @@ jobs:
               error_code = None
           channel = "test" if os.environ["TEST_EMAIL"] == "true" or os.environ.get("PREVIEW_ONLY") == "true" else "production"
           report_root = Path(os.environ["OUTPUT_DIR"]) / channel / report_key
-          report_available = report_root.is_dir() and any(report_root.glob("attempts/*/report.html"))
+          report_invalidated = error_code in {"report_clock_invalid", "snapshot_source_expired"}
+          report_available = (
+              not report_invalidated
+              and report_root.is_dir()
+              and any(report_root.glob("attempts/*/report.html"))
+          )
           diagnostic = {
               "report_key": report_key,
               "final_state": final_state,
@@ -550,6 +563,11 @@ jobs:
           }
           if error_code is not None:
               diagnostic["error_code"] = error_code
+          try:
+              stderr = Path(".workflow-artifacts/runner-stderr.log").read_text(encoding="utf-8")
+          except (OSError, UnicodeError):
+              stderr = ""
+          diagnostic["provider_diagnostics"] = safe_provider_diagnostics(stderr)
           if report_root.is_dir():
               for manifest_path in sorted(report_root.glob("attempts/*/manifest.json"), reverse=True):
                   try:

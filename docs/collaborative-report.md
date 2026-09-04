@@ -13,6 +13,11 @@ Add the following encrypted GitHub Secrets under **Settings -> Secrets and varia
 - `THS_API_KEY` for the optional 同花顺/福耀 market-data source
 - Any AI provider keys used by the report, such as `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY`
 
+For existing GitHub setups that saved the market-data key as `THS`, the workflow
+uses that encrypted secret when `THS_API_KEY` is absent or empty. If both are set,
+`THS_API_KEY` takes precedence. No key is copied into repository variables or
+logs. Local runs continue to use the canonical `THS_API_KEY` environment variable.
+
 Do not place sender/receiver addresses, portfolio JSON, authorization codes, or AI keys in repository variables. The `.env.example` values are synthetic placeholders only.
 
 ## 同花顺数据与人工查询
@@ -33,6 +38,43 @@ python scripts/run_collaborative_report.py query index bars 886042.TI --expected
 ```
 
 Queries are read-only data retrieval, not trading commands. Review returned data quality and confirm every investment decision manually.
+
+## Gold history completeness
+
+Empty or stale gold responses, or recognized connection/time-out failures, allow
+one alternate-range retry. It requests one extra leading calendar day with the
+same exclusive end. The entire response is validated before removing the padding
+and revalidating the canonical ten-year window. Responses are never spliced;
+integrity failures do not trigger recovery, and a second failure stays unavailable.
+
+Gold history downloads end exclusively on the day after the latest completed
+futures session. This avoids requesting the ongoing session's incomplete daily
+bar. Returned data must still pass all existing date, price, volume, sample-size,
+and freshness checks; a stale series or a provider response beyond the cutoff
+remains unavailable rather than being silently accepted.
+
+## Acquisition and generation times
+
+Reports invalidated by clock or source-expiry checks are excluded from the
+workflow's report upload; their sanitized diagnostic manifest remains available.
+Provider logs expose only fixed THS failure categories and validated expected/actual
+bar dates, never exception text or response bodies.
+The workflow includes these allowlisted lines in `provider_diagnostics`. THS
+transport categories distinguish TLS, proxy, connect/read timeout, connection,
+and internal-client failures. TLS verification stays enabled, redirects remain
+disabled, and retry limits are unchanged.
+
+Source timestamps are checked against the time a response is received, not the
+time its request began. Each snapshot page is checked before another page can
+be requested. The report keeps its original trading-date identity but uses its
+actual final generation time for rendering and the manifest. Clock rollback,
+date rollover, genuinely future observations, and data expiring during a run
+remain safe failures rather than permission to reuse yesterday's signals.
+
+Market and gold failures include fixed diagnostic codes for known validation
+errors and generic stage codes for other exceptions. Raw provider errors,
+credentials, request URLs and response bodies are not copied into the report
+or diagnostic manifest.
 
 ## Repository variables
 

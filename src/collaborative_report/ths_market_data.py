@@ -97,8 +97,26 @@ class ThsConfigurationError(ThsMarketDataError):
     pass
 
 
+_THS_NETWORK_REASONS = frozenset({
+    "network_failed",
+    "tls_failed",
+    "proxy_failed",
+    "connect_timeout",
+    "read_timeout",
+    "connection_failed",
+    "internal_failure",
+    "credential_encoding_failed",
+    "internal_type_error",
+    "internal_value_error",
+    "internal_attribute_error",
+})
+
+
 class ThsNetworkError(ThsMarketDataError):
-    pass
+    def __init__(self, reason: str = "network_failed") -> None:
+        self.reason = reason if reason in _THS_NETWORK_REASONS else "network_failed"
+        message = "THS client internal failure" if self.reason == "internal_failure" else "THS network request failed"
+        super().__init__(message)
 
 
 class ThsResponseError(ThsMarketDataError):
@@ -148,12 +166,23 @@ def _requests_transport(
             headers=dict(headers),
             params=dict(params),
             timeout=timeout_seconds,
+            verify=True,
             allow_redirects=False,
         )
+    except requests.exceptions.SSLError:
+        raise ThsNetworkError("tls_failed") from None
+    except requests.exceptions.ProxyError:
+        raise ThsNetworkError("proxy_failed") from None
+    except requests.exceptions.ConnectTimeout:
+        raise ThsNetworkError("connect_timeout") from None
+    except requests.exceptions.ReadTimeout:
+        raise ThsNetworkError("read_timeout") from None
+    except requests.exceptions.ConnectionError:
+        raise ThsNetworkError("connection_failed") from None
     except requests.Timeout:
-        raise TimeoutError from None
+        raise ThsNetworkError from None
     except requests.RequestException:
-        raise ConnectionError from None
+        raise ThsNetworkError from None
 
     try:
         payload = response.json()
@@ -387,6 +416,8 @@ class ThsMarketDataClient:
             or self._settings.base_url != DEFAULT_THS_BASE_URL
         ):
             raise ThsConfigurationError("THS data provider is not configured")
+        if not all(33 <= ord(character) <= 126 for character in self._settings.api_key):
+            raise ThsNetworkError("credential_encoding_failed")
 
         url = f"{self._settings.base_url}{endpoint.value}"
         headers = {"X-api-key": self._settings.api_key, "Accept": "application/json"}
@@ -399,9 +430,14 @@ class ThsMarketDataClient:
                     timeout_seconds=self._settings.timeout_seconds,
                 )
                 result = self._parse_response(endpoint, response)
+            except ThsNetworkError as exc:
+                if attempt == self._settings.max_retries:
+                    raise ThsNetworkError(exc.reason) from None
+                self._backoff(attempt)
+                continue
             except (TimeoutError, ConnectionError):
                 if attempt == self._settings.max_retries:
-                    raise ThsNetworkError("THS network request failed") from None
+                    raise ThsNetworkError from None
                 self._backoff(attempt)
                 continue
             except ThsApiError as exc:
@@ -414,9 +450,29 @@ class ThsMarketDataClient:
                 continue
             except ThsResponseError:
                 raise
+            except UnicodeEncodeError:
+                if attempt == self._settings.max_retries:
+                    raise ThsNetworkError("credential_encoding_failed") from None
+                self._backoff(attempt)
+                continue
+            except TypeError:
+                if attempt == self._settings.max_retries:
+                    raise ThsNetworkError("internal_type_error") from None
+                self._backoff(attempt)
+                continue
+            except ValueError:
+                if attempt == self._settings.max_retries:
+                    raise ThsNetworkError("internal_value_error") from None
+                self._backoff(attempt)
+                continue
+            except AttributeError:
+                if attempt == self._settings.max_retries:
+                    raise ThsNetworkError("internal_attribute_error") from None
+                self._backoff(attempt)
+                continue
             except Exception:
                 if attempt == self._settings.max_retries:
-                    raise ThsNetworkError("THS network request failed") from None
+                    raise ThsNetworkError("internal_failure") from None
                 self._backoff(attempt)
                 continue
             else:
