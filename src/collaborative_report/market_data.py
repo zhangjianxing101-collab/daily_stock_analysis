@@ -74,6 +74,12 @@ _THS_FAILURE_CODES = {
     ThsPermissionError: "ths_permission_denied",
     ThsRateLimitError: "ths_rate_limited",
 }
+_THS_NETWORK_FAILURE_CODES = {
+    reason: f"ths_{reason}" for reason in (
+        "network_failed", "tls_failed", "proxy_failed", "connect_timeout",
+        "read_timeout", "connection_failed", "internal_failure",
+    )
+}
 _RECOVERABLE_THS_ERRORS = (
     ThsAuthenticationError,
     ThsConfigurationError,
@@ -471,7 +477,10 @@ class MarketDataGateway:
         except ThsResponseError:
             raise ValueError("THS snapshot data invalid") from None
         except _RECOVERABLE_THS_ERRORS as exc:
-            logger.warning("A-share primary source: %s", _THS_FAILURE_CODES.get(type(exc), "ths_unavailable"))
+            code = _THS_FAILURE_CODES.get(type(exc), "ths_unavailable")
+            if isinstance(exc, ThsNetworkError):
+                code = _THS_NETWORK_FAILURE_CODES.get(exc.reason, "ths_network_failed")
+            logger.warning("A-share primary source: %s", code)
             fallback_warnings = ("THS unavailable; existing snapshot source used",)
         try:
             if self._snapshot_fetcher is None:

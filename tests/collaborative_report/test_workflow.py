@@ -41,6 +41,7 @@ def test_provider_diagnostics_exclude_raw_errors_and_secrets() -> None:
     namespace = {"re": re}
     exec(compile(ast.Module(body=[function], type_ignores=[]), "workflow-diagnostics", "exec"), namespace)
     valid = ["A-share primary source: ths_authentication_failed",
+             "A-share primary source: ths_tls_failed",
              "Daily bars stale: expected=2026-09-03 actual=2026-09-02"]
     unsafe = ["token=secret", "https://private.example", valid[0] + " secret",
               "Daily bars stale: expected=secret actual=secret"]
