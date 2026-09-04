@@ -130,6 +130,58 @@ def test_ths_full_snapshot_reads_all_pages_before_returning_data() -> None:
     ]
 
 
+@pytest.mark.parametrize("kind", ["snapshot", "daily", "hot_list", "index"])
+def test_ths_validates_source_time_at_response_receipt(kind: str) -> None:
+    client = Mock()
+    source_time = OBSERVED_AT + timedelta(seconds=1)
+    received_at = OBSERVED_AT + timedelta(seconds=2)
+    response = ths_response(
+        ths_bar_items() if kind in {"daily", "index"} else [ths_snapshot_item()],
+        int(source_time.timestamp() * 1000),
+    )
+    client.a_share_snapshot.return_value = response
+    client.a_share_historical.return_value = response
+    client.hot_stock_list.return_value = response
+    client.index_historical.return_value = response
+    gateway = MarketDataGateway(ths_client=client, clock=Mock(side_effect=[OBSERVED_AT, received_at]))
+    if kind == "snapshot":
+        result = gateway.get_a_share_snapshot(["600000"])
+    elif kind == "daily":
+        result = gateway.get_daily_bars("600000", SESSION)
+    elif kind == "index":
+        result = gateway.get_ths_index_bars("886042.TI", SESSION)
+    else:
+        result = gateway.get_ths_hot_stock_list()
+    assert result.observed_at == received_at
+    assert result.source_timestamp == source_time
+
+
+def test_ths_pagination_rejects_future_page_before_requesting_next_page() -> None:
+    client = Mock()
+    response = ThsApiResponse({
+        "timestamp": int((OBSERVED_AT + timedelta(seconds=3)).timestamp() * 1000),
+        "total": 2,
+        "item": [ths_snapshot_item()],
+    }, None)
+    client.a_share_snapshot.return_value = response
+    gateway = MarketDataGateway(
+        ths_client=client,
+        clock=Mock(side_effect=[OBSERVED_AT, OBSERVED_AT + timedelta(seconds=1)]),
+    )
+    with pytest.raises(ValueError, match="THS source timestamp is in the future"):
+        gateway.get_a_share_snapshot()
+    assert client.a_share_snapshot.call_count == 1
+
+
+@pytest.mark.parametrize("received_at", [OBSERVED_AT - timedelta(seconds=1), OBSERVED_AT.replace(tzinfo=None)])
+def test_ths_rejects_invalid_receipt_clock(received_at: datetime) -> None:
+    client = Mock()
+    client.a_share_snapshot.return_value = ths_response([ths_snapshot_item()])
+    gateway = MarketDataGateway(ths_client=client, clock=Mock(side_effect=[OBSERVED_AT, received_at]))
+    with pytest.raises(ValueError, match="provider acquisition clock invalid"):
+        gateway.get_a_share_snapshot(["600000"])
+
+
 def test_ths_snapshot_recoverable_failure_uses_existing_source_with_warning() -> None:
     client = Mock()
     client.a_share_snapshot.side_effect = ThsNetworkError("THS network request failed")

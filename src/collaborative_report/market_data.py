@@ -389,15 +389,26 @@ class MarketDataGateway:
     def _observed_at(self) -> datetime:
         return self._clock()
 
+    def _received_at(self, requested_at: datetime) -> datetime:
+        received_at = self._observed_at()
+        if (
+            requested_at.tzinfo is None or requested_at.utcoffset() is None
+            or received_at.tzinfo is None or received_at.utcoffset() is None
+            or received_at < requested_at
+        ):
+            raise ValueError("provider acquisition clock invalid")
+        return received_at
+
     def _ths_snapshot(self, codes: Sequence[str] | None, observed_at: datetime) -> MarketDataset:
         client = self._require_ths_client()
         thscodes = None if codes is None else tuple(normalize_a_share_thscode(code) for code in codes)
         if thscodes is not None:
             response = client.a_share_snapshot(thscodes)
             items = response.items
+            observed_at = self._received_at(observed_at)
             source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         else:
-            response, items = self._ths_all_snapshot_pages(client, observed_at)
+            response, items, observed_at = self._ths_all_snapshot_pages(client, observed_at)
             source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         return MarketDataset(
             _normalize_ths_snapshot(items),
@@ -407,16 +418,16 @@ class MarketDataGateway:
             source_timestamp,
         )
 
-    @staticmethod
     def _ths_all_snapshot_pages(
-        client: ThsMarketDataClient, observed_at: datetime
-    ) -> tuple[Any, tuple[Mapping[str, Any], ...]]:
+        self, client: ThsMarketDataClient, observed_at: datetime
+    ) -> tuple[Any, tuple[Mapping[str, Any], ...], datetime]:
         offset = 0
         items: list[Mapping[str, Any]] = []
         response: Any | None = None
         expected_total: int | None = None
         while expected_total is None or len(items) < expected_total:
             response = client.a_share_snapshot(None, limit=1000, offset=offset)
+            observed_at = self._received_at(observed_at)
             total = response.data.get("total")
             if type(total) is not int or total < 0:
                 raise ValueError("THS snapshot total invalid")
@@ -436,7 +447,7 @@ class MarketDataGateway:
             offset += len(page_items)
         if response is None:
             raise AssertionError("THS snapshot pagination must return a response")
-        return response, tuple(items)
+        return response, tuple(items), observed_at
 
     def get_a_share_snapshot(self, codes: Sequence[str] | None = None) -> MarketDataset:
         observed_at = self._observed_at()
@@ -465,7 +476,7 @@ class MarketDataGateway:
         return MarketDataset(
             normalized,
             "akshare.stock_zh_a_spot_em",
-            observed_at,
+            self._received_at(observed_at),
             fallback_warnings + warnings,
             source_timestamp,
         )
@@ -481,6 +492,7 @@ class MarketDataGateway:
             start_ms=int(start.timestamp() * 1000),
             end_ms=int(end.timestamp() * 1000),
         )
+        observed_at = self._received_at(observed_at)
         source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         normalized = validate_daily_bars(_normalize_ths_daily_bars(response.items), expected_session)
         return MarketDataset(normalized, _THS_SOURCE + ".a_share_historical", observed_at, warnings, source_timestamp)
@@ -506,7 +518,7 @@ class MarketDataGateway:
         if raw is None or raw.empty:
             raise ValueError("daily provider returned empty data")
         normalized = validate_daily_bars(raw, expected_session)
-        return MarketDataset(normalized, str(source), observed_at, fallback_warnings)
+        return MarketDataset(normalized, str(source), self._received_at(observed_at), fallback_warnings)
 
     def _require_ths_client(self) -> ThsMarketDataClient:
         if self._ths_client is None:
@@ -514,6 +526,7 @@ class MarketDataGateway:
         return self._ths_client
 
     def _ths_dataset(self, source: str, response: Any, observed_at: datetime) -> MarketDataset:
+        observed_at = self._received_at(observed_at)
         source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         return MarketDataset(_ths_items_frame(response.items), source, observed_at, warnings, source_timestamp)
 
@@ -569,6 +582,7 @@ class MarketDataGateway:
             start_ms=int(start.timestamp() * 1000),
             end_ms=int(end.timestamp() * 1000),
         )
+        observed_at = self._received_at(observed_at)
         source_timestamp, warnings = _ths_timestamp(response.timestamp_ms, observed_at)
         normalized = validate_daily_bars(_normalize_ths_daily_bars(response.items), expected_session)
         return MarketDataset(normalized, _THS_SOURCE + ".index_historical", observed_at, warnings, source_timestamp)
@@ -707,4 +721,4 @@ class MarketDataGateway:
             latest_allowed=latest_completed,
             required_latest=latest_completed,
         )
-        return MarketDataset(normalized, "yfinance:GC=F", observed_at)
+        return MarketDataset(normalized, "yfinance:GC=F", self._received_at(observed_at))

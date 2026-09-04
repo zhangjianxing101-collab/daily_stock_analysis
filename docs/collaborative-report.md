@@ -47,6 +47,20 @@ bar. Returned data must still pass all existing date, price, volume, sample-size
 and freshness checks; a stale series or a provider response beyond the cutoff
 remains unavailable rather than being silently accepted.
 
+## Acquisition and generation times
+
+Source timestamps are checked against the time a response is received, not the
+time its request began. Each snapshot page is checked before another page can
+be requested. The report keeps its original trading-date identity but uses its
+actual final generation time for rendering and the manifest. Clock rollback,
+date rollover, genuinely future observations, and data expiring during a run
+remain safe failures rather than permission to reuse yesterday's signals.
+
+Market and gold failures include fixed diagnostic codes for known validation
+errors and generic stage codes for other exceptions. Raw provider errors,
+credentials, request URLs and response bodies are not copied into the report
+or diagnostic manifest.
+
 ## Repository variables
 
 Set non-secret Repository variables for the delivery policy and model choices. Set `COLLAB_CAPITAL_CNY` to `20000` for a CNY 20,000 baseline, `COLLAB_RISK_FRACTION` to `0.02`, `COLLAB_SHORT_LIMIT` and `COLLAB_SWING_LIMIT` to `5`, and `COLLAB_SCREEN_PREFILTER` to `120`. Model names are repository variables; the workflow has safe defaults when a model variable is omitted.
