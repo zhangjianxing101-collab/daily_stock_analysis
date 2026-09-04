@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+import logging
 from typing import Any, Callable, Mapping, Sequence
 
 import exchange_calendars
@@ -64,6 +65,15 @@ _SYMBOL_CALENDARS = {
     "CL=F": "CMES",
 }
 _THS_SOURCE = "ths.fuyao"
+logger = logging.getLogger(__name__)
+_THS_FAILURE_CODES = {
+    ThsAuthenticationError: "ths_authentication_failed",
+    ThsConfigurationError: "ths_configuration_missing",
+    ThsDataUnavailableError: "ths_data_unavailable",
+    ThsNetworkError: "ths_network_failed",
+    ThsPermissionError: "ths_permission_denied",
+    ThsRateLimitError: "ths_rate_limited",
+}
 _RECOVERABLE_THS_ERRORS = (
     ThsAuthenticationError,
     ThsConfigurationError,
@@ -335,6 +345,10 @@ def _validate_bar_series(
     _validate_bar_values(normalized)
     ascending = normalized.sort_values("date", kind="stable").reset_index(drop=True)
     if required_latest is not None and ascending.iloc[-1]["date"].date() != required_latest:
+        logger.warning(
+            "Daily bars stale: expected=%s actual=%s",
+            required_latest.isoformat(), ascending.iloc[-1]["date"].date().isoformat(),
+        )
         raise ValueError("daily bars stale")
     return ascending
 
@@ -456,7 +470,8 @@ class MarketDataGateway:
             return self._ths_snapshot(codes, observed_at)
         except ThsResponseError:
             raise ValueError("THS snapshot data invalid") from None
-        except _RECOVERABLE_THS_ERRORS:
+        except _RECOVERABLE_THS_ERRORS as exc:
+            logger.warning("A-share primary source: %s", _THS_FAILURE_CODES.get(type(exc), "ths_unavailable"))
             fallback_warnings = ("THS unavailable; existing snapshot source used",)
         try:
             if self._snapshot_fetcher is None:

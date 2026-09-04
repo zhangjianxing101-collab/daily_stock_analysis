@@ -727,6 +727,16 @@ def test_snapshot_receipt_time_and_authority_age_guards_reject_future_data() -> 
         expected_session=NOW.date(),
         checked_at=NOW,
     )
+    assert not _snapshot_source_is_authoritative(
+        replace(
+            gateway.snapshot,
+            observed_at=NOW,
+            source_timestamp=NOW + timedelta(seconds=1),
+        ),
+        session,
+        expected_session=NOW.date(),
+        checked_at=NOW + timedelta(seconds=2),
+    )
 
     close_snapshot = replace(gateway.snapshot, source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI))
     boundary = datetime(2026, 8, 19, 19, 0, tzinfo=SHANGHAI)
@@ -840,6 +850,48 @@ def test_authoritative_snapshot_expiry_stops_before_delivery_claim(tmp_path, dep
     assert result.exit_code == EXIT_FAILURE
     assert result.error_code == "snapshot_source_expired"
     assert LocalDeliveryLedger(tmp_path).record("2026-08-19-postmarket") is None
+    deps.mail_sender.assert_not_called()
+
+
+def test_authoritative_snapshot_expiry_stops_before_rendering(tmp_path, deps) -> None:
+    start = datetime(2026, 8, 19, 18, 50, tzinfo=SHANGHAI)
+    gateway = FakeGateway()
+    gateway.snapshot = replace(
+        gateway.snapshot,
+        source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI),
+    )
+    renderer = Mock(wraps=deps.renderer)
+    clock = Mock(side_effect=(
+        start,
+        start,
+        datetime(2026, 8, 19, 19, 0, 1, tzinfo=SHANGHAI),
+    ))
+    session_builder = lambda mode, current_time, scheduled: ReportSession(
+        mode,
+        start,
+        start.date(),
+        True,
+        f"{start.date().isoformat()}-{mode.value}",
+    )
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        force=True,
+        deps=replace(
+            deps,
+            clock=clock,
+            gateway=gateway,
+            renderer=renderer,
+            session_builder=session_builder,
+        ),
+        output_dir=tmp_path,
+    )
+
+    assert result.exit_code == EXIT_FAILURE
+    assert result.error_code == "snapshot_source_expired"
+    assert result.html_path is None
+    assert LocalDeliveryLedger(tmp_path).record("2026-08-19-postmarket") is None
+    renderer.assert_not_called()
     deps.mail_sender.assert_not_called()
 
 

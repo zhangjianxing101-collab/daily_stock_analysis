@@ -182,9 +182,9 @@ def test_ths_rejects_invalid_receipt_clock(received_at: datetime) -> None:
         gateway.get_a_share_snapshot(["600000"])
 
 
-def test_ths_snapshot_recoverable_failure_uses_existing_source_with_warning() -> None:
+def test_ths_snapshot_recoverable_failure_uses_existing_source_with_warning(caplog) -> None:
     client = Mock()
-    client.a_share_snapshot.side_effect = ThsNetworkError("THS network request failed")
+    client.a_share_snapshot.side_effect = ThsNetworkError("https://private.example/?token=private-key")
     fallback = Mock(return_value=pd.DataFrame({"代码": ["000001"], "名称": ["A"], "最新价": [10]}))
     gateway = MarketDataGateway(ths_client=client, snapshot_fetcher=fallback, clock=lambda: OBSERVED_AT)
 
@@ -193,6 +193,9 @@ def test_ths_snapshot_recoverable_failure_uses_existing_source_with_warning() ->
     fallback.assert_called_once_with()
     assert result.source == "akshare.stock_zh_a_spot_em"
     assert result.warnings == ("THS unavailable; existing snapshot source used", "snapshot source timestamp unavailable")
+    assert "ths_network_failed" in caplog.text
+    assert "private-key" not in caplog.text
+    assert "private.example" not in caplog.text
 
 
 @pytest.mark.parametrize(
@@ -856,7 +859,7 @@ def test_get_gold_bars_does_not_download_when_calendar_is_unavailable() -> None:
     download.assert_not_called()
 
 
-def test_get_gold_bars_rejects_stale_history() -> None:
+def test_get_gold_bars_rejects_stale_history(caplog) -> None:
     gateway = MarketDataGateway(
         yfinance_download=lambda *args, **kwargs: daily_bars(end="2026-07-31"),
         clock=lambda: OBSERVED_AT,
@@ -864,6 +867,8 @@ def test_get_gold_bars_rejects_stale_history() -> None:
 
     with pytest.raises(ValueError, match="^daily bars stale$"):
         gateway.get_gold_bars()
+    assert "actual=2026-07-31" in caplog.text
+    assert "expected=" in caplog.text
 
 
 def test_market_dataset_requires_timezone_aware_observation() -> None:

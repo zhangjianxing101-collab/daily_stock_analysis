@@ -49,6 +49,11 @@ remains unavailable rather than being silently accepted.
 
 ## Acquisition and generation times
 
+Reports invalidated by clock or source-expiry checks are excluded from the
+workflow's report upload; their sanitized diagnostic manifest remains available.
+Provider logs expose only fixed THS failure categories and validated expected/actual
+bar dates, never exception text or response bodies.
+
 Source timestamps are checked against the time a response is received, not the
 time its request began. Each snapshot page is checked before another page can
 be requested. The report keeps its original trading-date identity but uses its

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import ast
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -28,6 +30,29 @@ def _step(workflow: dict, name: str) -> dict:
 
 def _upload_steps(workflow: dict) -> list[dict]:
     return [step for step in _steps(workflow) if step.get("uses") == "actions/upload-artifact@v6"]
+
+
+@pytest.mark.parametrize("error_code,expected", [
+    ("report_clock_invalid", False),
+    ("snapshot_source_expired", False),
+    (None, True),
+])
+def test_invalidated_reports_are_not_uploaded(tmp_path, error_code, expected) -> None:
+    run = _step(_workflow(), "Run collaborative report")["run"]
+    script = run.split('RUNNER_EXIT="$runner_exit" OUTPUT_DIR="$OUTPUT_DIR" python - <<\'PY\'\n', 1)[1].split("\nPY", 1)[0]
+    assignments = [
+        node for node in ast.parse(script).body
+        if isinstance(node, ast.Assign)
+        and any(isinstance(target, ast.Name) and target.id in {"report_invalidated", "report_available"}
+                for target in node.targets)
+    ]
+    assert len(assignments) == 2
+    attempt = tmp_path / "attempts" / "current"
+    attempt.mkdir(parents=True)
+    (attempt / "report.html").write_text("report", encoding="utf-8")
+    namespace = {"error_code": error_code, "report_root": tmp_path}
+    exec(compile(ast.Module(body=assignments, type_ignores=[]), "workflow-upload-gate", "exec"), namespace)
+    assert namespace["report_available"] is expected
 
 
 def _production_prior_candidates(artifacts: list[dict], artifact_name: str) -> list[dict]:

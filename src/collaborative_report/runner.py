@@ -716,11 +716,14 @@ def _snapshot_source_is_authoritative(
     checked_at: datetime | None = None,
 ) -> bool:
     source = dataset.source_timestamp
+    observed_at = dataset.observed_at
     checked = checked_at if checked_at is not None else session.now_shanghai
     if (
         source is None
         or source.tzinfo is None
         or source.utcoffset() is None
+        or observed_at.tzinfo is None
+        or observed_at.utcoffset() is None
         or checked.tzinfo is None
         or checked.utcoffset() is None
         or session.now_shanghai.tzinfo is None
@@ -728,9 +731,10 @@ def _snapshot_source_is_authoritative(
     ):
         return False
     local = source.astimezone(SHANGHAI_TIMEZONE)
+    observed_local = observed_at.astimezone(SHANGHAI_TIMEZONE)
     checked_local = checked.astimezone(SHANGHAI_TIMEZONE)
     session_start = session.now_shanghai.astimezone(SHANGHAI_TIMEZONE)
-    if local > checked_local:
+    if local > observed_local or local > checked_local:
         return False
     if checked_local.date() != session.trading_date or checked_local < session_start:
         return False
@@ -1735,6 +1739,13 @@ def run_report(
     if generated_at is None:
         return _failure("report_clock_invalid", report_key=session.report_key, modules=modules)
     checkpoint = generated_at
+    if snapshot_source_is_authoritative and not _snapshot_source_is_authoritative(
+        snapshot,
+        session,
+        expected_session=expected_session,
+        checked_at=generated_at,
+    ):
+        return _failure("snapshot_source_expired", report_key=session.report_key, modules=modules)
     try:
         rendered = active.renderer(
             normalized_mode,

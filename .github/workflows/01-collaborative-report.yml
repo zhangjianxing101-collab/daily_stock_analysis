@@ -540,7 +540,12 @@ jobs:
               error_code = None
           channel = "test" if os.environ["TEST_EMAIL"] == "true" or os.environ.get("PREVIEW_ONLY") == "true" else "production"
           report_root = Path(os.environ["OUTPUT_DIR"]) / channel / report_key
-          report_available = report_root.is_dir() and any(report_root.glob("attempts/*/report.html"))
+          report_invalidated = error_code in {"report_clock_invalid", "snapshot_source_expired"}
+          report_available = (
+              not report_invalidated
+              and report_root.is_dir()
+              and any(report_root.glob("attempts/*/report.html"))
+          )
           diagnostic = {
               "report_key": report_key,
               "final_state": final_state,
