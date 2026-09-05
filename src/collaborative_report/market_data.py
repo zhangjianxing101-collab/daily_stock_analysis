@@ -467,8 +467,15 @@ class MarketDataGateway:
         warning = "snapshot_screening_fields_incomplete"
         if source_timestamp is None:
             return result, observed_at, source_timestamp, (warning,)
+        supported_codes: list[str] = []
+        for code in result["code"]:
+            try:
+                normalize_a_share_thscode(code)
+            except ValueError:
+                continue
+            supported_codes.append(code)
         try:
-            supplement = self._snapshot_supplement_fetcher(tuple(result["code"]))
+            supplement = self._snapshot_supplement_fetcher(tuple(supported_codes))
         except Exception:
             return result, self._received_at(observed_at), source_timestamp, (warning,)
         received_at = self._received_at(observed_at)
@@ -551,6 +558,10 @@ class MarketDataGateway:
             offset += len(page_items)
         if response is None:
             raise AssertionError("THS snapshot pagination must return a response")
+        session_dates = {pd.Timestamp(stamp).tz_convert("Asia/Shanghai").date()
+                         for stamp in timestamps if stamp is not None}
+        if len(session_dates) > 1:
+            raise ValueError("THS snapshot pages have mixed sessions")
         source_timestamp = min(timestamps) if all(stamp is not None for stamp in timestamps) else None
         return tuple(items), observed_at, source_timestamp, tuple(dict.fromkeys(warnings))
 

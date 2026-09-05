@@ -45,13 +45,18 @@ THS rows without a quoted price are excluded only when volume and traded amount
 are also genuinely missing or zero. Malformed text, negative values, duplicate
 codes, or missing prices alongside trading activity still fail validation. The
 report discloses excluded-row and screening-field coverage counts.
+Snapshot pages with different source-session dates are rejected before aggregation.
+When any held position lacks a validated price, the report cannot determine available
+cash and suppresses all new-position sizing. An explicitly empty portfolio still
+uses the configured capital baseline.
 
 Production snapshots supplement THS names, volume ratios and turnover percentages
 from the project's public Tencent quote source before screening the full universe.
 THS traded amount is never interpreted as turnover percentage. Supplements require
 exact identities, independent same-session timestamps at or after 15:00, no future
 timestamps, finite metrics, and price agreement within CNY 0.01. Rejected fields
-remain unavailable. Partial coverage marks screening as partial. For conservative
+remain unavailable. Codes outside the supplemental provider's supported exchange
+prefixes do not block enrichment for the supported universe. Partial coverage marks screening as partial. For conservative
 freshness checks, the combined dataset uses the oldest accepted source timestamp;
 one expired source can therefore invalidate the combined snapshot.
 

@@ -50,6 +50,46 @@ def bars_summary(frame):
     }
 
 
+def supplement_summary(items, *, supplement_fetcher=fetch_snapshot_supplement):
+    """Return bounded supplement coverage diagnostics without provider content."""
+
+    try:
+        quotes = _normalize_ths_snapshot(items)
+    except Exception:
+        return {
+            "unsupported_prefix_counts": {},
+            "supplement": {"status": "probe_failed", "reason": "normalize"},
+        }
+
+    supported = []
+    unsupported = {}
+    for code in quotes["code"]:
+        try:
+            normalize_a_share_thscode(code)
+            supported.append(code)
+        except ValueError:
+            prefix = code[:3] if code.isascii() and code.isdigit() else "invalid"
+            unsupported[prefix] = unsupported.get(prefix, 0) + 1
+
+    result = {"unsupported_prefix_counts": unsupported}
+    try:
+        supplement = supplement_fetcher(supported)
+        other = supplement.frame
+        matches = quotes.merge(other, on="code", suffixes=("_ths", "_supplement"))
+        result["supplement"] = {
+            "requested": len(supported),
+            "rows": len(other),
+            "missing": supplement.missing_count,
+            "price_agreements": int(
+                ((matches["price_ths"] - matches["price_supplement"]).abs() <= 0.010000001).sum()
+            ),
+            "source_dates": sorted({pd.Timestamp(value).date().isoformat() for value in other["source_timestamp"]}),
+        }
+    except Exception:
+        result["supplement"] = {"status": "probe_failed", "reason": "supplement"}
+    return result
+
+
 def main():
     now = datetime.now(timezone.utc)
     gateway = MarketDataGateway()
@@ -64,28 +104,7 @@ def main():
             if not response.items or (type(total) is int and len(items) >= total):
                 break
         output["snapshot"] = snapshot_summary(items)
-        quotes = _normalize_ths_snapshot(items)
-        supported = []
-        unsupported = {}
-        for code in quotes["code"]:
-            try:
-                normalize_a_share_thscode(code)
-                supported.append(code)
-            except ValueError:
-                prefix = code[:3] if code.isascii() and code.isdigit() else "invalid"
-                unsupported[prefix] = unsupported.get(prefix, 0) + 1
-        output["unsupported_prefix_counts"] = unsupported
-        try:
-            supplement = fetch_snapshot_supplement(supported)
-            other = supplement.frame
-            matches = quotes.merge(other, on="code", suffixes=("_ths", "_supplement"))
-            output["supplement"] = {
-                "requested": len(supported), "rows": len(other), "missing": supplement.missing_count,
-                "price_agreements": int(((matches["price_ths"] - matches["price_supplement"]).abs() <= 0.010000001).sum()),
-                "source_dates": sorted({pd.Timestamp(value).date().isoformat() for value in other["source_timestamp"]}),
-            }
-        except Exception:
-            output["supplement"] = {"status": "probe_failed"}
+        output.update(supplement_summary(items, supplement_fetcher=fetch_snapshot_supplement))
     except Exception:
         output["snapshot"] = {"status": "probe_failed"}
     try:

@@ -1702,15 +1702,18 @@ def run_report(
             tuple(dict.fromkeys(portfolio_warnings)) or (() if portfolio_payload else ("数据不足，建议观望",)),
         )
 
-    current_market_value = sum(
-        price * position.quantity
-        for position in settings.positions
-        if (price := prices.get(position.code))
-    )
-    available_cash = max(settings.capital_cny - current_market_value, 0.0)
+    portfolio_valuations_complete = all(position.code in prices for position in settings.positions)
+    available_cash: float | None = None
+    if portfolio_valuations_complete:
+        current_market_value = sum(prices[position.code] * position.quantity for position in settings.positions)
+        available_cash = max(settings.capital_cny - current_market_value, 0.0)
     sizing_payload: dict[str, int] = {}
     sizing_warnings: list[str] = []
+    if not portfolio_valuations_complete:
+        sizing_warnings.append("持仓估值不可用，未提供仓位建议")
     for item in (*screening.short_term, *screening.swing):
+        if not portfolio_valuations_complete:
+            continue
         if item.warning.strip():
             sizing_warnings.append("候选不可操作，未提供仓位建议")
             continue
