@@ -13,7 +13,9 @@ import pandas as pd  # noqa: E402
 
 from src.collaborative_report.market_data import (  # noqa: E402
     MarketDataGateway, _canonical_code, _latest_completed_session_date, _normalize_bar_columns,
+    _normalize_ths_snapshot, normalize_a_share_thscode,
 )
+from src.collaborative_report.snapshot_supplement import fetch_snapshot_supplement  # noqa: E402
 from src.collaborative_report.settings import ThsSettings  # noqa: E402
 from src.collaborative_report.ths_market_data import ThsMarketDataClient  # noqa: E402
 
@@ -62,6 +64,28 @@ def main():
             if not response.items or (type(total) is int and len(items) >= total):
                 break
         output["snapshot"] = snapshot_summary(items)
+        quotes = _normalize_ths_snapshot(items)
+        supported = []
+        unsupported = {}
+        for code in quotes["code"]:
+            try:
+                normalize_a_share_thscode(code)
+                supported.append(code)
+            except ValueError:
+                prefix = code[:3] if code.isascii() and code.isdigit() else "invalid"
+                unsupported[prefix] = unsupported.get(prefix, 0) + 1
+        output["unsupported_prefix_counts"] = unsupported
+        try:
+            supplement = fetch_snapshot_supplement(supported)
+            other = supplement.frame
+            matches = quotes.merge(other, on="code", suffixes=("_ths", "_supplement"))
+            output["supplement"] = {
+                "requested": len(supported), "rows": len(other), "missing": supplement.missing_count,
+                "price_agreements": int(((matches["price_ths"] - matches["price_supplement"]).abs() <= 0.010000001).sum()),
+                "source_dates": sorted({pd.Timestamp(value).date().isoformat() for value in other["source_timestamp"]}),
+            }
+        except Exception:
+            output["supplement"] = {"status": "probe_failed"}
     except Exception:
         output["snapshot"] = {"status": "probe_failed"}
     try:
