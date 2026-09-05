@@ -194,6 +194,30 @@ def test_missing_activity_is_unavailable_for_persistence_and_crowding() -> None:
     assert result.crowding_risk == "unavailable"
 
 
+def test_classify_sector_accepts_current_state_with_only_rank_and_change() -> None:
+    result = classify_sector({"rank": 10, "change_pct": 1}, {})
+
+    assert result == SectorClassification("new_start", "unavailable", "unavailable")
+
+
+def test_negative_current_change_retreats_without_universe_size() -> None:
+    result = classify_sector(
+        {"rank": 10, "change_pct": -1},
+        classification_state(rank=10),
+    )
+
+    assert result.rotation == "retreating"
+
+
+def test_non_top_twenty_narrow_high_activity_sector_has_low_crowding_risk() -> None:
+    result = classify_sector(
+        classification_state(rank=21, breadth_pct=49, activity_percentile=90),
+        classification_state(),
+    )
+
+    assert result.crowding_risk == "low"
+
+
 @pytest.mark.parametrize("observed_at", [datetime(2026, 9, 6), "2026-09-06"])
 @pytest.mark.parametrize("limit", [0, -1, 1.0, True])
 def test_analyze_sectors_rejects_invalid_control_inputs(observed_at: object, limit: object) -> None:

@@ -74,14 +74,17 @@ def _state_number(state: Mapping[str, object], key: str, *, required: bool = Fal
         if required:
             raise ValueError(f"current {key} is required")
         return None
-    return _optional_number(state[key], key)
+    value = _optional_number(state[key], key)
+    if required and value is None:
+        raise ValueError(f"current {key} is required")
+    return value
 
 
 def _validated_state(state: Mapping[str, object], *, current: bool) -> dict[str, float | None]:
     if not isinstance(state, Mapping):
         raise ValueError("sector state must be a mapping")
     label = "current" if current else "previous"
-    required = _STATE_KEYS if current else frozenset()
+    required = frozenset(("rank", "change_pct")) if current else frozenset()
     values: dict[str, float | None] = {}
     for key in _STATE_KEYS:
         values[key] = _state_number(state, key, required=key in required)
@@ -109,7 +112,7 @@ def _crowding(state: Mapping[str, float | None]) -> str:
     activity = state["activity_percentile"]
     if breadth is None or activity is None:
         return "unavailable"
-    if activity >= 90 and breadth < 50:
+    if _top_twenty(state) and activity >= 90 and breadth < 50:
         return "high"
     if activity >= 75 and breadth >= 50:
         return "medium"
@@ -134,7 +137,10 @@ def classify_sector(current: Mapping[str, object], previous: Mapping[str, object
         rotation = "diverging"
     elif _top_twenty(previous_state) and (
         current_state["change_pct"] < 0
-        or current_state["rank"] > current_state["universe_size"] / 2
+        or (
+            current_state["universe_size"] is not None
+            and current_state["rank"] > current_state["universe_size"] / 2
+        )
     ):
         rotation = "retreating"
     elif (
