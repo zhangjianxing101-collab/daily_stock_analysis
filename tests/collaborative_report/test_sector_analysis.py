@@ -44,6 +44,12 @@ def test_public_contracts_are_frozen_and_exact() -> None:
     result = SectorClassification("continuing", "medium", "low")
     with pytest.raises(FrozenInstanceError):
         result.rotation = "retreating"  # type: ignore[misc]
+    row = SectorRow("industry", "A", 1, 1.0, None, None, None, None, None, "first_observation", "unavailable", "unavailable")
+    analysis = SectorAnalysis((row,), (), (), 1)
+    with pytest.raises(FrozenInstanceError):
+        row.rank = 2  # type: ignore[misc]
+    with pytest.raises(FrozenInstanceError):
+        analysis.valid_count = 2  # type: ignore[misc]
 
 
 def test_analyze_sectors_ranks_ties_derives_evidence_and_keeps_buckets_disjoint() -> None:
@@ -82,6 +88,19 @@ def test_analyze_sectors_fills_strongest_first_in_small_universe_and_does_not_mu
     pd.testing.assert_frame_equal(frame, original)
 
 
+def test_analyze_sectors_distinguishes_no_snapshot_from_missing_prior_sector_and_never_mutates_prior() -> None:
+    frame = sector_frame([{"sector_type": "industry", "name": "A", "change_pct": 1}])
+    previous = {("industry", "Other"): classification_state()}
+    original_previous = {key: value.copy() for key, value in previous.items()}
+
+    no_snapshot = analyze_sectors(frame, previous=(), observed_at=OBSERVED_AT)
+    missing_sector = analyze_sectors(frame, previous=previous, observed_at=OBSERVED_AT)
+
+    assert no_snapshot.strongest[0].rotation == "first_observation"
+    assert missing_sector.strongest[0].rotation == "new_start"
+    assert previous == original_previous
+
+
 def test_analyze_sectors_watch_uses_strongest_rows_with_durable_persistence() -> None:
     frame = sector_frame([
         {"sector_type": "industry", "name": "A", "change_pct": 2, "advance_count": 6, "decline_count": 4, "turnover_rate": 20},
@@ -106,8 +125,10 @@ def test_analyze_sectors_watch_uses_strongest_rows_with_durable_persistence() ->
         (classification_state(rank=10, breadth_pct=55, activity_percentile=60), classification_state(rank=15, activity_percentile=60), "accelerating"),
         (classification_state(rank=10, breadth_pct=49, activity_percentile=60), classification_state(rank=15, activity_percentile=60), "diverging"),
         (classification_state(rank=10, breadth_pct=55, activity_percentile=50), classification_state(rank=15, activity_percentile=60), "diverging"),
+        (classification_state(rank=25, breadth_pct=49, universe_size=40), classification_state(rank=10), "diverging"),
         (classification_state(rank=25, change_pct=-1, universe_size=40), classification_state(rank=10), "retreating"),
         (classification_state(rank=10, change_pct=-1), classification_state(rank=10), "retreating"),
+        (classification_state(rank=5, change_pct=-1), classification_state(rank=10), "retreating"),
         (classification_state(rank=10, change_pct=0), classification_state(rank=12), "continuing"),
     ],
 )
@@ -124,6 +145,7 @@ def test_classify_sector_covers_all_rotation_states(
         (classification_state(breadth_pct=55, activity_percentile=60), classification_state(rank=10, activity_percentile=60), "high", "low"),
         (classification_state(breadth_pct=55, activity_percentile=60), classification_state(rank=25, breadth_pct=40, activity_percentile=55), "medium", "low"),
         (classification_state(rank=1, breadth_pct=49, activity_percentile=90), classification_state(), "low", "high"),
+        (classification_state(rank=2, breadth_pct=49, activity_percentile=90), classification_state(), "low", "high"),
         (classification_state(rank=2, breadth_pct=50, activity_percentile=75), classification_state(), "medium", "medium"),
         (classification_state(rank=2, breadth_pct=50, activity_percentile=74.999), classification_state(), "medium", "low"),
     ],
@@ -152,6 +174,24 @@ def test_classify_sector_persistence_and_crowding_boundaries(
 def test_analyze_sectors_rejects_invalid_frames(frame: pd.DataFrame) -> None:
     with pytest.raises(ValueError):
         analyze_sectors(frame, previous={}, observed_at=OBSERVED_AT)
+
+
+@pytest.mark.parametrize("counts", [{"advance_count": 3}, {"decline_count": 2}])
+def test_analyze_sectors_treats_partial_breadth_counts_as_nullable(counts: dict[str, int]) -> None:
+    frame = sector_frame([{"sector_type": "industry", "name": "A", "change_pct": 1, **counts}])
+
+    result = analyze_sectors(frame, previous=(), observed_at=OBSERVED_AT)
+
+    assert result.strongest[0].breadth_pct is None
+
+
+def test_missing_activity_is_unavailable_for_persistence_and_crowding() -> None:
+    current = classification_state(activity_percentile=None)
+
+    result = classify_sector(current, classification_state())
+
+    assert result.persistence == "unavailable"
+    assert result.crowding_risk == "unavailable"
 
 
 @pytest.mark.parametrize("observed_at", [datetime(2026, 9, 6), "2026-09-06"])

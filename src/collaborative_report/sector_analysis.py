@@ -109,7 +109,7 @@ def _crowding(state: Mapping[str, float | None]) -> str:
     activity = state["activity_percentile"]
     if breadth is None or activity is None:
         return "unavailable"
-    if state["rank"] == 1 and activity >= 90 and breadth < 50:
+    if activity >= 90 and breadth < 50:
         return "high"
     if activity >= 75 and breadth >= 50:
         return "medium"
@@ -123,8 +123,6 @@ def classify_sector(current: Mapping[str, object], previous: Mapping[str, object
     previous_state = None if previous is None else _validated_state(previous, current=False)
     if previous is None:
         rotation = "first_observation"
-    elif previous_state is None or previous_state["rank"] is None or previous_state["rank"] > 20:
-        rotation = "new_start" if _top_twenty(current_state) else "continuing"
     elif current_state["change_pct"] > 0 and (
         (current_state["breadth_pct"] is not None and current_state["breadth_pct"] < 50)
         or (
@@ -134,8 +132,14 @@ def classify_sector(current: Mapping[str, object], previous: Mapping[str, object
         )
     ):
         rotation = "diverging"
+    elif _top_twenty(previous_state) and (
+        current_state["change_pct"] < 0
+        or current_state["rank"] > current_state["universe_size"] / 2
+    ):
+        rotation = "retreating"
     elif (
         _top_twenty(current_state)
+        and _top_twenty(previous_state)
         and current_state["rank"] <= previous_state["rank"] - 5
         and (
             current_state["activity_percentile"] is None
@@ -144,8 +148,8 @@ def classify_sector(current: Mapping[str, object], previous: Mapping[str, object
         )
     ):
         rotation = "accelerating"
-    elif current_state["change_pct"] < 0 or current_state["rank"] > current_state["universe_size"] / 2:
-        rotation = "retreating"
+    elif previous_state["rank"] is None or previous_state["rank"] > 20:
+        rotation = "new_start" if _top_twenty(current_state) else "continuing"
     else:
         rotation = "continuing"
 
@@ -192,9 +196,7 @@ def _validate_frame(frame: pd.DataFrame) -> list[dict[str, object]]:
         decline = _optional_number(record.get("decline_count"), "decline_count")
         if advance is not None and advance < 0 or decline is not None and decline < 0:
             raise ValueError("advance_count and decline_count must be non-negative")
-        if (advance is None) != (decline is None):
-            raise ValueError("advance_count and decline_count must be supplied together")
-        denominator = None if advance is None else advance + decline
+        denominator = None if advance is None or decline is None else advance + decline
         breadth_pct = None if denominator is None or denominator == 0 else advance / denominator * 100
         turnover_rate = _optional_number(record.get("turnover_rate"), "turnover_rate")
         if turnover_rate is not None and turnover_rate < 0:
@@ -226,7 +228,7 @@ def _activity_percentiles(rows: list[dict[str, object]]) -> None:
 def analyze_sectors(
     frame: pd.DataFrame,
     *,
-    previous: Mapping[tuple[str, str], Mapping[str, object]] | None,
+    previous: Mapping[tuple[str, str], Mapping[str, object]] | tuple[()] | None,
     observed_at: datetime,
     limit: int = 10,
 ) -> SectorAnalysis:
@@ -236,8 +238,9 @@ def analyze_sectors(
         raise ValueError("observed_at must be timezone-aware")
     if type(limit) is not int or limit <= 0:
         raise ValueError("limit must be a positive integer")
-    if previous is not None and not isinstance(previous, Mapping):
-        raise ValueError("previous must be a mapping or None")
+    if previous != () and previous is not None and not isinstance(previous, Mapping):
+        raise ValueError("previous must be a mapping, an empty tuple, or None")
+    no_trustworthy_prior = previous is None or previous == ()
     rows = _validate_frame(frame)
     _activity_percentiles(rows)
     rows.sort(key=lambda row: (-float(row["change_pct"]), str(row["name"])))
@@ -251,7 +254,7 @@ def analyze_sectors(
             "activity_percentile": row["activity_percentile"],
             "universe_size": universe_size,
         }
-        prior = None if previous is None else previous.get((str(row["sector_type"]), str(row["name"])))
+        prior = None if no_trustworthy_prior else previous.get((str(row["sector_type"]), str(row["name"])), {})
         classification = classify_sector(state, prior)
         output.append(SectorRow(
             sector_type=str(row["sector_type"]), name=str(row["name"]), rank=index,
