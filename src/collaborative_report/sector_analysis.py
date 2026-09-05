@@ -49,7 +49,10 @@ class SectorClassification:
 def _finite_number(value: object, label: str) -> float:
     if isinstance(value, bool) or not isinstance(value, (int, float)):
         raise ValueError(f"{label} must be a finite number")
-    normalized = float(value)
+    try:
+        normalized = float(value)
+    except (OverflowError, TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite number") from exc
     if not math.isfinite(normalized):
         raise ValueError(f"{label} must be a finite number")
     return normalized
@@ -200,8 +203,10 @@ def _validate_frame(frame: pd.DataFrame) -> list[dict[str, object]]:
         change_pct = _finite_number(record["change_pct"], "change_pct")
         advance = _optional_number(record.get("advance_count"), "advance_count")
         decline = _optional_number(record.get("decline_count"), "decline_count")
-        if advance is not None and advance < 0 or decline is not None and decline < 0:
-            raise ValueError("advance_count and decline_count must be non-negative")
+        if advance is not None and (advance < 0 or not advance.is_integer()):
+            raise ValueError("advance_count must be a non-negative integer")
+        if decline is not None and (decline < 0 or not decline.is_integer()):
+            raise ValueError("decline_count must be a non-negative integer")
         denominator = None if advance is None or decline is None else advance + decline
         breadth_pct = None if denominator is None or denominator == 0 else advance / denominator * 100
         turnover_rate = _optional_number(record.get("turnover_rate"), "turnover_rate")
@@ -225,8 +230,18 @@ def _activity_percentiles(rows: list[dict[str, object]]) -> None:
         group = [row for row in rows if row["sector_type"] == sector_type and row["turnover_rate"] is not None]
         group.sort(key=lambda row: (float(row["turnover_rate"]), str(row["name"])))
         count = len(group)
-        for index, row in enumerate(group):
-            row["activity_percentile"] = 100.0 if count == 1 else index / (count - 1) * 100
+        if count == 1:
+            group[0]["activity_percentile"] = 100.0
+            continue
+        start = 0
+        while start < count:
+            end = start + 1
+            while end < count and group[end]["turnover_rate"] == group[start]["turnover_rate"]:
+                end += 1
+            percentile = (start + end - 1) / 2 / (count - 1) * 100
+            for row in group[start:end]:
+                row["activity_percentile"] = percentile
+            start = end
     for row in rows:
         row.setdefault("activity_percentile", None)
 
@@ -249,7 +264,7 @@ def analyze_sectors(
     no_trustworthy_prior = previous is None or previous == ()
     rows = _validate_frame(frame)
     _activity_percentiles(rows)
-    rows.sort(key=lambda row: (-float(row["change_pct"]), str(row["name"])))
+    rows.sort(key=lambda row: (-float(row["change_pct"]), str(row["name"]), str(row["sector_type"])))
     universe_size = len(rows)
     output: list[SectorRow] = []
     for index, row in enumerate(rows, start=1):
@@ -274,7 +289,7 @@ def analyze_sectors(
     strongest_keys = {(row.sector_type, row.name) for row in strongest}
     weakest = tuple(sorted(
         (row for row in output if (row.sector_type, row.name) not in strongest_keys),
-        key=lambda row: (row.change_pct, row.name),
+        key=lambda row: (row.change_pct, row.name, row.sector_type),
     )[:limit])
     watch = tuple(row for row in strongest if row.persistence in {"high", "medium"})
     return SectorAnalysis(strongest=strongest, weakest=weakest, watch=watch, valid_count=len(output))
