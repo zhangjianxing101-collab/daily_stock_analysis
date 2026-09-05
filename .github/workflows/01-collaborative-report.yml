@@ -680,6 +680,23 @@ jobs:
           include-hidden-files: true
           retention-days: 7
 
+      - name: Probe provider quality for previews
+        if: ${{ steps.context.outputs.preview_only == 'true' }}
+        timeout-minutes: 3
+        continue-on-error: true
+        env:
+          THS_API_KEY: ${{ secrets.THS_API_KEY || secrets.THS }}
+        run: python scripts/probe_collaborative_data.py > .workflow-artifacts/provider-quality.json 2> .workflow-artifacts/provider-private-stderr.log
+
+      - name: Upload safe provider quality counts
+        if: ${{ always() && steps.context.outputs.preview_only == 'true' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: provider-quality-${{ steps.context.outputs.report_key }}
+          path: .workflow-artifacts/provider-quality.json
+          include-hidden-files: true
+          retention-days: 3
+
       - name: Upload sent marker
         if: ${{ always() && ((steps.runner.outputs.final_state == 'sent' && steps.context.outputs.test_email == 'false' && steps.runner.outputs.runner_exit == '0') || steps.reconcile.outputs.reconciled == 'true') }}
         uses: actions/upload-artifact@v6

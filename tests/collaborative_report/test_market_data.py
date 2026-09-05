@@ -1,5 +1,6 @@
 import traceback
 from datetime import date, datetime, timedelta, timezone
+from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 from zoneinfo import ZoneInfo
 
@@ -107,6 +108,140 @@ def test_ths_snapshot_is_preferred_and_preserves_source_timestamp() -> None:
     assert result.source == "ths.fuyao.a_share_snapshot"
     assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
     assert result.frame.loc[0, "price"] == 10.0
+
+
+@pytest.mark.parametrize("activity", [0, None])
+def test_ths_snapshot_quarantines_missing_unquoted_rows(activity) -> None:
+    client = Mock()
+    client.a_share_snapshot.return_value = ths_response([
+        ths_snapshot_item("600000"),
+        {**ths_snapshot_item("600001"), "last_price": None, "volume": activity, "turnover": activity},
+    ])
+    data = MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_a_share_snapshot(["600000", "600001"])
+    assert data.frame["code"].tolist() == ["600000"]
+    assert data.frame.attrs["quarantined_row_count"] == 1
+    assert data.frame.attrs["provider_row_count"] == 2
+    assert "ths_snapshot_unquoted_rows_excluded" in data.warnings
+
+
+def test_ths_snapshot_does_not_hide_missing_price_with_active_trading() -> None:
+    client = Mock()
+    client.a_share_snapshot.return_value = ths_response([
+        ths_snapshot_item("600000"), {**ths_snapshot_item("600001"), "last_price": None},
+    ])
+    with pytest.raises(ValueError, match="THS snapshot contains unsafe prices"):
+        MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_a_share_snapshot(["600000", "600001"])
+
+
+@pytest.mark.parametrize("bad", [
+    {"last_price": "invalid", "volume": None, "turnover": None},
+    {"last_price": None, "volume": "invalid", "turnover": None},
+])
+def test_ths_quarantine_does_not_hide_malformed_values(bad) -> None:
+    client = Mock()
+    client.a_share_snapshot.return_value = ths_response([
+        ths_snapshot_item("600000"), {**ths_snapshot_item("600001"), **bad},
+    ])
+    with pytest.raises(ValueError):
+        MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_a_share_snapshot(["600000", "600001"])
+
+
+@pytest.mark.parametrize("fault", [None, "future", "stale", "price", "missing", "duplicate", "unknown", "boundary", "above_boundary"])
+def test_ths_supplement_requires_independent_time_identity_and_price_agreement(fault) -> None:
+    stamp = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    record = {"code": "600000", "name": "Stock", "price": 10.0,
+              "volume_ratio": 1.2, "turnover": 2.3, "source_timestamp": stamp}
+    if fault == "future":
+        record["source_timestamp"] = OBSERVED_AT + timedelta(seconds=1)
+    elif fault == "stale":
+        record["source_timestamp"] = stamp - timedelta(days=1)
+    elif fault == "price":
+        record["price"] = 11.0
+    elif fault == "missing":
+        record["volume_ratio"] = np.nan
+    elif fault == "unknown":
+        record["code"] = "600001"
+    elif fault == "boundary":
+        record["price"] = 10.01
+    elif fault == "above_boundary":
+        record["price"] = 10.01001
+    records = [record, record] if fault == "duplicate" else [record]
+    fetcher = Mock(return_value=SimpleNamespace(frame=pd.DataFrame(records), observed_at=OBSERVED_AT))
+    client = Mock()
+    client.a_share_snapshot.return_value = ths_response([ths_snapshot_item()])
+    data = MarketDataGateway(ths_client=client, snapshot_supplement_fetcher=fetcher,
+                             clock=lambda: OBSERVED_AT).get_a_share_snapshot(["600000"])
+    fetcher.assert_called_once_with(("600000",))
+    if fault in (None, "boundary"):
+        assert data.frame.loc[0, "name"] == "Stock"
+        assert data.frame.loc[0, "turnover"] == 2.3
+        assert data.frame.loc[0, "amount"] == 10000.0
+        assert data.source.endswith("+tencent")
+        assert data.frame.attrs["screening_complete_count"] == 1
+    else:
+        assert pd.isna(data.frame.loc[0, "name"])
+        assert "snapshot_screening_fields_incomplete" in data.warnings
+        assert data.frame.attrs["screening_complete_count"] == 0
+
+
+def test_ths_supplement_skips_unsupported_code_without_losing_supported_coverage() -> None:
+    stamp = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    fetcher = Mock(return_value=SimpleNamespace(
+        frame=pd.DataFrame([{
+            "code": "600000", "name": "Stock", "price": 10.0,
+            "volume_ratio": 1.2, "turnover": 2.3, "source_timestamp": stamp,
+        }]),
+        observed_at=OBSERVED_AT,
+    ))
+    client = Mock()
+    client.a_share_snapshot.return_value = ThsApiResponse(
+        {
+            "timestamp": int(stamp.timestamp() * 1000),
+            "total": 2,
+            "item": [ths_snapshot_item("600000"), ths_snapshot_item("302001")],
+        },
+        None,
+    )
+
+    data = MarketDataGateway(
+        ths_client=client,
+        snapshot_supplement_fetcher=fetcher,
+        clock=lambda: OBSERVED_AT,
+    ).get_a_share_snapshot()
+
+    fetcher.assert_called_once_with(("600000",))
+    assert data.frame.attrs["screening_complete_count"] == 1
+    assert data.frame.set_index("code").loc["600000", "name"] == "Stock"
+    assert pd.isna(data.frame.set_index("code").loc["302001", "name"])
+    assert "snapshot_screening_fields_incomplete" in data.warnings
+
+
+def test_ths_full_snapshot_preserves_oldest_page_timestamp() -> None:
+    client = Mock()
+    older = OBSERVED_AT - timedelta(hours=2)
+    newer = OBSERVED_AT - timedelta(hours=1)
+    client.a_share_snapshot.side_effect = [
+        ThsApiResponse({"timestamp": int(older.timestamp() * 1000), "total": 2,
+                        "item": [ths_snapshot_item("600000")]}, None),
+        ThsApiResponse({"timestamp": int(newer.timestamp() * 1000), "total": 2,
+                        "item": [ths_snapshot_item("600001")]}, None),
+    ]
+    data = MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_a_share_snapshot()
+    assert data.source_timestamp == older
+
+
+def test_ths_snapshot_rejects_mixed_session_pages_even_before_market_close() -> None:
+    yesterday = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    today = datetime(2026, 8, 20, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    client = Mock()
+    client.a_share_snapshot.side_effect = [
+        ThsApiResponse({"timestamp": int(yesterday.timestamp() * 1000), "total": 2,
+                        "item": [ths_snapshot_item("600000")]}, None),
+        ThsApiResponse({"timestamp": int(today.timestamp() * 1000), "total": 2,
+                        "item": [ths_snapshot_item("600001")]}, None),
+    ]
+    with pytest.raises(ValueError, match="THS snapshot pages have mixed sessions"):
+        MarketDataGateway(ths_client=client, clock=lambda: today + timedelta(minutes=10)).get_a_share_snapshot()
 
 
 def test_ths_full_snapshot_reads_all_pages_before_returning_data() -> None:

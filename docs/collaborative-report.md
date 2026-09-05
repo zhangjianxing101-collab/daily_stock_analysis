@@ -39,6 +39,30 @@ python scripts/run_collaborative_report.py query index bars 886042.TI --expected
 
 Queries are read-only data retrieval, not trading commands. Review returned data quality and confirm every investment decision manually.
 
+## Snapshot completeness
+
+THS rows without a quoted price are excluded only when volume and traded amount
+are also genuinely missing or zero. Malformed text, negative values, duplicate
+codes, or missing prices alongside trading activity still fail validation. The
+report discloses excluded-row and screening-field coverage counts.
+Snapshot pages with different source-session dates are rejected before aggregation.
+When any held position lacks a validated price, the report cannot determine available
+cash and suppresses all new-position sizing. An explicitly empty portfolio still
+uses the configured capital baseline.
+
+Production snapshots supplement THS names, volume ratios and turnover percentages
+from the project's public Tencent quote source before screening the full universe.
+THS traded amount is never interpreted as turnover percentage. Supplements require
+exact identities, independent same-session timestamps at or after 15:00, no future
+timestamps, finite metrics, and price agreement within CNY 0.01. Rejected fields
+remain unavailable. Codes outside the supplemental provider's supported exchange
+prefixes do not block enrichment for the supported universe. Partial coverage marks screening as partial. For conservative
+freshness checks, the combined dataset uses the oldest accepted source timestamp;
+one expired source can therefore invalidate the combined snapshot.
+
+Preview runs additionally produce bounded `provider-quality` diagnostics containing
+only counts and parsed dates. Raw responses, stderr and credentials are not uploaded.
+
 ## Gold history completeness
 
 Empty or stale gold responses, or recognized connection/time-out failures, allow

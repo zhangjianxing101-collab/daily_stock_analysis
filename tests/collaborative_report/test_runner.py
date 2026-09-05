@@ -39,7 +39,7 @@ from src.collaborative_report.runner import _production_mail_sender
 from src.collaborative_report.screener import ScreeningResult, screen_aggressive
 from src.collaborative_report.session import ReportSession, build_report_session, report_data_session
 from src.collaborative_report.settings import CollaborativeSettings
-from src.collaborative_report.ths_market_data import ThsMarketDataClient
+from src.collaborative_report.ths_market_data import ThsApiResponse, ThsMarketDataClient
 
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
@@ -267,6 +267,19 @@ def test_calendar_worker_timeout_stops_production_before_data_and_mail(tmp_path,
     deps.mail_sender.assert_not_called()
 
 
+def test_incomplete_supplement_marks_market_and_screening_partial(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.snapshot.frame.attrs.update(quarantined_row_count=1, screening_complete_count=1)
+    gateway.snapshot = replace(gateway.snapshot, warnings=("snapshot_screening_fields_incomplete",))
+    result = run_report(ReportMode.PREMARKET, deps=replace(deps, gateway=gateway),
+                        force=True, preview_only=True, output_dir=tmp_path)
+    assert result.modules["market"].status == "partial"
+    assert result.modules["market"].payload["无报价剔除记录"] == 1
+    assert result.modules["market"].payload["选股字段齐全记录"] == 1
+    assert result.modules["screening"].status == "partial"
+    deps.mail_sender.assert_not_called()
+
+
 def test_force_bypasses_only_window_gate(tmp_path, deps) -> None:
     session_builder = Mock(side_effect=deps.session_builder)
     stale_gateway = FakeGateway()
@@ -307,6 +320,78 @@ def test_force_still_applies_risk_and_board_lot_sizing(tmp_path, deps) -> None:
         9.8,
         capital=20_000,
         available_cash=18_980,
+        risk_fraction=0.02,
+    )
+
+
+def test_quarantined_held_snapshot_row_suppresses_all_new_position_sizing(tmp_path, deps) -> None:
+    primary = Mock()
+    primary.a_share_snapshot.return_value = ThsApiResponse(
+        {
+            "timestamp": int(datetime(2026, 8, 19, 15, 5, tzinfo=SHANGHAI).timestamp() * 1000),
+            "total": 2,
+            "item": [
+                {
+                    "thscode": "600000.SH",
+                    "ticker": PORTFOLIO_CODE,
+                    "last_price": None,
+                    "price_change_ratio_pct": 0.0,
+                    "volume": 0,
+                    "turnover": 0,
+                },
+                {
+                    "thscode": "600001.SH",
+                    "ticker": CANDIDATE_CODE,
+                    "last_price": 10.5,
+                    "price_change_ratio_pct": 1.0,
+                    "volume": 1_000_000,
+                    "turnover": 100_000_000,
+                },
+            ],
+        },
+        None,
+    )
+    gateway = FakeGateway()
+    snapshot_gateway = MarketDataGateway(ths_client=primary, clock=lambda: NOW)
+    gateway.get_a_share_snapshot = snapshot_gateway.get_a_share_snapshot
+    sizing_evaluator = Mock(return_value=100)
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway, sizing_evaluator=sizing_evaluator),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["market"].payload["无报价剔除记录"] == 1
+    assert result.modules["portfolio"].status == "unavailable"
+    assert result.modules["sizing"].status == "unavailable"
+    assert result.modules["sizing"].warnings == ("持仓估值不可用，未提供仓位建议",)
+    sizing_evaluator.assert_not_called()
+
+
+def test_empty_portfolio_keeps_full_capital_available_for_sizing(tmp_path, deps, settings) -> None:
+    sizing_evaluator = Mock(return_value=100)
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(
+            deps,
+            settings_loader=lambda: replace(settings, positions=()),
+            sizing_evaluator=sizing_evaluator,
+        ),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["portfolio"].status == "ok"
+    sizing_evaluator.assert_called_once_with(
+        10.5,
+        9.8,
+        capital=20_000,
+        available_cash=20_000,
         risk_fraction=0.02,
     )
 
