@@ -1,5 +1,6 @@
 import traceback
 from datetime import date, datetime, timedelta, timezone
+import sys
 from types import SimpleNamespace
 from unittest.mock import Mock, call, patch
 from zoneinfo import ZoneInfo
@@ -720,6 +721,150 @@ def test_get_leading_sector_codes_wraps_sector_list_failure() -> None:
     assert caught.value.__cause__ is None
     assert "secret" not in formatted_traceback(caught)
     assert "https://feed.invalid" not in formatted_traceback(caught)
+
+
+def test_get_sector_snapshot_normalizes_industry_fields_and_preserves_raw_input() -> None:
+    raw = pd.DataFrame(
+        {
+            "板块名称": ["  半导体  "],
+            "涨跌幅": ["2.5%"],
+            "上涨家数": ["10"],
+            "下跌家数": ["2"],
+            "换手率": ["3.4%"],
+            "成交额": ["1,234"],
+            "领涨股票": ["  芯片股  "],
+            "领涨股票代码": ["000001"],
+            "领涨股票-涨跌幅": ["5.6%"],
+        }
+    )
+    raw.attrs["source_timestamp"] = "2026-08-19 15:00:00"
+    original = raw.copy(deep=True)
+    original.attrs = raw.attrs.copy()
+
+    result = MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert list(result.frame.columns) == [
+        "sector_type", "name", "change_pct", "advance_count", "decline_count", "turnover_rate", "amount",
+        "leader_name", "leader_code", "leader_change_pct",
+    ]
+    assert result.frame.to_dict("records") == [{
+        "sector_type": "industry", "name": "半导体", "change_pct": 2.5, "advance_count": 10.0,
+        "decline_count": 2.0, "turnover_rate": 3.4, "amount": 1234.0, "leader_name": "芯片股",
+        "leader_code": "000001", "leader_change_pct": 5.6,
+    }]
+    assert result.source == "akshare.eastmoney_industry_boards"
+    assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    pd.testing.assert_frame_equal(raw, original)
+    assert raw.attrs == original.attrs
+
+
+def test_get_sector_snapshot_normalizes_concept_english_aliases_and_optional_na() -> None:
+    raw = pd.DataFrame({"sector": ["AI"], "change_pct": ["1.2"], "leader_code": [" "], "amount": ["bad"]})
+
+    result = MarketDataGateway(concept_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("concept")
+
+    assert result.frame.loc[0, "sector_type"] == "concept"
+    assert result.frame.loc[0, "name"] == "AI"
+    assert result.frame.loc[0, "change_pct"] == 1.2
+    for column in ("advance_count", "decline_count", "turnover_rate", "amount", "leader_name", "leader_code", "leader_change_pct"):
+        assert pd.isna(result.frame.loc[0, column])
+    assert result.warnings == ("snapshot source timestamp unavailable",)
+
+
+def test_get_sector_snapshot_uses_correct_default_akshare_fetchers(monkeypatch) -> None:
+    industry = Mock(return_value=pd.DataFrame({"name": ["Industry"], "change_pct": [1]}))
+    concept = Mock(return_value=pd.DataFrame({"name": ["Concept"], "change_pct": [2]}))
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(
+        stock_board_industry_name_em=industry,
+        stock_board_concept_name_em=concept,
+    ))
+    gateway = MarketDataGateway(clock=lambda: OBSERVED_AT)
+
+    assert gateway.get_sector_snapshot("industry").frame.loc[0, "name"] == "Industry"
+    assert gateway.get_sector_snapshot("concept").frame.loc[0, "name"] == "Concept"
+    industry.assert_called_once_with()
+    concept.assert_called_once_with()
+
+
+def test_get_sector_snapshot_rejects_invalid_type_and_isolates_provider_failures() -> None:
+    industry = Mock(side_effect=RuntimeError("https://feed.invalid/?token=secret"))
+    concept = Mock(return_value=pd.DataFrame({"name": ["Concept"], "change_pct": [1]}))
+    gateway = MarketDataGateway(industry_sector_fetcher=industry, concept_sector_fetcher=concept, clock=lambda: OBSERVED_AT)
+
+    with pytest.raises(ValueError, match="^sector type invalid$"):
+        gateway.get_sector_snapshot("other")
+    with pytest.raises(ValueError, match="^industry sector provider unavailable$") as caught:
+        gateway.get_sector_snapshot("industry")
+    assert caught.value.__cause__ is None
+    assert "secret" not in formatted_traceback(caught)
+    assert gateway.get_sector_snapshot("concept").frame.loc[0, "name"] == "Concept"
+
+
+@pytest.mark.parametrize("raw", [None, pd.DataFrame(), pd.DataFrame({"name": ["A"]}), pd.DataFrame({"change_pct": [1]})])
+def test_get_sector_snapshot_rejects_empty_and_missing_required_data(raw) -> None:
+    gateway = MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT)
+
+    with pytest.raises(ValueError, match="^industry sector provider returned (empty|invalid) data$"):
+        gateway.get_sector_snapshot("industry")
+
+
+def test_get_sector_snapshot_excludes_invalid_change_rows_with_count_and_rejects_all_invalid() -> None:
+    raw = pd.DataFrame({"name": ["Valid", "Blank", "Bad", "Infinite"], "change_pct": [1, 2, "bad", np.inf]})
+    raw.loc[1, "name"] = " "
+    result = MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.frame["name"].tolist() == ["Valid"]
+    assert result.warnings == ("sector snapshot rows excluded: 3", "snapshot source timestamp unavailable")
+    all_invalid = pd.DataFrame({"name": [" ", "Bad"], "change_pct": [1, "bad"]})
+    with pytest.raises(ValueError, match="^industry sector provider returned invalid data$"):
+        MarketDataGateway(industry_sector_fetcher=lambda: all_invalid, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+
+@pytest.mark.parametrize(
+    "column, value",
+    [
+        ("advance_count", -1), ("advance_count", 1.5), ("decline_count", -1), ("decline_count", 1.5),
+        ("turnover_rate", -0.1), ("amount", -1), ("turnover_rate", np.inf), ("amount", np.inf),
+    ],
+)
+def test_get_sector_snapshot_rejects_invalid_optional_finite_values(column: str, value: object) -> None:
+    raw = pd.DataFrame({"name": ["A"], "change_pct": [1], column: [value]})
+    with pytest.raises(ValueError, match="^industry sector provider returned invalid data$"):
+        MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+
+def test_get_sector_snapshot_rejects_duplicate_names() -> None:
+    raw = pd.DataFrame({"name": [" A ", "A"], "change_pct": [1, 2]})
+    with pytest.raises(ValueError, match="^industry sector provider returned invalid data$"):
+        MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+
+def test_get_sector_snapshot_handles_source_timestamps_and_postmarket_freshness_boundary() -> None:
+    raw = pd.DataFrame({"name": ["A"], "change_pct": [1]})
+    raw.attrs["quote_timestamp"] = "2026-08-19 15:00:00"
+    boundary = datetime(2026, 8, 19, 19, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+    assert (
+        MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: boundary)
+        .get_sector_snapshot("industry").source_timestamp
+        == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    )
+    with pytest.raises(ValueError, match="^industry sector snapshot stale$"):
+        MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: boundary + timedelta(seconds=1)).get_sector_snapshot("industry")
+    raw.attrs["data_timestamp"] = "2026-08-19 19:01:00+08:00"
+    raw.attrs.pop("quote_timestamp")
+    with pytest.raises(ValueError, match="^industry sector source timestamp is in the future$"):
+        MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: boundary).get_sector_snapshot("industry")
+
+
+def test_get_sector_snapshot_marks_invalid_source_timestamp_unavailable() -> None:
+    raw = pd.DataFrame({"name": ["A"], "change_pct": [1]})
+    raw.attrs["source_timestamp"] = "not-a-timestamp"
+
+    result = MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.source_timestamp is None
+    assert result.warnings == ("snapshot source timestamp unavailable",)
 
 
 def global_download_frame(*, multi_index: bool) -> pd.DataFrame:
