@@ -867,6 +867,51 @@ def test_get_sector_snapshot_marks_invalid_source_timestamp_unavailable() -> Non
     assert result.warnings == ("snapshot source timestamp unavailable",)
 
 
+@pytest.mark.parametrize(
+    "value",
+    [
+        pd.Series(["2026-08-19T15:00:00+08:00"]),
+        np.array(["2026-08-19T15:00:00+08:00", "2026-08-19T15:01:00+08:00"]),
+        ["2026-08-19T15:00:00+08:00"],
+    ],
+)
+def test_get_sector_snapshot_marks_non_scalar_source_timestamp_unavailable(value: object) -> None:
+    raw = pd.DataFrame({"name": ["A"], "change_pct": [1]})
+    raw.attrs["source_timestamp"] = value
+
+    result = MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.source_timestamp is None
+    assert result.warnings == ("snapshot source timestamp unavailable",)
+
+
+def test_get_sector_snapshot_marks_pd_na_source_timestamp_unavailable() -> None:
+    raw = pd.DataFrame({"name": ["A"], "change_pct": [1]})
+    raw.attrs["source_timestamp"] = pd.NA
+
+    result = MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.source_timestamp is None
+    assert result.warnings == ("snapshot source timestamp unavailable",)
+
+
+def test_get_sector_snapshot_skips_missing_higher_priority_timestamp_alias() -> None:
+    raw = pd.DataFrame({"name": ["A"], "change_pct": [1]})
+    raw.attrs["source_timestamp"] = pd.NA
+    raw.attrs["quote_timestamp"] = "2026-08-19T15:00:00+08:00"
+
+    result = MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    assert result.warnings == ()
+
+
+@pytest.mark.parametrize("sector_type", [[], {}, set()])
+def test_get_sector_snapshot_rejects_unhashable_sector_type(sector_type: object) -> None:
+    with pytest.raises(ValueError, match="^sector type invalid$"):
+        MarketDataGateway().get_sector_snapshot(sector_type)
+
+
 def global_download_frame(*, multi_index: bool) -> pd.DataFrame:
     symbols = ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F"]
     dates = pd.to_datetime(["2026-08-17", "2026-08-18"])

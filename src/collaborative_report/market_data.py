@@ -133,12 +133,26 @@ class MarketDataset:
 
 
 def _snapshot_source_timestamp(raw: pd.DataFrame) -> tuple[datetime | None, tuple[str, ...]]:
-    value = next(
-        (raw.attrs.get(key) for key in ("source_timestamp", "quote_timestamp", "data_timestamp") if raw.attrs.get(key)),
-        None,
-    )
+    unavailable = (None, ("snapshot source timestamp unavailable",))
+    value: object | None = None
+    for key in ("source_timestamp", "quote_timestamp", "data_timestamp"):
+        candidate = raw.attrs.get(key)
+        if candidate is None:
+            continue
+        if not pd.api.types.is_scalar(candidate):
+            return unavailable
+        try:
+            missing = pd.isna(candidate)
+            if not isinstance(missing, (bool, np.bool_)):
+                return unavailable
+            if bool(missing):
+                continue
+        except Exception:
+            return unavailable
+        value = candidate
+        break
     if value is None:
-        return None, ("snapshot source timestamp unavailable",)
+        return unavailable
     try:
         timestamp = pd.Timestamp(value)
         if pd.isna(timestamp):
@@ -146,8 +160,8 @@ def _snapshot_source_timestamp(raw: pd.DataFrame) -> tuple[datetime | None, tupl
         if timestamp.tzinfo is None:
             timestamp = timestamp.tz_localize("Asia/Shanghai")
         return timestamp.to_pydatetime(), ()
-    except (TypeError, ValueError, OverflowError):
-        return None, ("snapshot source timestamp unavailable",)
+    except Exception:
+        return unavailable
 
 
 def _matching_column(frame: pd.DataFrame, aliases: tuple[str, ...]) -> object | None:
@@ -831,7 +845,7 @@ class MarketDataGateway:
         return MarketDataset(frame, "akshare.industry_boards", self._observed_at(), tuple(warnings))
 
     def get_sector_snapshot(self, sector_type: str) -> MarketDataset:
-        if sector_type not in {"industry", "concept"}:
+        if not isinstance(sector_type, str) or sector_type not in {"industry", "concept"}:
             raise ValueError("sector type invalid")
         requested_at = self._observed_at()
         fetcher = (
