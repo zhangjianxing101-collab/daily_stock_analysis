@@ -28,6 +28,7 @@ from .models import Candidate, ModuleResult, Position, ReportMode
 from .report import RenderedReport, render_report
 from .risk import evaluate_position, suggested_board_lots
 from .screener import ScreeningResult, prefilter_universe, rank_with_ths_evidence, screen_aggressive
+from .sector_analysis import SectorAnalysis
 from .session import SHANGHAI_TIMEZONE, ReportSession, build_report_session, report_data_session
 from .settings import CollaborativeSettings, ThsSettings
 from .ths_market_data import ThsIndexTag, ThsMarketDataClient
@@ -46,6 +47,15 @@ _UNTRUSTED_SNAPSHOT_CANDIDATE_WARNING = "快照权威性不足，仅供观望"
 _SNAPSHOT_AUTHORITY_WARNING_CODE = "snapshot_timestamp_untrusted"
 _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING = "快照来源时间不可用，所有建议仅供观察"
 _REPORT_KEY_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})-(premarket|postmarket)")
+_SECTOR_STATE_KEYS = frozenset((
+    "sector_type", "name", "rank", "change_pct", "breadth_pct", "activity_percentile",
+    "universe_size", "rotation", "persistence", "crowding_risk", "source_timestamp",
+))
+_SECTOR_TYPES = frozenset(("industry", "concept"))
+_SECTOR_ROTATIONS = frozenset((
+    "first_observation", "new_start", "continuing", "accelerating", "diverging", "retreating",
+))
+_SECTOR_LEVELS = frozenset(("high", "medium", "low", "unavailable"))
 _POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=4)
 _PREMARKET_MAX_SOURCE_AGE = timedelta(days=4)
 _DATA_FAILURE_CODES = {
@@ -940,6 +950,178 @@ def _load_prior_state(path: Path | None, session: ReportSession) -> tuple[Mappin
     return tuple(rows)
 
 
+def _sector_state_error(message: str) -> ValueError:
+    return ValueError(message)
+
+
+def _sector_state_number(value: object, *, nullable: bool = False) -> float | None:
+    if value is None and nullable:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError
+    return normalized
+
+
+def _sector_state_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError
+    return parsed
+
+
+def _validated_sector_state_item(
+    item: object,
+    *,
+    manifest_date: date | None = None,
+    generated_at: datetime | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if not isinstance(item, Mapping) or set(item) != _SECTOR_STATE_KEYS:
+        raise ValueError
+    sector_type = item["sector_type"]
+    name = item["name"]
+    if sector_type not in _SECTOR_TYPES or not isinstance(name, str) or not name.strip():
+        raise ValueError
+    rank = item["rank"]
+    universe_size = item["universe_size"]
+    if type(rank) is not int or not 0 < rank <= 20:
+        raise ValueError
+    if type(universe_size) is not int or universe_size < rank:
+        raise ValueError
+    change_pct = _sector_state_number(item["change_pct"])
+    breadth_pct = _sector_state_number(item["breadth_pct"], nullable=True)
+    activity_percentile = _sector_state_number(item["activity_percentile"], nullable=True)
+    if (breadth_pct is not None and not 0 <= breadth_pct <= 100) or (
+        activity_percentile is not None and not 0 <= activity_percentile <= 100
+    ):
+        raise ValueError
+    rotation = item["rotation"]
+    persistence = item["persistence"]
+    crowding_risk = item["crowding_risk"]
+    if rotation not in _SECTOR_ROTATIONS or persistence not in _SECTOR_LEVELS or crowding_risk not in _SECTOR_LEVELS:
+        raise ValueError
+    source_timestamp = _sector_state_timestamp(item["source_timestamp"])
+    if generated_at is not None and source_timestamp > generated_at:
+        raise ValueError
+    if now is not None and source_timestamp > now:
+        raise ValueError
+    if manifest_date is not None and source_timestamp.astimezone(SHANGHAI_TIMEZONE).date() > manifest_date:
+        raise ValueError
+    return {
+        "sector_type": sector_type,
+        "name": name.strip(),
+        "rank": rank,
+        "change_pct": change_pct,
+        "breadth_pct": breadth_pct,
+        "activity_percentile": activity_percentile,
+        "universe_size": universe_size,
+        "rotation": rotation,
+        "persistence": persistence,
+        "crowding_risk": crowding_risk,
+        "source_timestamp": source_timestamp.isoformat(),
+    }
+
+
+def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple[Mapping[str, Any], ...]:
+    """Load one earlier sent postmarket sector snapshot without exposing its payload on failure."""
+
+    try:
+        if path is None or not path.is_file():
+            raise ValueError
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(payload, dict) or payload.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+            raise ValueError
+        trading_date = payload.get("trading_date")
+        if not isinstance(trading_date, str):
+            raise ValueError
+        parsed_date = date.fromisoformat(trading_date)
+        if parsed_date.isoformat() != trading_date or parsed_date >= session.trading_date:
+            raise ValueError
+        if (
+            payload.get("mode") != ReportMode.POSTMARKET.value
+            or payload.get("final_state") != FinalState.SENT.value
+            or payload.get("test_email") is not False
+            or payload.get("report_key") != f"{trading_date}-{ReportMode.POSTMARKET.value}"
+            or not isinstance(payload.get("sector_state"), list)
+        ):
+            raise ValueError
+        _canonical_report_key(str(payload["report_key"]))
+        generated_at = _sector_state_timestamp(payload.get("generated_at"))
+        if (
+            generated_at.astimezone(SHANGHAI_TIMEZONE).date() != parsed_date
+            or generated_at > session.now_shanghai
+        ):
+            raise ValueError
+        rows: list[Mapping[str, Any]] = []
+        identities: set[tuple[str, str]] = set()
+        for item in payload["sector_state"]:
+            normalized = _validated_sector_state_item(
+                item, manifest_date=parsed_date, generated_at=generated_at, now=session.now_shanghai,
+            )
+            identity = (normalized["sector_type"], normalized["name"])
+            if identity in identities:
+                raise ValueError
+            identities.add(identity)
+            rows.append(normalized)
+        return tuple(rows)
+    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, OverflowError):
+        raise _sector_state_error("prior sector state unavailable") from None
+
+
+def _sector_state(
+    analyses: Mapping[str, SectorAnalysis], source_timestamps: Mapping[str, datetime | None]
+) -> list[dict[str, Any]]:
+    """Serialize the privacy-safe state needed for the next sector comparison."""
+
+    try:
+        if not isinstance(analyses, Mapping) or not isinstance(source_timestamps, Mapping):
+            raise ValueError
+        rows: list[dict[str, Any]] = []
+        identities: set[tuple[str, str]] = set()
+        for sector_type, analysis in analyses.items():
+            if sector_type not in _SECTOR_TYPES or not isinstance(analysis, SectorAnalysis):
+                raise ValueError
+            source = source_timestamps.get(sector_type)
+            if source is None:
+                continue
+            if not isinstance(source, datetime) or source.tzinfo is None or source.utcoffset() is None:
+                raise ValueError
+            if type(analysis.valid_count) is not int or analysis.valid_count <= 0:
+                raise ValueError
+            for row in analysis.strongest:
+                if row.sector_type != sector_type:
+                    raise ValueError
+                if row.rank > 20:
+                    continue
+                normalized = _validated_sector_state_item({
+                    "sector_type": row.sector_type,
+                    "name": row.name,
+                    "rank": row.rank,
+                    "change_pct": row.change_pct,
+                    "breadth_pct": row.breadth_pct,
+                    "activity_percentile": row.activity_percentile,
+                    "universe_size": analysis.valid_count,
+                    "rotation": row.rotation,
+                    "persistence": row.persistence,
+                    "crowding_risk": row.crowding_risk,
+                    "source_timestamp": source.isoformat(),
+                })
+                identity = (normalized["sector_type"], normalized["name"])
+                if identity in identities:
+                    raise ValueError
+                identities.add(identity)
+                rows.append(normalized)
+        rows.sort(key=lambda row: (str(row["sector_type"]), int(row["rank"]), str(row["name"])))
+        return rows
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        raise _sector_state_error("sector state invalid") from None
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -1218,6 +1400,7 @@ def _redacted_manifest(
     test_email: bool,
     market_source_timestamp: str,
     generated_at: datetime | None = None,
+    sector_state: Sequence[Mapping[str, Any]] = (),
 ) -> dict[str, Any]:
     generated = generated_at if generated_at is not None else session.now_shanghai
     source_timestamps = {
@@ -1240,6 +1423,18 @@ def _redacted_manifest(
     if session.mode is ReportMode.PREMARKET:
         manifest["candidate_state"] = _candidate_state(candidates, portfolio_codes)
     else:
+        try:
+            manifest["sector_state"] = [
+                _validated_sector_state_item(
+                    item,
+                    manifest_date=session.trading_date,
+                    generated_at=generated,
+                    now=session.now_shanghai,
+                )
+                for item in sector_state
+            ]
+        except (TypeError, ValueError, OverflowError):
+            raise _sector_state_error("sector state invalid") from None
         manifest["morning_candidate_statuses"] = [
             {"code": row.get("code"), "status": row.get("status")}
             for row in morning_candidates
