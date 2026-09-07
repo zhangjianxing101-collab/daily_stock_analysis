@@ -1871,6 +1871,21 @@ def test_load_prior_sector_state_rejects_corrupt_or_non_mapping_roots(tmp_path, 
         _load_prior_sector_state(path, session)
 
 
+def test_load_prior_sector_state_converts_deep_json_recursion_to_fixed_error(tmp_path) -> None:
+    depth = 10_000
+    content = '{"nested":' + "[" * depth + "0" + "]" * depth + "}"
+    with pytest.raises(RecursionError):
+        json.loads(content)
+    path = tmp_path / "recursive.json"
+    path.write_text(content, encoding="utf-8")
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+
+    with pytest.raises(ValueError, match="^prior sector state unavailable$") as error:
+        _load_prior_sector_state(path, session)
+    assert error.value.__cause__ is None
+    assert error.value.__suppress_context__ is True
+
+
 @pytest.mark.parametrize(
     "overrides",
     [

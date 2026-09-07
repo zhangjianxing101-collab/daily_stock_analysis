@@ -1085,7 +1085,15 @@ def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple
             identities.add(identity)
             rows.append(normalized)
         return tuple(rows)
-    except (OSError, UnicodeError, json.JSONDecodeError, TypeError, ValueError, OverflowError):
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+    ):
         raise _sector_state_error("prior sector state unavailable") from None
 
 
