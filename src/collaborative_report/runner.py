@@ -496,11 +496,27 @@ def _unavailable(name: str, observed_at: datetime, warning: str) -> ModuleResult
     return ModuleResult(name=name, status="unavailable", observed_at=observed_at, payload={}, warnings=(warning,))
 
 
+def _unavailable_market_payload() -> dict[str, str]:
+    return {
+        "股票数量": "不可用",
+        "上涨家数": "不可用",
+        "下跌家数": "不可用",
+        "平盘家数": "不可用",
+        "上涨占比": "不可用",
+        "成交额": "不可用",
+        "市场温度": "不可用",
+        "涨停家数": "不可用",
+        "跌停家数": "不可用",
+        "市场风格": "不可用",
+    }
+
+
 def _data_unavailable(
     name: str, observed_at: datetime, warning: str, error: Exception, fallback: str,
 ) -> ModuleResult:
     code = _DATA_FAILURE_CODES.get(str(error), fallback)
-    return ModuleResult(name, "unavailable", observed_at, {}, (warning, code))
+    payload: Mapping[str, Any] = _unavailable_market_payload() if name == "market" else {}
+    return ModuleResult(name, "unavailable", observed_at, payload, (warning, code))
 
 
 def _module(name: str, observed_at: datetime, payload: Mapping[str, Any], *warnings: str) -> ModuleResult:
@@ -537,23 +553,13 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
         coverage["无报价剔除记录"] = int(frame.attrs["quarantined_row_count"])
     if "screening_complete_count" in frame.attrs:
         coverage["选股字段齐全记录"] = int(frame.attrs["screening_complete_count"])
-    unavailable = {
-        "上涨家数": "不可用",
-        "下跌家数": "不可用",
-        "平盘家数": "不可用",
-        "上涨占比": "不可用",
-        "成交额": "不可用",
-        "市场温度": "不可用",
-        "涨停家数": "不可用",
-        "跌停家数": "不可用",
-        "市场风格": "不可用",
-    }
+    unavailable = _unavailable_market_payload()
     if not authoritative:
-        return {"股票数量": int(len(frame)), **unavailable, **coverage}
+        return {**unavailable, "股票数量": int(len(frame)), **coverage}
     changes = pd.to_numeric(frame.get("change_pct", pd.Series(dtype=float)), errors="coerce")
     changes = changes[np.isfinite(changes)]
     if changes.empty:
-        return {"股票数量": int(len(frame)), **unavailable, **coverage}
+        return {**unavailable, "股票数量": int(len(frame)), **coverage}
     up_count = int((changes > 0).sum())
     down_count = int((changes < 0).sum())
     flat_count = int((changes == 0).sum())
@@ -612,7 +618,11 @@ def _run_sector_module(
     name = f"{sector_type}_sectors"
     try:
         snapshot = gateway.get_sector_snapshot(sector_type)
-        source_timestamp = _trustworthy_sector_source_timestamp(snapshot.source_timestamp)
+        source_timestamp = _trusted_sector_snapshot_timestamp(
+            snapshot.source_timestamp,
+            snapshot.observed_at,
+            observed_at,
+        )
         analysis_at = source_timestamp or snapshot.observed_at
         display = analyze_sectors(
             snapshot.frame,
@@ -823,7 +833,8 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
         portfolio = modules.get("portfolio")
         screening = modules.get("screening")
         sector_modules = [modules.get("industry_sectors"), modules.get("concept_sectors")]
-        sector_unavailable = any(module is None or module.status == "unavailable" for module in sector_modules)
+        market_degraded = market is None or market.status != "ok"
+        sector_degraded = any(module is None or module.status != "ok" for module in sector_modules)
         crowded = any(
             any(row.get("crowding_risk") == "high" for row in module.payload.get("strongest", ()))
             for module in sector_modules
@@ -832,22 +843,24 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
         portfolio_degraded = portfolio is None or portfolio.status != "ok"
         screening_degraded = screening is None or screening.status != "ok"
         watch = (
-            not breadth_usable or direction == "偏弱" or portfolio_degraded
-            or screening_degraded or sector_unavailable or crowded
+            not breadth_usable or direction == "偏弱" or market_degraded
+            or portfolio_degraded or screening_degraded or sector_degraded or crowded
         )
         high_risk = (
-            not breadth_usable or portfolio_degraded or screening_degraded
-            or sector_unavailable or crowded
+            not breadth_usable or market_degraded or portfolio_degraded
+            or screening_degraded or sector_degraded or crowded
         )
         risk = "高" if high_risk else ("中" if direction == "震荡" else "低")
         risks: list[str] = []
         if not breadth_usable:
             risks.append("市场广度不可用")
+        elif market_degraded:
+            risks.append("市场模块信息不完整")
         if portfolio_degraded:
             risks.append("持仓估值或风险信息不完整")
         if screening_degraded:
             risks.append("候选筛选信息不完整")
-        if sector_unavailable:
+        if sector_degraded:
             risks.append("板块证据不完整")
         if crowded:
             risks.append("板块拥挤风险偏高")
@@ -864,9 +877,7 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
             "板块共振": _sector_resonance(modules),
             "关键风险": risks,
         }
-        degraded = not breadth_usable or portfolio_degraded or screening_degraded or any(
-            module is None or module.status != "ok" for module in sector_modules
-        )
+        degraded = not breadth_usable or market_degraded or portfolio_degraded or screening_degraded or sector_degraded
         return ModuleResult("decision_summary", "partial" if degraded else "ok", observed_at, result_payload, ())
     except Exception:
         return ModuleResult(
@@ -1331,6 +1342,26 @@ def _trustworthy_sector_source_timestamp(value: object) -> datetime | None:
     except Exception:
         return None
     return value
+
+
+def _trusted_sector_snapshot_timestamp(
+    value: object,
+    dataset_observed_at: object,
+    session_observed_at: object,
+) -> datetime | None:
+    """Accept sector source time only when it cannot postdate either observation."""
+
+    source = _trustworthy_sector_source_timestamp(value)
+    dataset_observed = _trustworthy_sector_source_timestamp(dataset_observed_at)
+    session_observed = _trustworthy_sector_source_timestamp(session_observed_at)
+    if source is None or dataset_observed is None or session_observed is None:
+        return None
+    try:
+        if source > dataset_observed or source > session_observed:
+            return None
+    except Exception:
+        return None
+    return source
 
 
 def _validated_sector_state_item(
@@ -1808,6 +1839,25 @@ def _candidate_state(candidates: Sequence[Candidate], portfolio_codes: set[str])
     return state
 
 
+def _safe_manifest_source_timestamp(
+    value: object,
+    module_observed_at: object,
+    session_observed_at: object,
+) -> str:
+    if not isinstance(value, str):
+        return "unavailable"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return "unavailable"
+    trustworthy = _trusted_sector_snapshot_timestamp(
+        parsed,
+        module_observed_at,
+        session_observed_at,
+    )
+    return trustworthy.isoformat() if trustworthy is not None else "unavailable"
+
+
 def _redacted_manifest(
     session: ReportSession,
     modules: Mapping[str, ModuleResult],
@@ -1821,6 +1871,7 @@ def _redacted_manifest(
     market_source_timestamp: str,
     generated_at: datetime | None = None,
     sector_state: Sequence[Mapping[str, Any]] = (),
+    sector_source_timestamps: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     generated = generated_at if generated_at is not None else session.now_shanghai
     source_timestamps = {
@@ -1828,6 +1879,15 @@ def _redacted_manifest(
     }
     if "market" in modules:
         source_timestamps["market"] = market_source_timestamp
+    if session.mode is ReportMode.POSTMARKET:
+        overrides = sector_source_timestamps if isinstance(sector_source_timestamps, Mapping) else {}
+        for name in ("industry_sectors", "concept_sectors"):
+            if name in modules:
+                source_timestamps[name] = _safe_manifest_source_timestamp(
+                    overrides.get(name),
+                    modules[name].observed_at,
+                    generated,
+                )
     manifest: dict[str, Any] = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "report_key": session.report_key,
@@ -2030,8 +2090,9 @@ def run_report(
 
     modules: dict[str, ModuleResult] = {}
     prior_candidates: tuple[Mapping[str, Any], ...] = ()
-    prior_sector_previous: Mapping[tuple[str, str], Mapping[str, object]] | tuple[()] = ()
-    sector_history_unavailable = False
+    prior_sector_previous: dict[tuple[str, str], Mapping[str, object]] = {}
+    prior_sector_types: set[str] = set()
+    sector_history_artifact_unavailable = False
     if normalized_mode is ReportMode.POSTMARKET:
         try:
             prior_candidates = _load_prior_state(
@@ -2054,9 +2115,11 @@ def run_report(
                 }
                 for row in prior_sector_rows
             }
+            prior_sector_types = {str(row["sector_type"]) for row in prior_sector_rows}
         except Exception:
-            prior_sector_previous = ()
-            sector_history_unavailable = True
+            prior_sector_previous = {}
+            prior_sector_types = set()
+            sector_history_artifact_unavailable = True
 
     try:
         global_data = active.gateway.get_global_snapshot()
@@ -2181,25 +2244,32 @@ def run_report(
 
     sector_analyses: dict[str, SectorAnalysis] = {}
     sector_source_timestamps: dict[str, datetime | None] = {}
+    sector_manifest_timestamps: dict[str, str] = {}
     sector_state: list[dict[str, Any]] = []
     if normalized_mode is ReportMode.POSTMARKET:
         for sector_type in ("industry", "concept"):
-            previous = {
+            previous_for_type = {
                 key: value
                 for key, value in prior_sector_previous.items()
                 if key[0] == sector_type
-            } if prior_sector_previous else ()
+            }
+            previous = previous_for_type if sector_type in prior_sector_types else ()
             module, complete, source_timestamp = _run_sector_module(
                 active.gateway,
                 sector_type,
                 previous=previous,
                 observed_at=session.now_shanghai,
-                history_unavailable=sector_history_unavailable,
+                history_unavailable=(
+                    sector_history_artifact_unavailable or sector_type not in prior_sector_types
+                ),
             )
             modules[module.name] = module
             if complete is not None:
                 sector_analyses[sector_type] = complete
             sector_source_timestamps[sector_type] = source_timestamp
+            sector_manifest_timestamps[module.name] = (
+                source_timestamp.isoformat() if source_timestamp is not None else "unavailable"
+            )
         try:
             sector_state = _sector_state(sector_analyses, sector_source_timestamps)
         except Exception:
@@ -2473,6 +2543,7 @@ def run_report(
             market_source_timestamp=market_source_timestamp,
             generated_at=generated_at,
             sector_state=sector_state,
+            sector_source_timestamps=sector_manifest_timestamps,
         )
         paths = artifact_writer(
             output_dir,

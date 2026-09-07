@@ -37,6 +37,7 @@ from src.collaborative_report.runner import (
 )
 from src.collaborative_report.runner import (
     _PRIOR_SECTOR_MANIFEST_MAX_BYTES,
+    _decision_summary,
     _load_prior_sector_state,
     _market_payload,
     _production_mail_sender,
@@ -2652,3 +2653,122 @@ def test_sector_data_never_creates_candidates_and_missing_price_forces_watch(tmp
     assert summary["是否建议观望"] is True
     assert result.modules["sizing"].status == "unavailable"
     deps.mail_sender.assert_not_called()
+
+
+def test_unavailable_market_keeps_the_complete_safe_overview_schema(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.get_a_share_snapshot = Mock(side_effect=RuntimeError("provider-token=private"))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    payload = result.modules["market"].payload
+    expected = {
+        "股票数量", "上涨家数", "下跌家数", "平盘家数", "上涨占比", "成交额", "市场温度",
+        "涨停家数", "跌停家数", "市场风格",
+    }
+    assert set(payload) == expected
+    assert set(payload.values()) == {"不可用"}
+    assert all("private" not in warning for warning in result.modules["market"].warnings)
+
+
+@pytest.mark.parametrize("degraded_module", ["market", "industry_sectors", "concept_sectors"])
+def test_partial_core_modules_force_conservative_decision(degraded_module) -> None:
+    modules = {
+        "market": ModuleResult("market", "ok", NOW, {"上涨占比": 70.0}),
+        "portfolio": ModuleResult("portfolio", "ok", NOW, {}),
+        "screening": ModuleResult("screening", "ok", NOW, {}),
+        "industry_sectors": ModuleResult("industry_sectors", "ok", NOW, {"strongest": []}),
+        "concept_sectors": ModuleResult("concept_sectors", "ok", NOW, {"strongest": []}),
+    }
+    module = modules[degraded_module]
+    modules[degraded_module] = ModuleResult(module.name, "partial", module.observed_at, module.payload)
+
+    summary = _decision_summary(modules, NOW)
+
+    assert summary.payload["今日方向判断"] == "偏强"
+    assert summary.payload["是否建议观望"] is True
+    assert summary.payload["风险等级"] == "高"
+    assert summary.payload["策略信号"] == "观望"
+
+
+def test_concept_sector_failure_does_not_suppress_industry_module(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.get_sector_snapshot = Mock(side_effect=lambda kind: (
+        (_ for _ in ()).throw(RuntimeError("private-concept-token")) if kind == "concept"
+        else gateway.sector_snapshots[kind]
+    ))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["industry_sectors"].status == "partial"
+    assert result.modules["concept_sectors"].status == "unavailable"
+    assert all("private" not in warning for warning in result.modules["concept_sectors"].warnings)
+
+
+@pytest.mark.parametrize("available_type", ["industry", "concept"])
+def test_prior_sector_availability_is_tracked_per_type(tmp_path, deps, available_type) -> None:
+    previous_at = datetime(2026, 8, 18, 15, 5, tzinfo=SHANGHAI)
+    gateway = FakeGateway()
+    analysis = analyze_sectors(
+        gateway.sector_snapshots[available_type].frame.assign(change_pct=1.0),
+        previous=(),
+        observed_at=previous_at,
+        limit=20,
+    )
+    prior = tmp_path / f"prior-{available_type}.json"
+    prior.write_text(json.dumps(prior_sector_manifest(
+        state=_sector_state({available_type: analysis}, {available_type: previous_at}),
+    )), encoding="utf-8")
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        prior_sector_report=prior,
+        output_dir=tmp_path / "out",
+    )
+
+    missing_type = "concept" if available_type == "industry" else "industry"
+    available = result.modules[f"{available_type}_sectors"]
+    missing = result.modules[f"{missing_type}_sectors"]
+    assert available.payload["strongest"][0]["rotation"] != "first_observation"
+    assert "板块历史状态不可用，按首次观察处理" not in available.warnings
+    assert missing.payload["strongest"][0]["rotation"] == "first_observation"
+    assert "板块历史状态不可用，按首次观察处理" in missing.warnings
+
+
+def test_future_sector_source_timestamp_degrades_without_blocking_preview(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    future = NOW + timedelta(minutes=1)
+    gateway.sector_snapshots["industry"] = replace(
+        gateway.sector_snapshots["industry"], source_timestamp=future,
+    )
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.final_state is FinalState.PREVIEWED
+    assert result.modules["industry_sectors"].status == "partial"
+    assert "板块来源时间不可用，未持久化状态" in result.modules["industry_sectors"].warnings
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["source_timestamps"]["industry_sectors"] == "unavailable"
+    assert manifest["source_timestamps"]["concept_sectors"] == NOW.replace(hour=15, minute=5).isoformat()
+    assert {row["sector_type"] for row in manifest["sector_state"]} == {"concept"}
