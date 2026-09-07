@@ -564,8 +564,25 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
     down_count = int((changes < 0).sum())
     flat_count = int((changes == 0).sum())
     up_ratio = up_count / len(changes) * 100
-    amounts = pd.to_numeric(frame.get("amount", pd.Series(dtype=float)), errors="coerce")
-    amounts = amounts[np.isfinite(amounts) & (amounts >= 0)]
+    total_amount: float | str = "不可用"
+    if "amount" in frame:
+        raw_amounts = frame["amount"]
+        try:
+            parsed_amounts = pd.to_numeric(raw_amounts, errors="coerce")
+            values = tuple(float(value) for value in parsed_amounts)
+            raw_values = tuple(raw_amounts.tolist())
+            amounts_complete = (
+                len(values) == len(frame)
+                and not any(pd.isna(value) for value in raw_values)
+                and not any(isinstance(value, (bool, np.bool_)) for value in raw_values)
+                and all(math.isfinite(value) and value >= 0 for value in values)
+            )
+            if amounts_complete:
+                amount_sum = math.fsum(values)
+                if math.isfinite(amount_sum):
+                    total_amount = amount_sum
+        except (TypeError, ValueError, OverflowError):
+            total_amount = "不可用"
     temperature = "偏热" if up_ratio >= 60 else ("偏冷" if up_ratio <= 40 else "中性")
     return {
         "股票数量": int(len(frame)),
@@ -573,7 +590,7 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
         "下跌家数": down_count,
         "平盘家数": flat_count,
         "上涨占比": up_ratio,
-        "成交额": float(amounts.sum()) if not amounts.empty else "不可用",
+        "成交额": total_amount,
         "市场温度": temperature,
         "涨停家数": "不可用",
         "跌停家数": "不可用",
@@ -618,6 +635,14 @@ def _run_sector_module(
     name = f"{sector_type}_sectors"
     try:
         snapshot = gateway.get_sector_snapshot(sector_type)
+        frame = snapshot.frame
+        if (
+            not isinstance(frame, pd.DataFrame)
+            or frame.empty
+            or "sector_type" not in frame
+            or not all(isinstance(value, str) and value == sector_type for value in frame["sector_type"].tolist())
+        ):
+            raise ValueError("sector snapshot invalid")
         source_timestamp = _trusted_sector_snapshot_timestamp(
             snapshot.source_timestamp,
             snapshot.observed_at,
@@ -625,36 +650,38 @@ def _run_sector_module(
         )
         analysis_at = source_timestamp or snapshot.observed_at
         display = analyze_sectors(
-            snapshot.frame,
+            frame,
             previous=previous,
             observed_at=analysis_at,
             limit=10,
         )
         complete = analyze_sectors(
-            snapshot.frame,
+            frame,
             previous=previous,
             observed_at=analysis_at,
             limit=20,
         )
+        if display.valid_count <= 0 or complete.valid_count <= 0:
+            raise ValueError("sector snapshot invalid")
         warnings: list[str] = []
         evidence_columns = ("leader_name", "leader_code", "leader_change_pct")
         evidence_incomplete = (
             any(column not in snapshot.frame for column in evidence_columns)
             or any(
-                snapshot.frame[column].isna().any()
+                frame[column].isna().any()
                 for column in evidence_columns
-                if column in snapshot.frame
+                if column in frame
             )
         )
         excluded_rows = any(
-            snapshot.frame.attrs.get(key, 0)
+            frame.attrs.get(key, 0)
             for key in ("quarantined_row_count", "excluded_row_count")
         )
         if history_unavailable:
             warnings.append(_SECTOR_HISTORY_UNAVAILABLE_WARNING)
         if (
             snapshot.warnings or display.warnings or complete.warnings
-            or display.valid_count != len(snapshot.frame) or evidence_incomplete or excluded_rows
+            or display.valid_count != len(frame) or evidence_incomplete or excluded_rows
         ):
             warnings.append(_SECTOR_DATA_PARTIAL_WARNING)
         if source_timestamp is None:
@@ -791,17 +818,34 @@ def _rerank_sector_ties(candidates: Sequence[Candidate]) -> tuple[Candidate, ...
     return tuple(output)
 
 
+def _validated_sector_direction(name: str, module: ModuleResult | None) -> str | None:
+    expected_type = name.removesuffix("_sectors")
+    payload = module.payload if module is not None else {}
+    rows = payload.get("strongest", ()) if isinstance(payload, Mapping) else ()
+    if not isinstance(rows, (tuple, list)) or not rows or not isinstance(rows[0], Mapping):
+        return None
+    row = rows[0]
+    if (
+        row.get("sector_type") != expected_type
+        or type(row.get("rank")) is not int
+        or row["rank"] != 1
+        or not isinstance(row.get("name"), str)
+        or not row["name"].strip()
+    ):
+        return None
+    change = row.get("change_pct")
+    if not isinstance(change, (int, float)) or isinstance(change, bool) or not math.isfinite(float(change)):
+        return None
+    return "偏强" if change > 0 else ("偏弱" if change < 0 else "中性")
+
+
 def _sector_resonance(modules: Mapping[str, ModuleResult]) -> str:
-    directions: list[str] = []
-    for name in ("industry_sectors", "concept_sectors"):
-        module = modules.get(name)
-        payload = module.payload if module is not None else {}
-        rows = payload.get("strongest", ()) if isinstance(payload, Mapping) else ()
-        if not rows or not isinstance(rows[0], Mapping):
-            continue
-        change = rows[0].get("change_pct")
-        if isinstance(change, (int, float)) and not isinstance(change, bool) and math.isfinite(float(change)):
-            directions.append("偏强" if change > 0 else ("偏弱" if change < 0 else "中性"))
+    directions = [
+        direction
+        for name in ("industry_sectors", "concept_sectors")
+        for direction in (_validated_sector_direction(name, modules.get(name)),)
+        if direction is not None
+    ]
     if len(directions) != 2:
         return "证据不足"
     if directions == ["偏强", "偏强"]:
@@ -833,6 +877,17 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
         portfolio = modules.get("portfolio")
         screening = modules.get("screening")
         sector_modules = [modules.get("industry_sectors"), modules.get("concept_sectors")]
+        sector_directions = {
+            name: _validated_sector_direction(name, modules.get(name))
+            for name in ("industry_sectors", "concept_sectors")
+        }
+        resonance = _sector_resonance(modules)
+        sector_weak = "偏弱" in sector_directions.values() or resonance == "同步偏弱"
+        sector_strong = "偏强" in sector_directions.values()
+        sector_conflict = (
+            (direction == "偏强" and sector_weak)
+            or (direction == "偏弱" and sector_strong)
+        )
         market_degraded = market is None or market.status != "ok"
         sector_degraded = any(module is None or module.status != "ok" for module in sector_modules)
         crowded = any(
@@ -843,12 +898,12 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
         portfolio_degraded = portfolio is None or portfolio.status != "ok"
         screening_degraded = screening is None or screening.status != "ok"
         watch = (
-            not breadth_usable or direction == "偏弱" or market_degraded
-            or portfolio_degraded or screening_degraded or sector_degraded or crowded
+            not breadth_usable or direction == "偏弱" or market_degraded or sector_weak
+            or sector_conflict or portfolio_degraded or screening_degraded or sector_degraded or crowded
         )
         high_risk = (
-            not breadth_usable or market_degraded or portfolio_degraded
-            or screening_degraded or sector_degraded or crowded
+            not breadth_usable or direction == "偏弱" or market_degraded or sector_weak
+            or sector_conflict or portfolio_degraded or screening_degraded or sector_degraded or crowded
         )
         risk = "高" if high_risk else ("中" if direction == "震荡" else "低")
         risks: list[str] = []
@@ -856,12 +911,18 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
             risks.append("市场广度不可用")
         elif market_degraded:
             risks.append("市场模块信息不完整")
+        if direction == "偏弱":
+            risks.append("市场方向偏弱")
         if portfolio_degraded:
             risks.append("持仓估值或风险信息不完整")
         if screening_degraded:
             risks.append("候选筛选信息不完整")
         if sector_degraded:
             risks.append("板块证据不完整")
+        if sector_weak:
+            risks.append("板块方向偏弱")
+        if sector_conflict:
+            risks.append("市场与板块方向冲突")
         if crowded:
             risks.append("板块拥挤风险偏高")
         if not risks:
@@ -874,7 +935,7 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
             "操作建议": (
                 "仅供研究参考，任何操作均需人工确认，不构成自动下单或收益保证。"
             ),
-            "板块共振": _sector_resonance(modules),
+            "板块共振": resonance,
             "关键风险": risks,
         }
         degraded = not breadth_usable or market_degraded or portfolio_degraded or screening_degraded or sector_degraded

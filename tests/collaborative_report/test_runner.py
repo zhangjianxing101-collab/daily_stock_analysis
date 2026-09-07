@@ -2772,3 +2772,110 @@ def test_future_sector_source_timestamp_degrades_without_blocking_preview(tmp_pa
     assert manifest["source_timestamps"]["industry_sectors"] == "unavailable"
     assert manifest["source_timestamps"]["concept_sectors"] == NOW.replace(hour=15, minute=5).isoformat()
     assert {row["sector_type"] for row in manifest["sector_state"]} == {"concept"}
+
+
+@pytest.mark.parametrize(
+    "amounts",
+    [
+        [100.0, None],
+        [100.0, "not-a-number"],
+        [100.0, -1.0],
+        [float("1.7e308"), float("1.7e308")],
+    ],
+    ids=["missing", "unparseable", "negative", "overflow"],
+)
+def test_market_turnover_requires_complete_finite_amount_evidence(amounts) -> None:
+    market = _market_payload(dataset(pd.DataFrame({
+        "change_pct": [1.0, -1.0],
+        "amount": amounts,
+    })), authoritative=True)
+
+    assert market["成交额"] == "不可用"
+
+
+@pytest.mark.parametrize("failed_type", ["industry", "concept"])
+def test_empty_sector_snapshot_does_not_discard_healthy_type_state(tmp_path, deps, failed_type) -> None:
+    gateway = FakeGateway()
+    gateway.sector_snapshots[failed_type] = replace(
+        gateway.sector_snapshots[failed_type],
+        frame=pd.DataFrame(columns=["sector_type", "name", "change_pct"]),
+    )
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    healthy_type = "concept" if failed_type == "industry" else "industry"
+    assert result.modules[f"{failed_type}_sectors"].status == "unavailable"
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert {row["sector_type"] for row in manifest["sector_state"]} == {healthy_type}
+
+
+def test_sector_type_mismatch_is_unavailable_without_discarding_healthy_state(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.sector_snapshots["industry"] = replace(
+        gateway.sector_snapshots["industry"],
+        frame=gateway.sector_snapshots["industry"].frame.assign(sector_type="concept"),
+    )
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["industry_sectors"].status == "unavailable"
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert {row["sector_type"] for row in manifest["sector_state"]} == {"concept"}
+
+
+def test_weak_market_forces_watch_and_high_risk_when_modules_are_usable() -> None:
+    modules = {
+        "market": ModuleResult("market", "ok", NOW, {"上涨占比": 30.0}),
+        "portfolio": ModuleResult("portfolio", "ok", NOW, {}),
+        "screening": ModuleResult("screening", "ok", NOW, {}),
+        "industry_sectors": ModuleResult(
+            "industry_sectors", "ok", NOW,
+            {"strongest": [{"sector_type": "industry", "name": "行业", "rank": 1, "change_pct": 0.0}]},
+        ),
+        "concept_sectors": ModuleResult(
+            "concept_sectors", "ok", NOW,
+            {"strongest": [{"sector_type": "concept", "name": "概念", "rank": 1, "change_pct": 0.0}]},
+        ),
+    }
+
+    summary = _decision_summary(modules, NOW)
+
+    assert summary.payload["今日方向判断"] == "偏弱"
+    assert summary.payload["是否建议观望"] is True
+    assert summary.payload["风险等级"] == "高"
+
+
+def test_strong_market_weak_sectors_keep_direction_but_force_conservative_risk() -> None:
+    modules = {
+        "market": ModuleResult("market", "ok", NOW, {"上涨占比": 70.0}),
+        "portfolio": ModuleResult("portfolio", "ok", NOW, {}),
+        "screening": ModuleResult("screening", "ok", NOW, {}),
+        "industry_sectors": ModuleResult(
+            "industry_sectors", "ok", NOW,
+            {"strongest": [{"sector_type": "industry", "name": "行业", "rank": 1, "change_pct": -1.0}]},
+        ),
+        "concept_sectors": ModuleResult(
+            "concept_sectors", "ok", NOW,
+            {"strongest": [{"sector_type": "concept", "name": "概念", "rank": 1, "change_pct": -0.5}]},
+        ),
+    }
+
+    summary = _decision_summary(modules, NOW)
+
+    assert summary.payload["今日方向判断"] == "偏强"
+    assert summary.payload["是否建议观望"] is True
+    assert summary.payload["风险等级"] == "高"
+    assert "板块方向偏弱" in summary.payload["关键风险"]
+    assert "市场与板块方向冲突" in summary.payload["关键风险"]
