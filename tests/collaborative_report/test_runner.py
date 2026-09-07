@@ -36,6 +36,7 @@ from src.collaborative_report.runner import (
     write_report_artifacts,
 )
 from src.collaborative_report.runner import (
+    _PRIOR_SECTOR_MANIFEST_MAX_BYTES,
     _load_prior_sector_state,
     _production_mail_sender,
     _redacted_manifest,
@@ -1804,8 +1805,31 @@ def sector_row(**overrides: object) -> SectorRow:
     return SectorRow(**values)  # type: ignore[arg-type]
 
 
-def sector_analysis(*rows: SectorRow, valid_count: int = 20) -> SectorAnalysis:
-    return SectorAnalysis(strongest=rows, weakest=(), watch=(), valid_count=valid_count)
+def sector_analysis(*rows: SectorRow, valid_count: int | None = None) -> SectorAnalysis:
+    universe_size = len(rows) if valid_count is None else valid_count
+    return SectorAnalysis(strongest=rows, weakest=(), watch=(), valid_count=universe_size)
+
+
+def sector_state_rows(
+    sector_type: str,
+    count: int,
+    *,
+    universe_size: int | None = None,
+    source_timestamp: str = "2026-08-18T15:30:00+08:00",
+) -> list[dict[str, object]]:
+    base = serialized_sector_state()[0]
+    size = count if universe_size is None else universe_size
+    return [
+        dict(
+            base,
+            sector_type=sector_type,
+            name=f"{sector_type}-{rank:02d}",
+            rank=rank,
+            universe_size=size,
+            source_timestamp=source_timestamp,
+        )
+        for rank in range(1, count + 1)
+    ]
 
 
 def prior_sector_manifest(*, state: list[dict[str, object]], **overrides: object) -> dict[str, object]:
@@ -1886,6 +1910,37 @@ def test_load_prior_sector_state_converts_deep_json_recursion_to_fixed_error(tmp
     assert error.value.__suppress_context__ is True
 
 
+def test_load_prior_sector_state_rejects_oversized_manifest_without_full_read(tmp_path) -> None:
+    path = tmp_path / "oversized.json"
+    path.write_bytes(b" " * (_PRIOR_SECTOR_MANIFEST_MAX_BYTES + 1))
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+
+    with pytest.raises(ValueError, match="^prior sector state unavailable$") as error:
+        _load_prior_sector_state(path, session)
+    assert error.value.__cause__ is None
+
+
+@pytest.mark.parametrize("duplicate_key", ["final_state", "name"])
+def test_load_prior_sector_state_rejects_duplicate_json_object_keys(tmp_path, duplicate_key) -> None:
+    content = json.dumps(prior_sector_manifest(state=serialized_sector_state()), ensure_ascii=False)
+    if duplicate_key == "final_state":
+        content = content.replace(
+            '"final_state": "sent"',
+            '"final_state": "sent", "final_state": "prepared"',
+        )
+    else:
+        content = content.replace(
+            '"name": "半导体"',
+            '"name": "半导体", "name": "重复名称"',
+        )
+    path = tmp_path / "duplicate-key.json"
+    path.write_text(content, encoding="utf-8")
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+
+    with pytest.raises(ValueError, match="^prior sector state unavailable$"):
+        _load_prior_sector_state(path, session)
+
+
 @pytest.mark.parametrize(
     "overrides",
     [
@@ -1931,6 +1986,24 @@ def test_load_prior_sector_state_rejects_generated_at_on_the_wrong_local_date(tm
         generated_at="2026-08-17T16:30:00+08:00",
     )), encoding="utf-8")
     session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+    with pytest.raises(ValueError, match="^prior sector state unavailable$"):
+        _load_prior_sector_state(path, session)
+
+
+@pytest.mark.parametrize("trading_date", [date(2026, 8, 22), date(2026, 10, 1)])
+def test_load_prior_sector_state_rejects_non_xshg_session_manifest(tmp_path, trading_date) -> None:
+    date_text = trading_date.isoformat()
+    payload = prior_sector_manifest(
+        state=[],
+        trading_date=date_text,
+        report_key=f"{date_text}-postmarket",
+        generated_at=f"{date_text}T16:30:00+08:00",
+    )
+    path = tmp_path / "non-session.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    now = datetime(2026, 10, 12, 16, 30, tzinfo=SHANGHAI)
+    session = ReportSession(ReportMode.POSTMARKET, now, now.date(), True, "2026-10-12-postmarket")
+
     with pytest.raises(ValueError, match="^prior sector state unavailable$"):
         _load_prior_sector_state(path, session)
 
@@ -1991,6 +2064,43 @@ def test_load_prior_sector_state_rejects_duplicates(tmp_path) -> None:
         _load_prior_sector_state(path, session)
 
 
+@pytest.mark.parametrize(
+    "mutation",
+    [
+        lambda rows: rows[1].update(rank=1),
+        lambda rows: rows.pop(1),
+        lambda rows: rows[1].update(universe_size=4),
+        lambda rows: rows[1].update(source_timestamp="2026-08-18T15:31:00+08:00"),
+    ],
+    ids=["duplicate-ranks", "non-contiguous-ranks", "universe-size", "source-timestamp"],
+)
+def test_load_prior_sector_state_rejects_inconsistent_type_collections(tmp_path, mutation) -> None:
+    state = sector_state_rows("industry", 3)
+    mutation(state)
+    path = tmp_path / "inconsistent.json"
+    path.write_text(json.dumps(prior_sector_manifest(state=state)), encoding="utf-8")
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+
+    with pytest.raises(ValueError, match="^prior sector state unavailable$"):
+        _load_prior_sector_state(path, session)
+
+
+@pytest.mark.parametrize("limit_case", ["over-20-for-type", "over-40-total"])
+def test_load_prior_sector_state_rejects_collection_row_limits(tmp_path, limit_case) -> None:
+    industry = sector_state_rows("industry", 20)
+    if limit_case == "over-20-for-type":
+        state = [*industry, dict(industry[-1], name="industry-extra")]
+    else:
+        concept = sector_state_rows("concept", 20)
+        state = [*industry, *concept, {"invalid": "must be capped before item validation"}]
+    path = tmp_path / "too-many.json"
+    path.write_text(json.dumps(prior_sector_manifest(state=state)), encoding="utf-8")
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+
+    with pytest.raises(ValueError, match="^prior sector state unavailable$"):
+        _load_prior_sector_state(path, session)
+
+
 @pytest.mark.parametrize("failure", ["missing", "corrupt"])
 def test_prior_sector_state_loader_failure_degrades_to_first_observation(tmp_path, failure) -> None:
     path = tmp_path / "prior.json"
@@ -2013,9 +2123,10 @@ def test_prior_sector_state_loader_failure_degrades_to_first_observation(tmp_pat
 
 
 def test_sector_state_is_deterministic_private_and_top_twenty_only() -> None:
+    industry_rows = tuple(sector_row(name=f"I-{rank:02d}", rank=rank) for rank in range(1, 22))
     analyses = {
         "concept": sector_analysis(sector_row(sector_type="concept", name="A", rank=2), sector_row(sector_type="concept", name="B", rank=1)),
-        "industry": sector_analysis(sector_row(name="C", rank=21), sector_row(name="D", rank=1)),
+        "industry": sector_analysis(*industry_rows, valid_count=21),
     }
     timestamps = {
         "concept": datetime(2026, 8, 18, 15, 30, tzinfo=SHANGHAI),
@@ -2025,7 +2136,9 @@ def test_sector_state_is_deterministic_private_and_top_twenty_only() -> None:
     state = _sector_state(analyses, timestamps)
 
     assert [(row["sector_type"], row["rank"], row["name"]) for row in state] == [
-        ("concept", 1, "B"), ("concept", 2, "A"), ("industry", 1, "D"),
+        ("concept", 1, "B"),
+        ("concept", 2, "A"),
+        *(("industry", rank, f"I-{rank:02d}") for rank in range(1, 21)),
     ]
     assert set(state[0]) == set(SECTOR_STATE_KEYS)
     assert "私密龙头" not in json.dumps(state, ensure_ascii=False)
@@ -2055,6 +2168,22 @@ def test_sector_state_omits_missing_timestamp_and_rejects_other_invalid_inputs()
         _sector_state({"industry": sector_analysis(sector_row(change_pct=float("inf")))}, {"industry": NOW})
 
 
+@pytest.mark.parametrize(
+    "rows,valid_count",
+    [
+        ((sector_row(name="A", rank=1), sector_row(name="B", rank=1)), 2),
+        ((sector_row(name="A", rank=1), sector_row(name="C", rank=3)), 3),
+    ],
+    ids=["duplicate-ranks", "non-contiguous-ranks"],
+)
+def test_sector_state_rejects_invalid_rank_collections(rows, valid_count) -> None:
+    with pytest.raises(ValueError, match="^sector state invalid$"):
+        _sector_state(
+            {"industry": sector_analysis(*rows, valid_count=valid_count)},
+            {"industry": NOW},
+        )
+
+
 def test_sector_state_does_not_mutate_inputs_and_excludes_privacy_sentinels() -> None:
     privacy_sentinels = (
         "leader_name_private", "leader_code_private", "provider_payload_private", "raw_text_private",
@@ -2063,7 +2192,7 @@ def test_sector_state_does_not_mutate_inputs_and_excludes_privacy_sentinels() ->
     )
     analysis = SectorAnalysis(
         strongest=(sector_row(leader_name=privacy_sentinels[0], leader_code=privacy_sentinels[1]),),
-        weakest=(), watch=(), valid_count=20, warnings=privacy_sentinels[2:],
+        weakest=(), watch=(), valid_count=1, warnings=privacy_sentinels[2:],
     )
     analyses = {"industry": analysis}
     timestamps = {"industry": NOW}
@@ -2116,6 +2245,26 @@ def test_redacted_manifest_rejects_duplicate_normalized_sector_identity() -> Non
 
     with pytest.raises(ValueError, match="^sector state invalid$"):
         _redacted_manifest(session, sector_state=[state[0], duplicate], **common)
+
+
+def test_redacted_manifest_canonicalizes_direct_caller_sector_state_order() -> None:
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+    industry = sector_state_rows("industry", 2, source_timestamp="2026-08-19T15:30:00+08:00")
+    concept = sector_state_rows("concept", 2, source_timestamp="2026-08-19T15:31:00+08:00")
+
+    manifest = _redacted_manifest(
+        session, {}, RenderedReport("subject", "html", "text"), final_state="sent", candidates=(),
+        morning_candidates=(), portfolio_codes=set(), test_email=False,
+        market_source_timestamp=NOW.isoformat(),
+        sector_state=[industry[1], concept[1], industry[0], concept[0]],
+    )
+
+    assert [(row["sector_type"], row["rank"], row["name"]) for row in manifest["sector_state"]] == [
+        ("concept", 1, "concept-01"),
+        ("concept", 2, "concept-02"),
+        ("industry", 1, "industry-01"),
+        ("industry", 2, "industry-02"),
+    ]
 
 
 def test_same_sector_name_is_allowed_across_industry_and_concept(tmp_path) -> None:

@@ -56,6 +56,10 @@ _SECTOR_ROTATIONS = frozenset((
     "first_observation", "new_start", "continuing", "accelerating", "diverging", "retreating",
 ))
 _SECTOR_LEVELS = frozenset(("high", "medium", "low", "unavailable"))
+# More than enough for the maximum 40 normalized rows while bounding hostile input.
+_PRIOR_SECTOR_MANIFEST_MAX_BYTES = 1024 * 1024
+_SECTOR_STATE_MAX_ROWS = 40
+_SECTOR_STATE_MAX_ROWS_PER_TYPE = 20
 _POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=4)
 _PREMARKET_MAX_SOURCE_AGE = timedelta(days=4)
 _DATA_FAILURE_CODES = {
@@ -1039,13 +1043,73 @@ def _validated_sector_state_item(
     }
 
 
+def _validated_sector_state_collection(
+    items: object,
+    *,
+    manifest_date: date | None = None,
+    generated_at: datetime | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    if (
+        not isinstance(items, Sequence)
+        or isinstance(items, (str, bytes, bytearray))
+        or len(items) > _SECTOR_STATE_MAX_ROWS
+    ):
+        raise ValueError
+    rows = [
+        _validated_sector_state_item(
+            item,
+            manifest_date=manifest_date,
+            generated_at=generated_at,
+            now=now,
+        )
+        for item in items
+    ]
+    identities: set[tuple[str, str]] = set()
+    by_type: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        identity = (row["sector_type"], row["name"])
+        if identity in identities:
+            raise ValueError
+        identities.add(identity)
+        by_type.setdefault(row["sector_type"], []).append(row)
+    for type_rows in by_type.values():
+        if len(type_rows) > _SECTOR_STATE_MAX_ROWS_PER_TYPE:
+            raise ValueError
+        universe_sizes = {row["universe_size"] for row in type_rows}
+        source_timestamps = {row["source_timestamp"] for row in type_rows}
+        if len(universe_sizes) != 1 or len(source_timestamps) != 1:
+            raise ValueError
+        universe_size = next(iter(universe_sizes))
+        expected_ranks = list(range(1, min(_SECTOR_STATE_MAX_ROWS_PER_TYPE, universe_size) + 1))
+        if sorted(row["rank"] for row in type_rows) != expected_ranks:
+            raise ValueError
+    rows.sort(key=lambda row: (row["sector_type"], row["rank"], row["name"]))
+    return rows
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError
+        payload[key] = value
+    return payload
+
+
 def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple[Mapping[str, Any], ...]:
     """Load one earlier sent postmarket sector snapshot without exposing its payload on failure."""
 
     try:
         if path is None or not path.is_file():
             raise ValueError
-        payload = json.loads(path.read_text(encoding="utf-8"))
+        if path.stat().st_size > _PRIOR_SECTOR_MANIFEST_MAX_BYTES:
+            raise ValueError
+        with path.open("rb") as manifest_file:
+            raw_manifest = manifest_file.read(_PRIOR_SECTOR_MANIFEST_MAX_BYTES + 1)
+        if len(raw_manifest) > _PRIOR_SECTOR_MANIFEST_MAX_BYTES:
+            raise ValueError
+        payload = json.loads(raw_manifest.decode("utf-8"), object_pairs_hook=_unique_json_object)
         if (
             not isinstance(payload, dict)
             or type(payload.get("schema_version")) is not int
@@ -1073,17 +1137,14 @@ def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple
             or generated_at > session.now_shanghai
         ):
             raise ValueError
-        rows: list[Mapping[str, Any]] = []
-        identities: set[tuple[str, str]] = set()
-        for item in payload["sector_state"]:
-            normalized = _validated_sector_state_item(
-                item, manifest_date=parsed_date, generated_at=generated_at, now=session.now_shanghai,
-            )
-            identity = (normalized["sector_type"], normalized["name"])
-            if identity in identities:
-                raise ValueError
-            identities.add(identity)
-            rows.append(normalized)
+        if report_data_session(ReportMode.POSTMARKET, parsed_date, generated_at) != parsed_date:
+            raise ValueError
+        rows = _validated_sector_state_collection(
+            payload["sector_state"],
+            manifest_date=parsed_date,
+            generated_at=generated_at,
+            now=session.now_shanghai,
+        )
         return tuple(rows)
     except (
         OSError,
@@ -1093,6 +1154,7 @@ def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple
         ValueError,
         OverflowError,
         RecursionError,
+        RuntimeError,
     ):
         raise _sector_state_error("prior sector state unavailable") from None
 
@@ -1106,7 +1168,6 @@ def _sector_state(
         if not isinstance(analyses, Mapping) or not isinstance(source_timestamps, Mapping):
             raise ValueError
         rows: list[dict[str, Any]] = []
-        identities: set[tuple[str, str]] = set()
         for sector_type, analysis in analyses.items():
             if sector_type not in _SECTOR_TYPES or not isinstance(analysis, SectorAnalysis):
                 raise ValueError
@@ -1120,7 +1181,7 @@ def _sector_state(
                     raise ValueError
                 if row.rank > 20:
                     continue
-                normalized = _validated_sector_state_item({
+                rows.append({
                     "sector_type": row.sector_type,
                     "name": row.name,
                     "rank": row.rank,
@@ -1133,13 +1194,7 @@ def _sector_state(
                     "crowding_risk": row.crowding_risk,
                     "source_timestamp": source.isoformat(),
                 })
-                identity = (normalized["sector_type"], normalized["name"])
-                if identity in identities:
-                    raise ValueError
-                identities.add(identity)
-                rows.append(normalized)
-        rows.sort(key=lambda row: (str(row["sector_type"]), int(row["rank"]), str(row["name"])))
-        return rows
+        return _validated_sector_state_collection(rows)
     except (TypeError, ValueError, OverflowError, AttributeError):
         raise _sector_state_error("sector state invalid") from None
 
@@ -1446,21 +1501,12 @@ def _redacted_manifest(
         manifest["candidate_state"] = _candidate_state(candidates, portfolio_codes)
     else:
         try:
-            sanitized_sector_state: list[dict[str, Any]] = []
-            identities: set[tuple[str, str]] = set()
-            for item in sector_state:
-                normalized = _validated_sector_state_item(
-                    item,
-                    manifest_date=session.trading_date,
-                    generated_at=generated,
-                    now=session.now_shanghai,
-                )
-                identity = (normalized["sector_type"], normalized["name"])
-                if identity in identities:
-                    raise ValueError
-                identities.add(identity)
-                sanitized_sector_state.append(normalized)
-            manifest["sector_state"] = sanitized_sector_state
+            manifest["sector_state"] = _validated_sector_state_collection(
+                sector_state,
+                manifest_date=session.trading_date,
+                generated_at=generated,
+                now=session.now_shanghai,
+            )
         except (TypeError, ValueError, OverflowError):
             raise _sector_state_error("sector state invalid") from None
         manifest["morning_candidate_statuses"] = [
