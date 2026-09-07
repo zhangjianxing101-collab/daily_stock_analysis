@@ -32,6 +32,10 @@ class Candidate:
     observed_at: datetime
     source: str
     warning: str = ""
+    industry_sector: str = ""
+    concept_sectors: tuple[str, ...] = ()
+    sector_rotation: str = ""
+    sector_persistence: str = ""
 
 
 @dataclass(frozen=True)

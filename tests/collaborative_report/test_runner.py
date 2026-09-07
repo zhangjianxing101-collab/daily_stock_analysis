@@ -38,8 +38,10 @@ from src.collaborative_report.runner import (
 from src.collaborative_report.runner import (
     _PRIOR_SECTOR_MANIFEST_MAX_BYTES,
     _load_prior_sector_state,
+    _market_payload,
     _production_mail_sender,
     _redacted_manifest,
+    _rerank_sector_ties,
     _sector_state,
 )
 from src.collaborative_report.sector_analysis import SectorAnalysis, SectorRow, analyze_sectors
@@ -150,6 +152,30 @@ class FakeGateway:
             PORTFOLIO_CODE: dataset(bars()),
             CANDIDATE_CODE: dataset(bars(high=10.6, close=10.5)),
         }
+        self.sector_snapshots = {
+            "industry": replace(
+                dataset(pd.DataFrame([
+                    {
+                        "sector_type": "industry", "name": "示例板块", "change_pct": 2.0,
+                        "advance_count": 8, "decline_count": 2, "turnover_rate": 3.0,
+                        "leader_name": "示例股份", "leader_code": CANDIDATE_CODE,
+                        "leader_change_pct": 2.0,
+                    },
+                ]), "fixture.industry"),
+                source_timestamp=datetime(2026, 8, 19, 15, 5, tzinfo=SHANGHAI),
+            ),
+            "concept": replace(
+                dataset(pd.DataFrame([
+                    {
+                        "sector_type": "concept", "name": "示例概念", "change_pct": 1.0,
+                        "advance_count": 6, "decline_count": 4, "turnover_rate": 2.0,
+                        "leader_name": "示例股份", "leader_code": CANDIDATE_CODE,
+                        "leader_change_pct": 2.0,
+                    },
+                ]), "fixture.concept"),
+                source_timestamp=datetime(2026, 8, 19, 15, 5, tzinfo=SHANGHAI),
+            ),
+        }
 
     def get_a_share_snapshot(self):
         return self.snapshot
@@ -159,6 +185,9 @@ class FakeGateway:
 
     def get_leading_sector_codes(self, limit=10):
         return dataset(pd.DataFrame([{"code": CANDIDATE_CODE, "sector": "示例板块"}]))
+
+    def get_sector_snapshot(self, sector_type):
+        return self.sector_snapshots[sector_type]
 
     def get_global_snapshot(self):
         return dataset(pd.DataFrame([{"symbol": "^GSPC", "change_pct": 0.5}]))
@@ -2408,3 +2437,218 @@ def test_script_import_has_no_side_effect(monkeypatch) -> None:
 
     assert namespace["main"] is cli_main
     cli_main.assert_not_called()
+
+
+def test_candidate_sector_context_defaults_are_backward_compatible() -> None:
+    item = candidate()
+
+    assert item.industry_sector == ""
+    assert item.concept_sectors == ()
+    assert item.sector_rotation == ""
+    assert item.sector_persistence == ""
+
+
+def test_postmarket_runs_independent_sector_modules_and_persists_safe_state(tmp_path, deps) -> None:
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=deps,
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    industry = result.modules["industry_sectors"]
+    concept = result.modules["concept_sectors"]
+    assert industry.status == "partial"
+    assert concept.status == "partial"
+    assert set(industry.payload) == {"valid_count", "strongest", "weakest", "watch"}
+    assert industry.payload["strongest"][0]["leader_code"] == CANDIDATE_CODE
+    selected = result.short_term_candidates[0]
+    assert selected.industry_sector == "示例板块"
+    assert selected.concept_sectors == ("示例概念",)
+    assert selected.sector_rotation == "first_observation"
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["module_statuses"]["industry_sectors"] == "partial"
+    assert {row["sector_type"] for row in manifest["sector_state"]} == {"industry", "concept"}
+    deps.mail_sender.assert_not_called()
+
+
+def test_postmarket_sector_source_failure_does_not_suppress_other_module(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.get_sector_snapshot = Mock(side_effect=lambda kind: (
+        (_ for _ in ()).throw(RuntimeError("token=secret")) if kind == "industry"
+        else gateway.sector_snapshots[kind]
+    ))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["industry_sectors"].status == "unavailable"
+    assert result.modules["concept_sectors"].status == "partial"
+    serialized = json.dumps(result.modules["industry_sectors"].payload, ensure_ascii=False)
+    assert "secret" not in serialized
+    assert all("secret" not in warning for warning in result.modules["industry_sectors"].warnings)
+
+
+def test_premarket_never_fetches_postmarket_sector_modules(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.get_sector_snapshot = Mock(wraps=gateway.get_sector_snapshot)
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert "industry_sectors" not in result.modules
+    assert "concept_sectors" not in result.modules
+    gateway.get_sector_snapshot.assert_not_called()
+
+
+def test_market_overview_has_safe_breadth_semantics_and_decision_summary(tmp_path, deps) -> None:
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=deps,
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    market = result.modules["market"].payload
+    assert set((
+        "股票数量", "上涨家数", "下跌家数", "平盘家数", "上涨占比", "成交额", "市场温度",
+        "涨停家数", "跌停家数", "市场风格",
+    )).issubset(market)
+    assert market["上涨家数"] == 2
+    assert market["上涨占比"] == 100.0
+    assert market["市场温度"] == "偏热"
+    summary = result.modules["decision_summary"]
+    assert set(summary.payload) == {
+        "今日方向判断", "策略信号", "风险等级", "是否建议观望", "操作建议", "板块共振", "关键风险",
+    }
+    assert "人工确认" in summary.payload["操作建议"]
+    assert deps.mail_sender.assert_not_called() is None
+
+
+def test_untrusted_market_breadth_is_unavailable_and_forces_watch_summary(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.snapshot = replace(gateway.snapshot, source_timestamp=None)
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    market = result.modules["market"].payload
+    assert market["上涨家数"] == "不可用"
+    assert market["成交额"] == "不可用"
+    assert market["市场温度"] == "不可用"
+    assert result.modules["decision_summary"].payload["今日方向判断"] == "数据不足，建议观望"
+    assert result.modules["decision_summary"].payload["是否建议观望"] is True
+
+
+def test_postmarket_valid_prior_sector_state_classifies_transition(tmp_path, deps) -> None:
+    previous_at = datetime(2026, 8, 18, 15, 5, tzinfo=SHANGHAI)
+    prior_analyses = {
+        sector_type: analyze_sectors(
+            snapshot.frame.assign(change_pct=1.0), previous=(), observed_at=previous_at, limit=20,
+        )
+        for sector_type, snapshot in FakeGateway().sector_snapshots.items()
+    }
+    prior = tmp_path / "prior-sector.json"
+    prior.write_text(json.dumps(prior_sector_manifest(
+        state=_sector_state(prior_analyses, {"industry": previous_at, "concept": previous_at}),
+    )), encoding="utf-8")
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=deps,
+        force=True,
+        preview_only=True,
+        prior_sector_report=prior,
+        output_dir=tmp_path / "out",
+    )
+
+    row = result.modules["industry_sectors"].payload["strongest"][0]
+    assert row["rotation"] != "first_observation"
+    assert "板块历史状态不可用，按首次观察处理" not in result.modules["industry_sectors"].warnings
+
+
+def test_missing_sector_source_timestamp_marks_partial_and_omits_only_that_state(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.sector_snapshots["industry"] = replace(gateway.sector_snapshots["industry"], source_timestamp=None)
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["industry_sectors"].status == "partial"
+    assert "板块来源时间不可用，未持久化状态" in result.modules["industry_sectors"].warnings
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert {row["sector_type"] for row in manifest["sector_state"]} == {"concept"}
+
+
+@pytest.mark.parametrize(
+    ("changes", "temperature"),
+    [([1.0, 1.0, 1.0, -1.0, -1.0], "偏热"), ([1.0, 1.0, -1.0, -1.0, -1.0], "偏冷")],
+)
+def test_market_payload_temperature_boundaries_and_invalid_amounts(changes, temperature) -> None:
+    market = _market_payload(dataset(pd.DataFrame({
+        "change_pct": changes,
+        "amount": [float("nan"), -1, float("inf"), -2, float("nan")],
+    })), authoritative=True)
+
+    assert market["上涨占比"] in {40.0, 60.0}
+    assert market["市场温度"] == temperature
+    assert market["成交额"] == "不可用"
+    unavailable = _market_payload(dataset(pd.DataFrame({"change_pct": changes})), authoritative=False)
+    assert unavailable["上涨家数"] == "不可用"
+    assert unavailable["市场温度"] == "不可用"
+
+
+def test_sector_context_reranks_only_equal_scores_without_changing_candidates() -> None:
+    low = replace(candidate("600001"), score=88, sector_persistence="low", sector_rotation="continuing")
+    high = replace(candidate("600002"), score=88, sector_persistence="high", sector_rotation="retreating")
+    fixed = replace(candidate("600003"), score=89, sector_persistence="", sector_rotation="")
+
+    ranked = _rerank_sector_ties((fixed, low, high))
+
+    assert [item.code for item in ranked] == ["600003", "600002", "600001"]
+    assert {item.code for item in ranked} == {"600001", "600002", "600003"}
+    assert [item.score for item in ranked] == [89, 88, 88]
+
+
+def test_sector_data_never_creates_candidates_and_missing_price_forces_watch(tmp_path, deps, settings) -> None:
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(
+            deps,
+            screener=lambda *args, **kwargs: ScreeningResult((), ()),
+            settings_loader=lambda: replace(settings, positions=(Position("600099", 100, 10.0),)),
+        ),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.short_term_candidates == ()
+    assert result.swing_candidates == ()
+    summary = result.modules["decision_summary"].payload
+    assert summary["风险等级"] == "高"
+    assert summary["是否建议观望"] is True
+    assert result.modules["sizing"].status == "unavailable"
+    deps.mail_sender.assert_not_called()
