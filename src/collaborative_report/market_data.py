@@ -191,6 +191,13 @@ def _canonical_code(value: object) -> str | None:
     return None
 
 
+def _optional_canonical_code(value: object) -> str | None:
+    try:
+        return _canonical_code(value)
+    except Exception:
+        return None
+
+
 def normalize_a_share_thscode(code: object) -> str:
     """Return a documented THS A-share code without guessing the exchange."""
 
@@ -322,18 +329,28 @@ def _normalize_sector_snapshot(raw: pd.DataFrame, sector_type: str) -> tuple[pd.
         raise ValueError(f"{sector_type} sector provider returned invalid data")
 
     result = pd.DataFrame(index=source.index)
-    result["sector_type"] = sector_type
+    result["sector_type"] = pd.Series(sector_type, index=source.index, dtype="string")
     result["name"] = source[name_column].astype("string").str.strip().replace("", pd.NA)
-    result["change_pct"] = _numeric(source[change_column])
+    result["change_pct"] = _numeric(source[change_column]).astype("Float64")
     for column in ("advance_count", "decline_count", "turnover_rate", "amount", "leader_change_pct"):
         source_column = _matching_column(source, _SECTOR_SNAPSHOT_ALIASES[column])
-        result[column] = _numeric(source[source_column]) if source_column is not None else pd.NA
-    for column in ("leader_name", "leader_code"):
-        source_column = _matching_column(source, _SECTOR_SNAPSHOT_ALIASES[column])
         result[column] = (
-            source[source_column].astype("string").str.strip().replace("", pd.NA)
-            if source_column is not None else pd.NA
+            _numeric(source[source_column]).astype("Float64")
+            if source_column is not None
+            else pd.Series(pd.NA, index=source.index, dtype="Float64")
         )
+    leader_name_column = _matching_column(source, _SECTOR_SNAPSHOT_ALIASES["leader_name"])
+    result["leader_name"] = (
+        source[leader_name_column].astype("string").str.strip().replace("", pd.NA)
+        if leader_name_column is not None
+        else pd.Series(pd.NA, index=source.index, dtype="string")
+    )
+    leader_code_column = _matching_column(source, _SECTOR_SNAPSHOT_ALIASES["leader_code"])
+    result["leader_code"] = (
+        source[leader_code_column].map(_optional_canonical_code).astype("string")
+        if leader_code_column is not None
+        else pd.Series(pd.NA, index=source.index, dtype="string")
+    )
 
     valid = result["name"].notna() & result["change_pct"].notna()
     valid &= np.isfinite(result["change_pct"].to_numpy(dtype=float, na_value=np.nan))
@@ -351,6 +368,7 @@ def _normalize_sector_snapshot(raw: pd.DataFrame, sector_type: str) -> tuple[pd.
         values = result[column].dropna()
         if (values < 0).any() or not np.equal(values, np.floor(values)).all():
             raise ValueError(f"{sector_type} sector provider returned invalid data")
+        result[column] = result[column].astype("Int64")
     if (result["turnover_rate"].dropna() < 0).any() or (result["amount"].dropna() < 0).any():
         raise ValueError(f"{sector_type} sector provider returned invalid data")
     if result.duplicated(subset=["sector_type", "name"]).any():
@@ -863,10 +881,15 @@ class MarketDataGateway:
             raw = fetcher()
         except Exception:
             raise ValueError(f"{sector_type} sector provider unavailable") from None
-        if raw is None or not isinstance(raw, pd.DataFrame) or raw.empty:
+        if raw is None or (isinstance(raw, pd.DataFrame) and raw.empty):
             raise ValueError(f"{sector_type} sector provider returned empty data")
+        if not isinstance(raw, pd.DataFrame):
+            raise ValueError(f"{sector_type} sector provider returned invalid data")
 
-        normalized, normalization_warnings = _normalize_sector_snapshot(raw, sector_type)
+        try:
+            normalized, normalization_warnings = _normalize_sector_snapshot(raw, sector_type)
+        except Exception:
+            raise ValueError(f"{sector_type} sector provider returned invalid data") from None
         received_at = self._received_at(requested_at)
         source_timestamp, timestamp_warnings = _snapshot_source_timestamp(raw)
         if source_timestamp is not None:

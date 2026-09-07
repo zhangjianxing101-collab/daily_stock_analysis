@@ -771,6 +771,57 @@ def test_get_sector_snapshot_normalizes_concept_english_aliases_and_optional_na(
     assert result.warnings == ("snapshot source timestamp unavailable",)
 
 
+def test_get_sector_snapshot_normalizes_leader_codes() -> None:
+    raw = pd.DataFrame(
+        {
+            "name": ["A", "B", "C", "D"],
+            "change_pct": [1, 2, 3, 4],
+            "leader_code": [1, 600000.0, "invalid", True],
+        }
+    )
+
+    result = MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.frame["leader_code"].tolist()[:2] == ["000001", "600000"]
+    assert result.frame["leader_code"].isna().tolist() == [False, False, True, True]
+
+
+def test_get_sector_snapshot_has_deterministic_nullable_dtypes_across_sector_types() -> None:
+    industry_raw = pd.DataFrame(
+        {"name": ["Industry"], "change_pct": [1], "advance_count": [2], "amount": [100]}
+    )
+    concept_raw = pd.DataFrame(
+        {"name": ["Concept"], "change_pct": [2.5], "decline_count": [1], "turnover_rate": [3]}
+    )
+    gateway = MarketDataGateway(
+        industry_sector_fetcher=lambda: industry_raw,
+        concept_sector_fetcher=lambda: concept_raw,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    industry = gateway.get_sector_snapshot("industry").frame
+    concept = gateway.get_sector_snapshot("concept").frame
+    expected_dtypes = {
+        "sector_type": "string",
+        "name": "string",
+        "change_pct": "Float64",
+        "advance_count": "Int64",
+        "decline_count": "Int64",
+        "turnover_rate": "Float64",
+        "amount": "Float64",
+        "leader_name": "string",
+        "leader_code": "string",
+        "leader_change_pct": "Float64",
+    }
+    assert industry.dtypes.astype(str).to_dict() == expected_dtypes
+    assert concept.dtypes.astype(str).to_dict() == expected_dtypes
+
+    combined = pd.concat([industry, concept], ignore_index=True)
+    assert combined.dtypes.astype(str).to_dict() == expected_dtypes
+    assert combined["change_pct"].sum() == 3.5
+    assert combined["advance_count"].sum() == 2
+
+
 def test_get_sector_snapshot_uses_correct_default_akshare_fetchers(monkeypatch) -> None:
     industry = Mock(return_value=pd.DataFrame({"name": ["Industry"], "change_pct": [1]}))
     concept = Mock(return_value=pd.DataFrame({"name": ["Concept"], "change_pct": [2]}))
@@ -839,6 +890,30 @@ def test_get_sector_snapshot_rejects_duplicate_names() -> None:
         MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
 
 
+def test_get_sector_snapshot_sanitizes_duplicate_columns() -> None:
+    raw = pd.DataFrame([["A", "B", 1]], columns=["name", "name", "change_pct"])
+
+    with pytest.raises(ValueError, match="^industry sector provider returned invalid data$") as caught:
+        MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert caught.value.__cause__ is None
+
+
+def test_get_sector_snapshot_sanitizes_object_conversion_failure() -> None:
+    class UnsafeText:
+        def __str__(self) -> str:
+            raise RuntimeError("https://feed.invalid/?token=secret")
+
+    raw = pd.DataFrame({"name": [UnsafeText()], "change_pct": [1]})
+
+    with pytest.raises(ValueError, match="^industry sector provider returned invalid data$") as caught:
+        MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert caught.value.__cause__ is None
+    assert "secret" not in formatted_traceback(caught)
+    assert "feed.invalid" not in formatted_traceback(caught)
+
+
 def test_get_sector_snapshot_handles_source_timestamps_and_postmarket_freshness_boundary() -> None:
     raw = pd.DataFrame({"name": ["A"], "change_pct": [1]})
     raw.attrs["quote_timestamp"] = "2026-08-19 15:00:00"
@@ -855,6 +930,21 @@ def test_get_sector_snapshot_handles_source_timestamps_and_postmarket_freshness_
     raw.attrs.pop("quote_timestamp")
     with pytest.raises(ValueError, match="^industry sector source timestamp is in the future$"):
         MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: boundary).get_sector_snapshot("industry")
+
+
+def test_get_sector_snapshot_freshness_uses_equivalent_instants_across_timezones() -> None:
+    raw = pd.DataFrame({"name": ["A"], "change_pct": [1]})
+    raw.attrs["source_timestamp"] = "2026-08-19T15:00:00+08:00"
+    boundary_utc = datetime(2026, 8, 19, 11, 0, tzinfo=timezone.utc)
+
+    result = MarketDataGateway(industry_sector_fetcher=lambda: raw, clock=lambda: boundary_utc).get_sector_snapshot("industry")
+
+    assert result.observed_at == boundary_utc
+    with pytest.raises(ValueError, match="^industry sector snapshot stale$"):
+        MarketDataGateway(
+            industry_sector_fetcher=lambda: raw,
+            clock=lambda: boundary_utc + timedelta(seconds=1),
+        ).get_sector_snapshot("industry")
 
 
 def test_get_sector_snapshot_marks_invalid_source_timestamp_unavailable() -> None:
