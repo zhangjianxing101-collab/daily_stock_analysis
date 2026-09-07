@@ -974,6 +974,18 @@ def _sector_state_timestamp(value: object) -> datetime:
     return parsed
 
 
+def _trustworthy_sector_source_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    try:
+        if value.tzinfo is None or value.utcoffset() is None:
+            return None
+        value.isoformat()
+    except Exception:
+        return None
+    return value
+
+
 def _validated_sector_state_item(
     item: object,
     *,
@@ -1034,7 +1046,11 @@ def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple
         if path is None or not path.is_file():
             raise ValueError
         payload = json.loads(path.read_text(encoding="utf-8"))
-        if not isinstance(payload, dict) or payload.get("schema_version") != MANIFEST_SCHEMA_VERSION:
+        if (
+            not isinstance(payload, dict)
+            or type(payload.get("schema_version")) is not int
+            or payload.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        ):
             raise ValueError
         trading_date = payload.get("trading_date")
         if not isinstance(trading_date, str):
@@ -1086,11 +1102,9 @@ def _sector_state(
         for sector_type, analysis in analyses.items():
             if sector_type not in _SECTOR_TYPES or not isinstance(analysis, SectorAnalysis):
                 raise ValueError
-            source = source_timestamps.get(sector_type)
+            source = _trustworthy_sector_source_timestamp(source_timestamps.get(sector_type))
             if source is None:
                 continue
-            if not isinstance(source, datetime) or source.tzinfo is None or source.utcoffset() is None:
-                raise ValueError
             if type(analysis.valid_count) is not int or analysis.valid_count <= 0:
                 raise ValueError
             for row in analysis.strongest:
@@ -1424,15 +1438,21 @@ def _redacted_manifest(
         manifest["candidate_state"] = _candidate_state(candidates, portfolio_codes)
     else:
         try:
-            manifest["sector_state"] = [
-                _validated_sector_state_item(
+            sanitized_sector_state: list[dict[str, Any]] = []
+            identities: set[tuple[str, str]] = set()
+            for item in sector_state:
+                normalized = _validated_sector_state_item(
                     item,
                     manifest_date=session.trading_date,
                     generated_at=generated,
                     now=session.now_shanghai,
                 )
-                for item in sector_state
-            ]
+                identity = (normalized["sector_type"], normalized["name"])
+                if identity in identities:
+                    raise ValueError
+                identities.add(identity)
+                sanitized_sector_state.append(normalized)
+            manifest["sector_state"] = sanitized_sector_state
         except (TypeError, ValueError, OverflowError):
             raise _sector_state_error("sector state invalid") from None
         manifest["morning_candidate_statuses"] = [

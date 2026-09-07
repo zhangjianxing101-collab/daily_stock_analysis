@@ -5,7 +5,7 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, tzinfo
 from pathlib import Path
 from unittest.mock import Mock, patch
 from zoneinfo import ZoneInfo
@@ -52,6 +52,18 @@ SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 8, 19, 16, 30, tzinfo=SHANGHAI)
 PORTFOLIO_CODE = "600000"
 CANDIDATE_CODE = "600001"
+SECTOR_STATE_KEYS = (
+    "sector_type", "name", "rank", "change_pct", "breadth_pct", "activity_percentile",
+    "universe_size", "rotation", "persistence", "crowding_risk", "source_timestamp",
+)
+
+
+class InvalidOffsetTimezone(tzinfo):
+    def utcoffset(self, dt):
+        raise ValueError("invalid offset")
+
+    def dst(self, dt):
+        return None
 
 
 def candidate(code: str = CANDIDATE_CODE, *, observed_at: datetime = NOW) -> Candidate:
@@ -1883,6 +1895,18 @@ def test_load_prior_sector_state_rejects_invalid_manifest_contract(tmp_path, ove
         _load_prior_sector_state(path, session)
 
 
+@pytest.mark.parametrize("schema_version", [True, 1.0, "1"])
+def test_load_prior_sector_state_requires_exact_integer_schema_version(tmp_path, schema_version) -> None:
+    path = tmp_path / "prior.json"
+    path.write_text(json.dumps(prior_sector_manifest(
+        state=serialized_sector_state(), schema_version=schema_version,
+    )), encoding="utf-8")
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+
+    with pytest.raises(ValueError, match="^prior sector state unavailable$"):
+        _load_prior_sector_state(path, session)
+
+
 def test_load_prior_sector_state_rejects_generated_at_on_the_wrong_local_date(tmp_path) -> None:
     path = tmp_path / "prior.json"
     state = serialized_sector_state()
@@ -1929,7 +1953,19 @@ def test_load_prior_sector_state_rejects_invalid_items(tmp_path, mutate) -> None
         _load_prior_sector_state(path, session)
 
 
-def test_load_prior_sector_state_rejects_duplicates_and_degrades_to_first_observation(tmp_path) -> None:
+@pytest.mark.parametrize("missing_key", SECTOR_STATE_KEYS)
+def test_load_prior_sector_state_rejects_every_missing_item_key(tmp_path, missing_key) -> None:
+    state = serialized_sector_state()
+    state[0].pop(missing_key)
+    path = tmp_path / "prior.json"
+    path.write_text(json.dumps(prior_sector_manifest(state=state)), encoding="utf-8")
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+
+    with pytest.raises(ValueError, match="^prior sector state unavailable$"):
+        _load_prior_sector_state(path, session)
+
+
+def test_load_prior_sector_state_rejects_duplicates(tmp_path) -> None:
     state = serialized_sector_state()
     state.append(dict(state[0]))
     path = tmp_path / "prior.json"
@@ -1938,9 +1974,25 @@ def test_load_prior_sector_state_rejects_duplicates_and_degrades_to_first_observ
 
     with pytest.raises(ValueError, match="^prior sector state unavailable$"):
         _load_prior_sector_state(path, session)
+
+
+@pytest.mark.parametrize("failure", ["missing", "corrupt"])
+def test_prior_sector_state_loader_failure_degrades_to_first_observation(tmp_path, failure) -> None:
+    path = tmp_path / "prior.json"
+    if failure == "corrupt":
+        path.write_text("{private provider payload", encoding="utf-8")
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+
+    try:
+        prior_rows = _load_prior_sector_state(path, session)
+    except ValueError as exc:
+        assert str(exc) == "prior sector state unavailable"
+        previous = ()
+    else:
+        previous = {(row["sector_type"], row["name"]): row for row in prior_rows}
     analysis = analyze_sectors(
         pd.DataFrame([{"sector_type": "industry", "name": "半导体", "change_pct": 1.0}]),
-        previous=(), observed_at=NOW,
+        previous=previous, observed_at=NOW,
     )
     assert analysis.strongest[0].rotation == "first_observation"
 
@@ -1960,21 +2012,61 @@ def test_sector_state_is_deterministic_private_and_top_twenty_only() -> None:
     assert [(row["sector_type"], row["rank"], row["name"]) for row in state] == [
         ("concept", 1, "B"), ("concept", 2, "A"), ("industry", 1, "D"),
     ]
-    assert set(state[0]) == {
-        "sector_type", "name", "rank", "change_pct", "breadth_pct", "activity_percentile",
-        "universe_size", "rotation", "persistence", "crowding_risk", "source_timestamp",
-    }
+    assert set(state[0]) == set(SECTOR_STATE_KEYS)
     assert "私密龙头" not in json.dumps(state, ensure_ascii=False)
 
 
-def test_sector_state_omits_types_without_trustworthy_timestamps_and_rejects_invalid_inputs() -> None:
+@pytest.mark.parametrize(
+    "untrustworthy",
+    [None, "2026-08-18T15:30:00+08:00", datetime(2026, 8, 18, 15, 30),
+     datetime(2026, 8, 18, 15, 30, tzinfo=InvalidOffsetTimezone())],
+)
+def test_sector_state_omits_only_type_with_untrustworthy_timestamp(untrustworthy) -> None:
+    analyses = {
+        "industry": sector_analysis(sector_row()),
+        "concept": sector_analysis(sector_row(sector_type="concept", name="机器人")),
+    }
+    timestamps = {"industry": untrustworthy, "concept": NOW}
+
+    state = _sector_state(analyses, timestamps)  # type: ignore[arg-type]
+
+    assert [(row["sector_type"], row["name"]) for row in state] == [("concept", "机器人")]
+
+
+def test_sector_state_omits_missing_timestamp_and_rejects_other_invalid_inputs() -> None:
     analysis = sector_analysis(sector_row())
-    assert _sector_state({"industry": analysis}, {"industry": None}) == []
     assert _sector_state({"industry": analysis}, {}) == []
     with pytest.raises(ValueError, match="^sector state invalid$"):
-        _sector_state({"industry": analysis}, {"industry": datetime(2026, 8, 18, 15, 30)})
-    with pytest.raises(ValueError, match="^sector state invalid$"):
         _sector_state({"industry": sector_analysis(sector_row(change_pct=float("inf")))}, {"industry": NOW})
+
+
+def test_sector_state_does_not_mutate_inputs_and_excludes_privacy_sentinels() -> None:
+    privacy_sentinels = (
+        "leader_name_private", "leader_code_private", "provider_payload_private", "raw_text_private",
+        "https://private.example", "credential_private", "token_private", "private@example.com",
+        "quantity_private", "cost_price_private", "capital_cny_private",
+    )
+    analysis = SectorAnalysis(
+        strongest=(sector_row(leader_name=privacy_sentinels[0], leader_code=privacy_sentinels[1]),),
+        weakest=(), watch=(), valid_count=20, warnings=privacy_sentinels[2:],
+    )
+    analyses = {"industry": analysis}
+    timestamps = {"industry": NOW}
+    analyses_before = dict(analyses)
+    timestamps_before = dict(timestamps)
+
+    state = _sector_state(analyses, timestamps)
+
+    assert analyses == analyses_before
+    assert timestamps == timestamps_before
+    manifest = _redacted_manifest(
+        ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket"),
+        {}, RenderedReport("subject", "html", "text"), final_state="sent", candidates=(),
+        morning_candidates=(), portfolio_codes=set(), test_email=False,
+        market_source_timestamp=NOW.isoformat(), sector_state=state,
+    )
+    serialized = json.dumps(manifest, ensure_ascii=False)
+    assert all(sentinel not in serialized for sentinel in privacy_sentinels)
 
 
 def test_redacted_manifest_postmarket_includes_valid_sector_state_and_premarket_omits_it() -> None:
@@ -1996,6 +2088,46 @@ def test_redacted_manifest_postmarket_includes_valid_sector_state_and_premarket_
     assert _redacted_manifest(postmarket, **common)["sector_state"] == []
     with pytest.raises(ValueError, match="^sector state invalid$"):
         _redacted_manifest(postmarket, sector_state=[{"private": "payload"}], **common)
+
+
+def test_redacted_manifest_rejects_duplicate_normalized_sector_identity() -> None:
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+    state = serialized_sector_state()
+    duplicate = dict(state[0], name=" 半导体 ")
+    common = dict(
+        modules={}, rendered=RenderedReport("subject", "html", "text"), final_state="sent", candidates=(),
+        morning_candidates=(), portfolio_codes=set(), test_email=False, market_source_timestamp=NOW.isoformat(),
+    )
+
+    with pytest.raises(ValueError, match="^sector state invalid$"):
+        _redacted_manifest(session, sector_state=[state[0], duplicate], **common)
+
+
+def test_same_sector_name_is_allowed_across_industry_and_concept(tmp_path) -> None:
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+    timestamp = datetime(2026, 8, 18, 15, 30, tzinfo=SHANGHAI)
+    state = _sector_state(
+        {
+            "industry": sector_analysis(sector_row(name="共同名称")),
+            "concept": sector_analysis(sector_row(sector_type="concept", name="共同名称")),
+        },
+        {"industry": timestamp, "concept": timestamp},
+    )
+    manifest = _redacted_manifest(
+        session, {}, RenderedReport("subject", "html", "text"), final_state="sent", candidates=(),
+        morning_candidates=(), portfolio_codes=set(), test_email=False,
+        market_source_timestamp=NOW.isoformat(), sector_state=state,
+    )
+
+    assert [(row["sector_type"], row["name"]) for row in manifest["sector_state"]] == [
+        ("concept", "共同名称"), ("industry", "共同名称"),
+    ]
+    path = tmp_path / "prior.json"
+    path.write_text(json.dumps(prior_sector_manifest(state=state)), encoding="utf-8")
+    loaded = _load_prior_sector_state(path, session)
+    assert [(row["sector_type"], row["name"]) for row in loaded] == [
+        ("concept", "共同名称"), ("industry", "共同名称"),
+    ]
 
 
 def test_default_dependencies_bind_production_collaborative_modules_without_running_them() -> None:
