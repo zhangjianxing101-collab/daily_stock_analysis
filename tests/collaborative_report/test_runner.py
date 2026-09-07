@@ -2144,6 +2144,44 @@ def test_sector_state_is_deterministic_private_and_top_twenty_only() -> None:
     assert "私密龙头" not in json.dumps(state, ensure_ascii=False)
 
 
+def twenty_five_industry_sectors() -> pd.DataFrame:
+    return pd.DataFrame([
+        {
+            "sector_type": "industry",
+            "name": f"行业-{index:02d}",
+            "change_pct": float(26 - index),
+        }
+        for index in range(1, 26)
+    ])
+
+
+def test_sector_state_persists_complete_top_twenty_from_real_analysis() -> None:
+    analysis = analyze_sectors(
+        twenty_five_industry_sectors(),
+        previous=(),
+        observed_at=NOW,
+        limit=20,
+    )
+
+    state = _sector_state({"industry": analysis}, {"industry": NOW})
+
+    assert len(state) == 20
+    assert [row["rank"] for row in state] == list(range(1, 21))
+    assert {row["universe_size"] for row in state} == {25}
+
+
+def test_sector_state_rejects_incomplete_default_limit_analysis_for_large_universe() -> None:
+    analysis = analyze_sectors(
+        twenty_five_industry_sectors(),
+        previous=(),
+        observed_at=NOW,
+    )
+
+    assert len(analysis.strongest) == 10
+    with pytest.raises(ValueError, match="^sector state invalid$"):
+        _sector_state({"industry": analysis}, {"industry": NOW})
+
+
 @pytest.mark.parametrize(
     "untrustworthy",
     [None, "2026-08-18T15:30:00+08:00", datetime(2026, 8, 18, 15, 30),
