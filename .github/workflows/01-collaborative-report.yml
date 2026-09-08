@@ -117,6 +117,7 @@ jobs:
           printf 'test_email=%s\n' "$test_email" >> "$GITHUB_OUTPUT"
           printf 'preview_only=%s\n' "$preview_only" >> "$GITHUB_OUTPUT"
           printf 'reconcile_sent=%s\n' "$reconcile_sent" >> "$GITHUB_OUTPUT"
+          printf 'trading_date=%s\n' "$trading_date" >> "$GITHUB_OUTPUT"
           printf 'report_key=%s\n' "$report_key" >> "$GITHUB_OUTPUT"
           printf 'prior_report_artifact=%s\n' "report-$trading_date-premarket" >> "$GITHUB_OUTPUT"
 
@@ -411,6 +412,154 @@ jobs:
           printf 'prior_report=%s\n' "$prior_report" >> "$GITHUB_OUTPUT"
           printf 'prior_report_warning=%s\n' "$prior_report_warning" >> "$GITHUB_OUTPUT"
 
+      - name: Extract prior sector state
+        id: prior_sector
+        if: ${{ steps.context.outputs.mode == 'postmarket' && steps.duplicate.outputs.delivery_action == 'deliver' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CURRENT_TRADING_DATE: ${{ steps.context.outputs.trading_date }}
+        run: |
+          set -euo pipefail
+          prior_sector_state_path=""
+          prior_sector_warning=prior_postmarket_sector_state_unavailable
+          metadata_path=".workflow-artifacts/prior-sector-artifact-metadata.json"
+          candidates_path=".workflow-artifacts/prior-sector-artifact-candidates.tsv"
+          output_path=".workflow-artifacts/prior-sector-state.json"
+          mkdir -p .workflow-artifacts
+
+          if gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/actions/artifacts?per_page=100" > "$metadata_path" 2>/dev/null; then
+            METADATA_PATH="$metadata_path" CANDIDATES_PATH="$candidates_path" python - <<'PY'
+          import json
+          import os
+          import re
+          from datetime import date
+          from pathlib import Path
+
+          metadata_path = Path(os.environ["METADATA_PATH"])
+          candidates_path = Path(os.environ["CANDIDATES_PATH"])
+          current_trading_date = date.fromisoformat(os.environ["CURRENT_TRADING_DATE"])
+          pattern = re.compile(r"^report-(\d{4}-\d{2}-\d{2})-postmarket$")
+          try:
+              pages = json.loads(metadata_path.read_text(encoding="utf-8"))
+          except (OSError, UnicodeError, json.JSONDecodeError):
+              pages = []
+
+          candidates = []
+          for page in pages if isinstance(pages, list) else []:
+              for artifact in page.get("artifacts", ()) if isinstance(page, dict) else ():
+                  if not isinstance(artifact, dict) or artifact.get("expired") is not False:
+                      continue
+                  artifact_name = artifact.get("name")
+                  match = pattern.fullmatch(artifact_name) if isinstance(artifact_name, str) else None
+                  if match is None:
+                      continue
+                  try:
+                      trading_date = date.fromisoformat(match.group(1))
+                  except ValueError:
+                      continue
+                  workflow_run = artifact.get("workflow_run")
+                  artifact_id = str(artifact.get("id", ""))
+                  run_id = str(workflow_run.get("id", "")) if isinstance(workflow_run, dict) else ""
+                  created_at = artifact.get("created_at")
+                  if (
+                      trading_date >= current_trading_date
+                      or trading_date.isoformat() != match.group(1)
+                      or not artifact_id.isascii()
+                      or not artifact_id.isdigit()
+                      or not run_id.isascii()
+                      or not run_id.isdigit()
+                      or not isinstance(created_at, str)
+                  ):
+                      continue
+                  candidates.append((trading_date, created_at, int(artifact_id), run_id, artifact_id, artifact_name))
+
+          candidates_path.write_text(
+              "".join(
+                  f"{run_id}\t{artifact_id}\t{artifact_name}\t{trading_date.isoformat()}\n"
+                  for trading_date, _, _, run_id, artifact_id, artifact_name
+                  in sorted(candidates, reverse=True)[:5]
+              ),
+              encoding="utf-8",
+          )
+          PY
+          fi
+
+          if [ -f "$candidates_path" ]; then
+            while IFS=$'\t' read -r run_id artifact_id artifact_name candidate_trading_date; do
+              if ! [[ "$run_id" =~ ^[0-9]+$ && "$artifact_id" =~ ^[0-9]+$ ]]; then
+                continue
+              fi
+              download_root=".workflow-artifacts/prior-sector-download/$artifact_id"
+              mkdir -p "$download_root"
+              if ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name "$artifact_name" --dir "$download_root" >/dev/null 2>&1; then
+                continue
+              fi
+              PRIOR_DOWNLOAD_ROOT="$download_root" CANDIDATE_TRADING_DATE="$candidate_trading_date" OUTPUT_PATH="$output_path" python - <<'PY'
+          import json
+          import os
+          from datetime import date
+          from pathlib import Path
+
+          root = Path(os.environ["PRIOR_DOWNLOAD_ROOT"]).resolve()
+          output = Path(os.environ["OUTPUT_PATH"]).resolve()
+          current_trading_date = date.fromisoformat(os.environ["CURRENT_TRADING_DATE"])
+          expected_trading_date = date.fromisoformat(os.environ["CANDIDATE_TRADING_DATE"])
+          for path in sorted(root.rglob("manifest.json")):
+              try:
+                  resolved = path.resolve(strict=True)
+                  if not resolved.is_relative_to(root) or resolved.stat().st_size > 1_000_000:
+                      continue
+                  payload = json.loads(resolved.read_text(encoding="utf-8"))
+              except (OSError, UnicodeError, json.JSONDecodeError):
+                  continue
+              if not isinstance(payload, dict):
+                  continue
+              trading_date_text = payload.get("trading_date")
+              try:
+                  trading_date = date.fromisoformat(trading_date_text)
+              except (TypeError, ValueError):
+                  continue
+              final_state = payload.get("final_state")
+              test_email = payload.get("test_email")
+              if not (
+                  type(payload.get("schema_version")) is int
+                  and payload["schema_version"] == 1
+                  and trading_date == expected_trading_date
+                  and trading_date < current_trading_date
+                  and payload.get("report_key") == f"{trading_date.isoformat()}-postmarket"
+                  and payload.get("mode") == "postmarket"
+                  and final_state == "sent"
+                  and test_email is False
+                  and isinstance(payload.get("generated_at"), str)
+                  and isinstance(payload.get("sector_state"), list)
+              ):
+                  continue
+              sanitized = {
+                  key: payload[key]
+                  for key in (
+                      "schema_version",
+                      "report_key",
+                      "mode",
+                      "trading_date",
+                      "generated_at",
+                      "final_state",
+                      "test_email",
+                      "sector_state",
+                  )
+              }
+              output.write_text(json.dumps(sanitized, ensure_ascii=False), encoding="utf-8")
+              break
+          PY
+              if [ -f "$output_path" ]; then
+                prior_sector_state_path="$output_path"
+                prior_sector_warning=""
+                break
+              fi
+            done < "$candidates_path"
+          fi
+          printf 'prior_sector_state_path=%s\n' "$prior_sector_state_path" >> "$GITHUB_OUTPUT"
+          printf 'prior_sector_warning=%s\n' "$prior_sector_warning" >> "$GITHUB_OUTPUT"
+
       - name: Run collaborative report
         id: runner
         if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.context.outputs.preview_only == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
@@ -422,6 +571,7 @@ jobs:
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           ALREADY_SENT: ${{ steps.duplicate.outputs.already_sent }}
           PRIOR_REPORT: ${{ steps.prior.outputs.prior_report }}
+          PRIOR_SECTOR_STATE_PATH: ${{ steps.prior_sector.outputs.prior_sector_state_path }}
           EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
           EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
@@ -487,6 +637,9 @@ jobs:
           fi
           if [ -n "$PRIOR_REPORT" ]; then
             args+=(--prior-report "$PRIOR_REPORT")
+          fi
+          if [ -n "$PRIOR_SECTOR_STATE_PATH" ]; then
+            args+=(--prior-sector-report "$PRIOR_SECTOR_STATE_PATH")
           fi
 
           set +e
@@ -726,6 +879,7 @@ jobs:
           DELIVERY_ACTION: ${{ steps.duplicate.outputs.delivery_action }}
           BLOCK_REASON: ${{ steps.duplicate.outputs.block_reason }}
           PRIOR_WARNING: ${{ steps.prior.outputs.prior_report_warning }}
+          PRIOR_SECTOR_WARNING: ${{ steps.prior_sector.outputs.prior_sector_warning }}
         run: |
           {
             printf '## Collaborative report\n\n'
@@ -740,6 +894,9 @@ jobs:
             fi
             if [ -n "$PRIOR_WARNING" ]; then
               printf -- '- prior state: %s\n' "$PRIOR_WARNING"
+            fi
+            if [ -n "$PRIOR_SECTOR_WARNING" ]; then
+              printf -- '- prior sector state: %s\n' "$PRIOR_SECTOR_WARNING"
             fi
           } >> "$GITHUB_STEP_SUMMARY"
 

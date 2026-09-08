@@ -39,6 +39,7 @@ def result(exit_code: int, state: FinalState) -> RunResult:
 def test_cli_passes_all_task_9_arguments_and_returns_success(tmp_path, capsys) -> None:
     runner = Mock(return_value=result(EXIT_SUCCESS, FinalState.DUPLICATE_SKIP))
     prior = tmp_path / "prior.json"
+    prior_sector = tmp_path / "prior-sector.json"
 
     exit_code = main(
         [
@@ -49,6 +50,8 @@ def test_cli_passes_all_task_9_arguments_and_returns_success(tmp_path, capsys) -
             "--already-sent",
             "--prior-report",
             str(prior),
+            "--prior-sector-report",
+            str(prior_sector),
             "--output-dir",
             str(tmp_path),
         ],
@@ -63,6 +66,7 @@ def test_cli_passes_all_task_9_arguments_and_returns_success(tmp_path, capsys) -
         preview_only=False,
         already_sent=True,
         prior_report=prior,
+        prior_sector_report=prior_sector,
         output_dir=tmp_path,
     )
     output = capsys.readouterr().out
@@ -126,6 +130,26 @@ def test_cli_rejects_premarket_prior_report_without_calling_runner(tmp_path) -> 
     runner.assert_not_called()
 
 
+def test_cli_rejects_premarket_prior_sector_report_without_calling_runner(tmp_path) -> None:
+    runner = Mock()
+
+    with pytest.raises(SystemExit) as error:
+        main(
+            [
+                "--mode",
+                "premarket",
+                "--prior-sector-report",
+                str(tmp_path / "prior-sector.json"),
+                "--output-dir",
+                str(tmp_path),
+            ],
+            runner=runner,
+        )
+
+    assert error.value.code == 2
+    runner.assert_not_called()
+
+
 def test_repository_entrypoint_help_executes_without_running_report() -> None:
     root = Path(__file__).resolve().parents[2]
     completed = subprocess.run(
@@ -140,6 +164,7 @@ def test_repository_entrypoint_help_executes_without_running_report() -> None:
     assert completed.returncode == 0
     assert "--mode {premarket,postmarket}" in completed.stdout
     assert "--already-sent" in completed.stdout
+    assert "--prior-sector-report" in completed.stdout
     assert "--ledger-status" in completed.stdout
     assert "--reconcile-sent" in completed.stdout
     assert "--reconcile-failed" in completed.stdout

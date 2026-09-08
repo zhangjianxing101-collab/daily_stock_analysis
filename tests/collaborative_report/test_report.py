@@ -21,7 +21,14 @@ def module(name: str, payload: dict, *warnings: str, status: str = "ok") -> Modu
 
 
 def candidate(
-    *, warning: str = "", name: str = "示例股份", observed_at: datetime = OBSERVED_AT
+    *,
+    warning: str = "",
+    name: str = "示例股份",
+    observed_at: datetime = OBSERVED_AT,
+    industry_sector: str = "",
+    concept_sectors: tuple[str, ...] = (),
+    sector_rotation: str = "",
+    sector_persistence: str = "",
 ) -> Candidate:
     return Candidate(
         code="600001",
@@ -36,6 +43,10 @@ def candidate(
         observed_at=observed_at,
         source="synthetic",
         warning=warning,
+        industry_sector=industry_sector,
+        concept_sectors=concept_sectors,
+        sector_rotation=sector_rotation,
+        sector_persistence=sector_persistence,
     )
 
 
@@ -442,3 +453,130 @@ def test_html_and_text_share_complete_disclaimer_content() -> None:
 def test_subject_prefix_is_explicit_and_optional() -> None:
     assert build_subject(ReportMode.PREMARKET, date(2026, 8, 19)) == "A股盘前日报 2026-08-19"
     assert build_subject(ReportMode.POSTMARKET, date(2026, 8, 19), prefix="测试") == "测试 A股收盘日报 2026-08-19"
+
+
+def _sector_row(**overrides: object) -> dict[str, object]:
+    row: dict[str, object] = {
+        "sector_type": "industry",
+        "rank": 1,
+        "name": "有色金属",
+        "change_pct": 2.5,
+        "breadth_pct": 60.0,
+        "activity_percentile": 75.0,
+        "leader_name": "示例股份",
+        "leader_code": "600000",
+        "leader_change_pct": 7.1,
+        "rotation": "continuing",
+        "persistence": "high",
+        "crowding_risk": "medium",
+    }
+    row.update(overrides)
+    return row
+
+
+def test_postmarket_decision_summary_precedes_market_and_sector_evidence() -> None:
+    rendered = render_report(
+        ReportMode.POSTMARKET,
+        date(2026, 8, 19),
+        modules={
+            "market": module("market", {"上涨家数": 3100}),
+            "industry_sectors": module(
+                "industry_sectors",
+                {"valid_count": 1, "strongest": [_sector_row()], "weakest": [], "watch": []},
+            ),
+            "decision_summary": module(
+                "decision_summary",
+                {"今日方向判断": "偏强", "策略信号": "顺势关注", "风险等级": "中", "是否建议观望": False},
+            ),
+        },
+    )
+
+    for output in (rendered.html, rendered.text):
+        assert output.index("决策摘要") < output.index("市场宽度") < output.index("行业板块")
+
+
+def test_sector_tables_have_html_text_parity_and_complete_columns() -> None:
+    industry = _sector_row()
+    concept = _sector_row(
+        sector_type="concept",
+        rank=2,
+        name="人工智能",
+        change_pct=-1.25,
+        rotation="retreating",
+        persistence="low",
+        crowding_risk="high",
+    )
+    rendered = render_report(
+        ReportMode.POSTMARKET,
+        date(2026, 8, 19),
+        modules={
+            "industry_sectors": module(
+                "industry_sectors",
+                {"valid_count": 24, "strongest": [industry], "weakest": [], "watch": [industry]},
+            ),
+            "concept_sectors": module(
+                "concept_sectors",
+                {"valid_count": 30, "strongest": [], "weakest": [concept], "watch": []},
+            ),
+        },
+    )
+
+    for value in ("有色金属", "2.50%", "60.0%", "75.0%", "延续", "高", "中", "人工智能", "-1.25%", "退潮"):
+        assert value in rendered.html
+        assert value in rendered.text
+    for heading in ("排名", "板块", "涨跌幅", "宽度", "活跃度", "领涨标的", "轮动", "持续性", "拥挤风险"):
+        assert heading in rendered.html
+        assert heading in rendered.text
+    assert rendered.html.count('class="sector-table-wrap"') == 4
+    assert "有效板块数：24" in rendered.html
+    assert "下一交易日观察" in rendered.text
+
+
+def test_unavailable_sector_fields_are_not_rendered_as_zero() -> None:
+    row = _sector_row(
+        breadth_pct=None,
+        activity_percentile=None,
+        leader_name=None,
+        leader_code=None,
+        leader_change_pct=None,
+        rotation="first_observation",
+        persistence="unavailable",
+        crowding_risk="unavailable",
+    )
+    rendered = render_report(
+        ReportMode.POSTMARKET,
+        date(2026, 8, 19),
+        modules={
+            "industry_sectors": module(
+                "industry_sectors",
+                {"valid_count": 1, "strongest": [row], "weakest": [], "watch": []},
+                "板块历史状态不可用，按首次观察处理",
+                status="partial",
+            ),
+        },
+    )
+
+    for output in (rendered.html, rendered.text):
+        sector_section = output.split("行业板块", 1)[1]
+        assert "首次观察" in sector_section
+        assert "不可用" in sector_section
+        assert "0.0%" not in sector_section
+        assert output.count("板块历史状态不可用，按首次观察处理") == 1
+
+
+def test_candidate_sector_context_is_preserved_in_html_and_text() -> None:
+    rendered = render_report(
+        ReportMode.PREMARKET,
+        date(2026, 8, 19),
+        modules={},
+        short_term_candidates=(candidate(
+            industry_sector="有色金属",
+            concept_sectors=("黄金概念", "稀缺资源"),
+            sector_rotation="accelerating",
+            sector_persistence="high",
+        ),),
+    )
+
+    for output in (rendered.html, rendered.text):
+        for value in ("行业：有色金属", "概念：黄金概念、稀缺资源", "轮动：加速", "持续性：高"):
+            assert value in output

@@ -47,6 +47,30 @@ _SNAPSHOT_ALIASES = {
     "volume": ("volume", "成交量"),
     "total_mv": ("total_mv", "总市值"),
 }
+_SECTOR_SNAPSHOT_COLUMNS = (
+    "sector_type",
+    "name",
+    "change_pct",
+    "advance_count",
+    "decline_count",
+    "turnover_rate",
+    "amount",
+    "leader_name",
+    "leader_code",
+    "leader_change_pct",
+)
+_SECTOR_SNAPSHOT_ALIASES = {
+    "name": ("板块名称", "名称", "name", "sector"),
+    "change_pct": ("涨跌幅", "change_pct", "涨幅"),
+    "advance_count": ("上涨家数", "advance_count"),
+    "decline_count": ("下跌家数", "decline_count"),
+    "turnover_rate": ("换手率", "turnover_rate", "turnover"),
+    "amount": ("成交额", "amount"),
+    "leader_name": ("领涨股票", "领涨股", "leader_name"),
+    "leader_code": ("领涨股票代码", "领涨股代码", "leader_code", "code"),
+    "leader_change_pct": ("领涨股票-涨跌幅", "领涨股涨跌幅", "leader_change_pct"),
+}
+_SECTOR_POSTMARKET_FRESHNESS = timedelta(hours=4)
 _BAR_ALIASES = {
     "date": ("date", "Date", "日期", "时间"),
     "open": ("open", "Open", "开盘"),
@@ -109,12 +133,26 @@ class MarketDataset:
 
 
 def _snapshot_source_timestamp(raw: pd.DataFrame) -> tuple[datetime | None, tuple[str, ...]]:
-    value = next(
-        (raw.attrs.get(key) for key in ("source_timestamp", "quote_timestamp", "data_timestamp") if raw.attrs.get(key)),
-        None,
-    )
+    unavailable = (None, ("snapshot source timestamp unavailable",))
+    value: object | None = None
+    for key in ("source_timestamp", "quote_timestamp", "data_timestamp"):
+        candidate = raw.attrs.get(key)
+        if candidate is None:
+            continue
+        if not pd.api.types.is_scalar(candidate):
+            return unavailable
+        try:
+            missing = pd.isna(candidate)
+            if not isinstance(missing, (bool, np.bool_)):
+                return unavailable
+            if bool(missing):
+                continue
+        except Exception:
+            return unavailable
+        value = candidate
+        break
     if value is None:
-        return None, ("snapshot source timestamp unavailable",)
+        return unavailable
     try:
         timestamp = pd.Timestamp(value)
         if pd.isna(timestamp):
@@ -122,8 +160,8 @@ def _snapshot_source_timestamp(raw: pd.DataFrame) -> tuple[datetime | None, tupl
         if timestamp.tzinfo is None:
             timestamp = timestamp.tz_localize("Asia/Shanghai")
         return timestamp.to_pydatetime(), ()
-    except (TypeError, ValueError, OverflowError):
-        return None, ("snapshot source timestamp unavailable",)
+    except Exception:
+        return unavailable
 
 
 def _matching_column(frame: pd.DataFrame, aliases: tuple[str, ...]) -> object | None:
@@ -151,6 +189,13 @@ def _canonical_code(value: object) -> str | None:
     if len(text) == 6 and text.isascii() and text.isdigit():
         return text
     return None
+
+
+def _optional_canonical_code(value: object) -> str | None:
+    try:
+        return _canonical_code(value)
+    except Exception:
+        return None
 
 
 def normalize_a_share_thscode(code: object) -> str:
@@ -270,6 +315,67 @@ def normalize_a_share_snapshot(raw: pd.DataFrame) -> pd.DataFrame:
     for column in _SNAPSHOT_COLUMNS[2:]:
         result[column] = _numeric(result[column])
     return result.loc[:, _SNAPSHOT_COLUMNS].reset_index(drop=True)
+
+
+def _normalize_sector_snapshot(raw: pd.DataFrame, sector_type: str) -> tuple[pd.DataFrame, tuple[str, ...]]:
+    """Normalize a board list while retaining unavailable optional fields as nulls."""
+
+    if not isinstance(raw, pd.DataFrame):
+        raise ValueError(f"{sector_type} sector provider returned invalid data")
+    source = raw.copy(deep=True)
+    name_column = _matching_column(source, _SECTOR_SNAPSHOT_ALIASES["name"])
+    change_column = _matching_column(source, _SECTOR_SNAPSHOT_ALIASES["change_pct"])
+    if name_column is None or change_column is None:
+        raise ValueError(f"{sector_type} sector provider returned invalid data")
+
+    result = pd.DataFrame(index=source.index)
+    result["sector_type"] = pd.Series(sector_type, index=source.index, dtype="string")
+    result["name"] = source[name_column].astype("string").str.strip().replace("", pd.NA)
+    result["change_pct"] = _numeric(source[change_column]).astype("Float64")
+    for column in ("advance_count", "decline_count", "turnover_rate", "amount", "leader_change_pct"):
+        source_column = _matching_column(source, _SECTOR_SNAPSHOT_ALIASES[column])
+        result[column] = (
+            _numeric(source[source_column]).astype("Float64")
+            if source_column is not None
+            else pd.Series(pd.NA, index=source.index, dtype="Float64")
+        )
+    leader_name_column = _matching_column(source, _SECTOR_SNAPSHOT_ALIASES["leader_name"])
+    result["leader_name"] = (
+        source[leader_name_column].astype("string").str.strip().replace("", pd.NA)
+        if leader_name_column is not None
+        else pd.Series(pd.NA, index=source.index, dtype="string")
+    )
+    leader_code_column = _matching_column(source, _SECTOR_SNAPSHOT_ALIASES["leader_code"])
+    result["leader_code"] = (
+        source[leader_code_column].map(_optional_canonical_code).astype("string")
+        if leader_code_column is not None
+        else pd.Series(pd.NA, index=source.index, dtype="string")
+    )
+
+    valid = result["name"].notna() & result["change_pct"].notna()
+    valid &= np.isfinite(result["change_pct"].to_numpy(dtype=float, na_value=np.nan))
+    excluded = int((~valid).sum())
+    result = result.loc[valid].copy()
+    if result.empty:
+        raise ValueError(f"{sector_type} sector provider returned invalid data")
+
+    for column in ("advance_count", "decline_count", "turnover_rate", "amount", "leader_change_pct"):
+        values = result[column]
+        supplied = values.notna()
+        if supplied.any() and not np.isfinite(values.loc[supplied].to_numpy(dtype=float)).all():
+            raise ValueError(f"{sector_type} sector provider returned invalid data")
+    for column in ("advance_count", "decline_count"):
+        values = result[column].dropna()
+        if (values < 0).any() or not np.equal(values, np.floor(values)).all():
+            raise ValueError(f"{sector_type} sector provider returned invalid data")
+        result[column] = result[column].astype("Int64")
+    if (result["turnover_rate"].dropna() < 0).any() or (result["amount"].dropna() < 0).any():
+        raise ValueError(f"{sector_type} sector provider returned invalid data")
+    if result.duplicated(subset=["sector_type", "name"]).any():
+        raise ValueError(f"{sector_type} sector provider returned invalid data")
+
+    warnings = (f"sector snapshot rows excluded: {excluded}",) if excluded else ()
+    return result.loc[:, _SECTOR_SNAPSHOT_COLUMNS].reset_index(drop=True), warnings
 
 
 def _flatten_yfinance_bars(frame: pd.DataFrame) -> pd.DataFrame:
@@ -405,6 +511,8 @@ class MarketDataGateway:
         daily_fetcher: Callable[..., tuple[pd.DataFrame, str]] | None = None,
         sector_names_fetcher: Callable[[], pd.DataFrame] | None = None,
         sector_members_fetcher: Callable[[str], pd.DataFrame] | None = None,
+        industry_sector_fetcher: Callable[[], pd.DataFrame] | None = None,
+        concept_sector_fetcher: Callable[[], pd.DataFrame] | None = None,
         yfinance_download: Callable[..., pd.DataFrame] | None = None,
         ths_client: ThsMarketDataClient | None = None,
         snapshot_supplement_fetcher: Callable[[Sequence[str]], Any] | None = None,
@@ -414,6 +522,8 @@ class MarketDataGateway:
         self._daily_fetcher = daily_fetcher
         self._sector_names_fetcher = sector_names_fetcher
         self._sector_members_fetcher = sector_members_fetcher
+        self._industry_sector_fetcher = industry_sector_fetcher
+        self._concept_sector_fetcher = concept_sector_fetcher
         self._yfinance_download = yfinance_download
         self._ths_client = ths_client
         self._snapshot_supplement_fetcher = snapshot_supplement_fetcher
@@ -751,6 +861,53 @@ class MarketDataGateway:
 
         frame = pd.DataFrame(records, columns=["code", "sector"])
         return MarketDataset(frame, "akshare.industry_boards", self._observed_at(), tuple(warnings))
+
+    def get_sector_snapshot(self, sector_type: str) -> MarketDataset:
+        if not isinstance(sector_type, str) or sector_type not in {"industry", "concept"}:
+            raise ValueError("sector type invalid")
+        requested_at = self._observed_at()
+        fetcher = (
+            self._industry_sector_fetcher if sector_type == "industry" else self._concept_sector_fetcher
+        )
+        try:
+            if fetcher is None:
+                import akshare
+
+                fetcher = (
+                    akshare.stock_board_industry_name_em
+                    if sector_type == "industry"
+                    else akshare.stock_board_concept_name_em
+                )
+            raw = fetcher()
+        except Exception:
+            raise ValueError(f"{sector_type} sector provider unavailable") from None
+        if raw is None or (isinstance(raw, pd.DataFrame) and raw.empty):
+            raise ValueError(f"{sector_type} sector provider returned empty data")
+        if not isinstance(raw, pd.DataFrame):
+            raise ValueError(f"{sector_type} sector provider returned invalid data")
+
+        try:
+            normalized, normalization_warnings = _normalize_sector_snapshot(raw, sector_type)
+        except Exception:
+            raise ValueError(f"{sector_type} sector provider returned invalid data") from None
+        received_at = self._received_at(requested_at)
+        source_timestamp, timestamp_warnings = _snapshot_source_timestamp(raw)
+        if source_timestamp is not None:
+            if source_timestamp > received_at:
+                raise ValueError(f"{sector_type} sector source timestamp is in the future")
+            received_local = pd.Timestamp(received_at).tz_convert("Asia/Shanghai")
+            if (
+                received_local.time() >= datetime.min.time().replace(hour=15)
+                and source_timestamp < received_at - _SECTOR_POSTMARKET_FRESHNESS
+            ):
+                raise ValueError(f"{sector_type} sector snapshot stale")
+        return MarketDataset(
+            normalized,
+            f"akshare.eastmoney_{sector_type}_boards",
+            received_at,
+            tuple(dict.fromkeys((*normalization_warnings, *timestamp_warnings))),
+            source_timestamp,
+        )
 
     def _download(self, *args, **kwargs) -> pd.DataFrame:
         if self._yfinance_download is None:

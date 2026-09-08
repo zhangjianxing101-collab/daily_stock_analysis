@@ -28,6 +28,7 @@ from .models import Candidate, ModuleResult, Position, ReportMode
 from .report import RenderedReport, render_report
 from .risk import evaluate_position, suggested_board_lots
 from .screener import ScreeningResult, prefilter_universe, rank_with_ths_evidence, screen_aggressive
+from .sector_analysis import SectorAnalysis, SectorRow, analyze_sectors
 from .session import SHANGHAI_TIMEZONE, ReportSession, build_report_session, report_data_session
 from .settings import CollaborativeSettings, ThsSettings
 from .ths_market_data import ThsIndexTag, ThsMarketDataClient
@@ -45,7 +46,27 @@ _PRICE_CONFLICT_CANDIDATE_WARNING = "价格来源冲突，仅供观望"
 _UNTRUSTED_SNAPSHOT_CANDIDATE_WARNING = "快照权威性不足，仅供观望"
 _SNAPSHOT_AUTHORITY_WARNING_CODE = "snapshot_timestamp_untrusted"
 _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING = "快照来源时间不可用，所有建议仅供观察"
+_MARKET_BREADTH_WARNING_CODE = "market_breadth_incomplete"
 _REPORT_KEY_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})-(premarket|postmarket)")
+_SECTOR_STATE_KEYS = frozenset((
+    "sector_type", "name", "rank", "change_pct", "breadth_pct", "activity_percentile",
+    "universe_size", "rotation", "persistence", "crowding_risk", "source_timestamp",
+))
+_SECTOR_TYPES = frozenset(("industry", "concept"))
+_SECTOR_ROTATIONS = frozenset((
+    "first_observation", "new_start", "continuing", "accelerating", "diverging", "retreating",
+))
+_SECTOR_LEVELS = frozenset(("high", "medium", "low", "unavailable"))
+# More than enough for the maximum 40 normalized rows while bounding hostile input.
+_PRIOR_SECTOR_MANIFEST_MAX_BYTES = 1024 * 1024
+_SECTOR_STATE_MAX_ROWS = 40
+_SECTOR_STATE_MAX_ROWS_PER_TYPE = 20
+_SECTOR_HISTORY_UNAVAILABLE_WARNING = "板块历史状态不可用，按首次观察处理"
+_SECTOR_SOURCE_TIMESTAMP_WARNING = "板块来源时间不可用，未持久化状态"
+_SECTOR_DATA_PARTIAL_WARNING = "板块数据覆盖不完整，仅供参考"
+_SECTOR_UNAVAILABLE_WARNING = "板块数据暂不可用，仅供参考"
+_SECTOR_UNAVAILABLE_CODE = "sector_module_unavailable"
+_SECTOR_STATE_WARNING = "板块状态持久化不可用，未保留历史"
 _POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=4)
 _PREMARKET_MAX_SOURCE_AGE = timedelta(days=4)
 _DATA_FAILURE_CODES = {
@@ -76,6 +97,7 @@ _DATA_FAILURE_CODES = {
 _SAFE_DATA_FAILURE_CODES = frozenset(_DATA_FAILURE_CODES.values()) | {
     "snapshot_data_failed", "gold_data_failed", "gold_analysis_failed",
     "ths_snapshot_unquoted_rows_excluded", "snapshot_screening_fields_incomplete",
+    _MARKET_BREADTH_WARNING_CODE,
 }
 
 
@@ -476,11 +498,27 @@ def _unavailable(name: str, observed_at: datetime, warning: str) -> ModuleResult
     return ModuleResult(name=name, status="unavailable", observed_at=observed_at, payload={}, warnings=(warning,))
 
 
+def _unavailable_market_payload() -> dict[str, str]:
+    return {
+        "股票数量": "不可用",
+        "上涨家数": "不可用",
+        "下跌家数": "不可用",
+        "平盘家数": "不可用",
+        "上涨占比": "不可用",
+        "成交额": "不可用",
+        "市场温度": "不可用",
+        "涨停家数": "不可用",
+        "跌停家数": "不可用",
+        "市场风格": "不可用",
+    }
+
+
 def _data_unavailable(
     name: str, observed_at: datetime, warning: str, error: Exception, fallback: str,
 ) -> ModuleResult:
     code = _DATA_FAILURE_CODES.get(str(error), fallback)
-    return ModuleResult(name, "unavailable", observed_at, {}, (warning, code))
+    payload: Mapping[str, Any] = _unavailable_market_payload() if name == "market" else {}
+    return ModuleResult(name, "unavailable", observed_at, payload, (warning, code))
 
 
 def _module(name: str, observed_at: datetime, payload: Mapping[str, Any], *warnings: str) -> ModuleResult:
@@ -512,20 +550,427 @@ def _global_payload(dataset: MarketDataset) -> Mapping[str, Any]:
 
 def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[str, Any]:
     frame = dataset.frame
-    coverage = {}
+    coverage: dict[str, Any] = {}
     if frame.attrs.get("quarantined_row_count", 0):
         coverage["无报价剔除记录"] = int(frame.attrs["quarantined_row_count"])
     if "screening_complete_count" in frame.attrs:
         coverage["选股字段齐全记录"] = int(frame.attrs["screening_complete_count"])
+    unavailable = _unavailable_market_payload()
     if not authoritative:
-        return {"股票数量": int(len(frame)), **coverage}
-    changes = pd.to_numeric(frame.get("change_pct", pd.Series(dtype=float)), errors="coerce")
-    return {
+        return {**unavailable, "股票数量": int(len(frame)), **coverage}
+    total_amount: float | str = "不可用"
+    if len(frame) > 0 and "amount" in frame:
+        raw_amounts = frame["amount"]
+        try:
+            parsed_amounts = pd.to_numeric(raw_amounts, errors="coerce")
+            values = tuple(float(value) for value in parsed_amounts)
+            raw_values = tuple(raw_amounts.tolist())
+            amounts_complete = (
+                len(values) == len(frame)
+                and not any(pd.isna(value) for value in raw_values)
+                and not any(isinstance(value, (bool, np.bool_)) for value in raw_values)
+                and all(math.isfinite(value) and value >= 0 for value in values)
+            )
+            if amounts_complete:
+                amount_sum = math.fsum(values)
+                if math.isfinite(amount_sum):
+                    total_amount = amount_sum
+        except (TypeError, ValueError, OverflowError):
+            total_amount = "不可用"
+    base = {
+        **unavailable,
         "股票数量": int(len(frame)),
-        "上涨家数": int((changes > 0).sum()),
-        "下跌家数": int((changes < 0).sum()),
+        "成交额": total_amount,
         **coverage,
     }
+    if len(frame) == 0 or "change_pct" not in frame:
+        return base
+    raw_changes = frame["change_pct"]
+    try:
+        parsed_changes = pd.to_numeric(raw_changes, errors="coerce")
+        changes = tuple(float(value) for value in parsed_changes)
+        raw_change_values = tuple(raw_changes.tolist())
+        breadth_complete = (
+            len(changes) == len(frame)
+            and not any(isinstance(value, (bool, np.bool_)) for value in raw_change_values)
+            and all(math.isfinite(value) for value in changes)
+        )
+    except (TypeError, ValueError, OverflowError):
+        breadth_complete = False
+        changes = ()
+    if not breadth_complete:
+        return base
+    up_count = sum(value > 0 for value in changes)
+    down_count = sum(value < 0 for value in changes)
+    flat_count = sum(value == 0 for value in changes)
+    up_ratio = up_count / len(changes) * 100
+    temperature = "偏热" if up_ratio >= 60 else ("偏冷" if up_ratio <= 40 else "中性")
+    return {
+        **base,
+        "上涨家数": up_count,
+        "下跌家数": down_count,
+        "平盘家数": flat_count,
+        "上涨占比": up_ratio,
+        "市场温度": temperature,
+    }
+
+
+def _sector_payload_row(row: SectorRow) -> dict[str, Any]:
+    """Project only validated sector facts into the report payload."""
+
+    return {
+        "sector_type": row.sector_type,
+        "rank": row.rank,
+        "name": row.name,
+        "change_pct": row.change_pct,
+        "breadth_pct": row.breadth_pct,
+        "activity_percentile": row.activity_percentile,
+        "leader_name": row.leader_name,
+        "leader_code": row.leader_code,
+        "leader_change_pct": row.leader_change_pct,
+        "rotation": row.rotation,
+        "persistence": row.persistence,
+        "crowding_risk": row.crowding_risk,
+    }
+
+
+def _empty_sector_payload() -> dict[str, Any]:
+    return {"valid_count": 0, "strongest": [], "weakest": [], "watch": []}
+
+
+def _run_sector_module(
+    gateway: Any,
+    sector_type: str,
+    *,
+    previous: Mapping[tuple[str, str], Mapping[str, object]] | tuple[()],
+    observed_at: datetime,
+    history_unavailable: bool,
+) -> tuple[ModuleResult, SectorAnalysis | None, datetime | None]:
+    """Run one independent sector type without exposing provider failures."""
+
+    name = f"{sector_type}_sectors"
+    try:
+        snapshot = gateway.get_sector_snapshot(sector_type)
+        frame = snapshot.frame
+        if (
+            not isinstance(frame, pd.DataFrame)
+            or frame.empty
+            or "sector_type" not in frame
+            or not all(isinstance(value, str) and value == sector_type for value in frame["sector_type"].tolist())
+        ):
+            raise ValueError("sector snapshot invalid")
+        source_timestamp = _trusted_sector_snapshot_timestamp(
+            snapshot.source_timestamp,
+            snapshot.observed_at,
+            observed_at,
+        )
+        analysis_at = source_timestamp or snapshot.observed_at
+        display = analyze_sectors(
+            frame,
+            previous=previous,
+            observed_at=analysis_at,
+            limit=10,
+        )
+        complete = analyze_sectors(
+            frame,
+            previous=previous,
+            observed_at=analysis_at,
+            limit=20,
+        )
+        if display.valid_count <= 0 or complete.valid_count <= 0:
+            raise ValueError("sector snapshot invalid")
+        warnings: list[str] = []
+        evidence_columns = ("leader_name", "leader_code", "leader_change_pct")
+        evidence_incomplete = (
+            any(column not in snapshot.frame for column in evidence_columns)
+            or any(
+                frame[column].isna().any()
+                for column in evidence_columns
+                if column in frame
+            )
+        )
+        excluded_rows = any(
+            frame.attrs.get(key, 0)
+            for key in ("quarantined_row_count", "excluded_row_count")
+        )
+        if history_unavailable:
+            warnings.append(_SECTOR_HISTORY_UNAVAILABLE_WARNING)
+        if (
+            snapshot.warnings or display.warnings or complete.warnings
+            or display.valid_count != len(frame) or evidence_incomplete or excluded_rows
+        ):
+            warnings.append(_SECTOR_DATA_PARTIAL_WARNING)
+        if source_timestamp is None:
+            warnings.append(_SECTOR_SOURCE_TIMESTAMP_WARNING)
+        payload = {
+            "valid_count": display.valid_count,
+            "strongest": [_sector_payload_row(row) for row in display.strongest],
+            "weakest": [_sector_payload_row(row) for row in display.weakest],
+            "watch": [_sector_payload_row(row) for row in display.watch],
+        }
+        return (
+            ModuleResult(
+                name,
+                "partial" if warnings else "ok",
+                analysis_at,
+                payload,
+                tuple(dict.fromkeys(warnings)),
+            ),
+            complete,
+            source_timestamp,
+        )
+    except Exception:
+        warnings = [_SECTOR_UNAVAILABLE_WARNING, _SECTOR_UNAVAILABLE_CODE]
+        if history_unavailable:
+            warnings.insert(0, _SECTOR_HISTORY_UNAVAILABLE_WARNING)
+        return (
+            ModuleResult(
+                name,
+                "unavailable",
+                observed_at,
+                _empty_sector_payload(),
+                tuple(warnings),
+            ),
+            None,
+            None,
+        )
+
+
+def _sector_rows(analyses: Mapping[str, SectorAnalysis]) -> tuple[SectorRow, ...]:
+    rows: dict[tuple[str, str], SectorRow] = {}
+    for sector_type, analysis in analyses.items():
+        for row in (*analysis.strongest, *analysis.weakest):
+            key = (sector_type, row.name)
+            existing = rows.get(key)
+            if existing is None or (row.rank, row.name) < (existing.rank, existing.name):
+                rows[key] = row
+    return tuple(sorted(rows.values(), key=lambda row: (row.rank, row.name, row.sector_type)))
+
+
+def _candidate_sector_context(
+    candidates: Sequence[Candidate],
+    *,
+    leading: Mapping[str, str],
+    analyses: Mapping[str, SectorAnalysis],
+) -> tuple[Candidate, ...]:
+    rows = _sector_rows(analyses)
+    by_identity = {(row.sector_type, row.name): row for row in rows}
+    leader_rows: dict[str, list[SectorRow]] = {}
+    for row in rows:
+        code = _canonical_evidence_code(row.leader_code)
+        if code is not None:
+            leader_rows.setdefault(code, []).append(row)
+    normalized_leading = {
+        code: raw_sector.strip()
+        for raw_code, raw_sector in leading.items()
+        for code in (_canonical_evidence_code(raw_code),)
+        if code is not None and isinstance(raw_sector, str) and raw_sector.strip()
+    }
+    persistence_order = {"high": 3, "medium": 2, "low": 1, "unavailable": 0, "": 0}
+    rotation_order = {
+        "accelerating": 6, "continuing": 5, "new_start": 4, "diverging": 3,
+        "retreating": 2, "first_observation": 1, "": 0,
+    }
+
+    projected: list[Candidate] = []
+    for item in candidates:
+        code = _canonical_evidence_code(item.code) or item.code
+        matched = list(leader_rows.get(code, ()))
+        industry = normalized_leading.get(code, "")
+        if not industry:
+            industry_rows = [row for row in matched if row.sector_type == "industry"]
+            if industry_rows:
+                industry = min(industry_rows, key=lambda row: (row.rank, row.name)).name
+        industry_row = by_identity.get(("industry", industry)) if industry else None
+        if industry_row is not None and industry_row not in matched:
+            matched.append(industry_row)
+        concepts = tuple(sorted({row.name for row in matched if row.sector_type == "concept"}))
+        if matched:
+            best = min(
+                matched,
+                key=lambda row: (
+                    -persistence_order.get(row.persistence, 0),
+                    -rotation_order.get(row.rotation, 0),
+                    row.rank,
+                    row.name,
+                    row.sector_type,
+                ),
+            )
+            rotation, persistence = best.rotation, best.persistence
+        else:
+            rotation = persistence = ""
+        projected.append(replace(
+            item,
+            industry_sector=industry,
+            concept_sectors=concepts,
+            sector_rotation=rotation,
+            sector_persistence=persistence,
+        ))
+    return tuple(projected)
+
+
+def _rerank_sector_ties(candidates: Sequence[Candidate]) -> tuple[Candidate, ...]:
+    """Use sector context only inside already-equal technical/THS scores."""
+
+    persistence_order = {"high": 3, "medium": 2, "low": 1, "unavailable": 0, "": 0}
+    rotation_order = {
+        "accelerating": 6, "continuing": 5, "new_start": 4, "diverging": 3,
+        "retreating": 2, "first_observation": 1, "": 0,
+    }
+    groups: dict[float, list[tuple[int, Candidate]]] = {}
+    for index, item in enumerate(candidates):
+        groups.setdefault(item.score, []).append((index, item))
+    output: list[Candidate] = []
+    for score in dict.fromkeys(item.score for item in candidates):
+        output.extend(item for _, item in sorted(
+            groups[score],
+            key=lambda pair: (
+                -persistence_order.get(pair[1].sector_persistence, 0),
+                -rotation_order.get(pair[1].sector_rotation, 0),
+                pair[0],
+                pair[1].code,
+            ),
+        ))
+    return tuple(output)
+
+
+def _validated_sector_direction(name: str, module: ModuleResult | None) -> str | None:
+    expected_type = name.removesuffix("_sectors")
+    payload = module.payload if module is not None else {}
+    rows = payload.get("strongest", ()) if isinstance(payload, Mapping) else ()
+    if not isinstance(rows, (tuple, list)) or not rows or not isinstance(rows[0], Mapping):
+        return None
+    row = rows[0]
+    if (
+        row.get("sector_type") != expected_type
+        or type(row.get("rank")) is not int
+        or row["rank"] != 1
+        or not isinstance(row.get("name"), str)
+        or not row["name"].strip()
+    ):
+        return None
+    change = row.get("change_pct")
+    if not isinstance(change, (int, float)) or isinstance(change, bool) or not math.isfinite(float(change)):
+        return None
+    return "偏强" if change > 0 else ("偏弱" if change < 0 else "中性")
+
+
+def _sector_resonance(modules: Mapping[str, ModuleResult]) -> str:
+    directions = [
+        direction
+        for name in ("industry_sectors", "concept_sectors")
+        for direction in (_validated_sector_direction(name, modules.get(name)),)
+        if direction is not None
+    ]
+    if len(directions) != 2:
+        return "证据不足"
+    if directions == ["偏强", "偏强"]:
+        return "同步偏强"
+    if directions == ["偏弱", "偏弱"]:
+        return "同步偏弱"
+    return "板块分化"
+
+
+def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime) -> ModuleResult:
+    """Produce a conservative advisory summary without any trade execution path."""
+
+    try:
+        market = modules.get("market")
+        payload = market.payload if market is not None else {}
+        ratio = payload.get("上涨占比") if isinstance(payload, Mapping) else None
+        breadth_usable = (
+            market is not None and market.status != "unavailable" and isinstance(ratio, (int, float))
+            and not isinstance(ratio, bool) and math.isfinite(float(ratio))
+        )
+        if not breadth_usable:
+            direction = "数据不足，建议观望"
+        elif ratio >= 60:
+            direction = "偏强"
+        elif ratio <= 40:
+            direction = "偏弱"
+        else:
+            direction = "震荡"
+        portfolio = modules.get("portfolio")
+        screening = modules.get("screening")
+        sector_modules = [modules.get("industry_sectors"), modules.get("concept_sectors")]
+        sector_directions = {
+            name: _validated_sector_direction(name, modules.get(name))
+            for name in ("industry_sectors", "concept_sectors")
+        }
+        resonance = _sector_resonance(modules)
+        sector_weak = "偏弱" in sector_directions.values() or resonance == "同步偏弱"
+        sector_strong = "偏强" in sector_directions.values()
+        sector_conflict = (
+            (direction == "偏强" and sector_weak)
+            or (direction == "偏弱" and sector_strong)
+        )
+        market_degraded = market is None or market.status != "ok"
+        sector_degraded = any(module is None or module.status != "ok" for module in sector_modules)
+        crowded = any(
+            any(row.get("crowding_risk") == "high" for row in module.payload.get("strongest", ()))
+            for module in sector_modules
+            if module is not None and isinstance(module.payload, Mapping)
+        )
+        portfolio_degraded = portfolio is None or portfolio.status != "ok"
+        screening_degraded = screening is None or screening.status != "ok"
+        watch = (
+            not breadth_usable or direction == "偏弱" or market_degraded or sector_weak
+            or sector_conflict or portfolio_degraded or screening_degraded or sector_degraded or crowded
+        )
+        high_risk = (
+            not breadth_usable or direction == "偏弱" or market_degraded or sector_weak
+            or sector_conflict or portfolio_degraded or screening_degraded or sector_degraded or crowded
+        )
+        risk = "高" if high_risk else ("中" if direction == "震荡" else "低")
+        risks: list[str] = []
+        if not breadth_usable:
+            risks.append("市场广度不可用")
+        elif market_degraded:
+            risks.append("市场模块信息不完整")
+        if direction == "偏弱":
+            risks.append("市场方向偏弱")
+        if portfolio_degraded:
+            risks.append("持仓估值或风险信息不完整")
+        if screening_degraded:
+            risks.append("候选筛选信息不完整")
+        if sector_degraded:
+            risks.append("板块证据不完整")
+        if sector_weak:
+            risks.append("板块方向偏弱")
+        if sector_conflict:
+            risks.append("市场与板块方向冲突")
+        if crowded:
+            risks.append("板块拥挤风险偏高")
+        if not risks:
+            risks.append("仍需核验盘后数据")
+        result_payload = {
+            "今日方向判断": direction,
+            "策略信号": "观望" if watch else ("顺势关注" if direction == "偏强" else "谨慎应对"),
+            "风险等级": risk,
+            "是否建议观望": watch,
+            "操作建议": (
+                "仅供研究参考，任何操作均需人工确认，不构成自动下单或收益保证。"
+            ),
+            "板块共振": resonance,
+            "关键风险": risks,
+        }
+        degraded = not breadth_usable or market_degraded or portfolio_degraded or screening_degraded or sector_degraded
+        return ModuleResult("decision_summary", "partial" if degraded else "ok", observed_at, result_payload, ())
+    except Exception:
+        return ModuleResult(
+            "decision_summary",
+            "unavailable",
+            observed_at,
+            {
+                "今日方向判断": "数据不足，建议观望", "策略信号": "观望", "风险等级": "高",
+                "是否建议观望": True,
+                "操作建议": (
+                    "仅供研究参考，任何操作均需人工确认，不构成自动下单或收益保证。"
+                ),
+                "板块共振": "证据不足", "关键风险": ["决策信息不完整"],
+            },
+            ("决策摘要数据不足",),
+        )
 
 
 def _dataset_source_payload(dataset: MarketDataset) -> Mapping[str, Any]:
@@ -940,6 +1385,273 @@ def _load_prior_state(path: Path | None, session: ReportSession) -> tuple[Mappin
     return tuple(rows)
 
 
+def _sector_state_error(message: str) -> ValueError:
+    return ValueError(message)
+
+
+def _sector_state_number(value: object, *, nullable: bool = False) -> float | None:
+    if value is None and nullable:
+        return None
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        raise ValueError
+    normalized = float(value)
+    if not math.isfinite(normalized):
+        raise ValueError
+    return normalized
+
+
+def _sector_state_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError
+    parsed = datetime.fromisoformat(value)
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise ValueError
+    return parsed
+
+
+def _trustworthy_sector_source_timestamp(value: object) -> datetime | None:
+    if not isinstance(value, datetime):
+        return None
+    try:
+        if value.tzinfo is None or value.utcoffset() is None:
+            return None
+        value.isoformat()
+    except Exception:
+        return None
+    return value
+
+
+def _trusted_sector_snapshot_timestamp(
+    value: object,
+    dataset_observed_at: object,
+    session_observed_at: object,
+) -> datetime | None:
+    """Accept sector source time only when it cannot postdate either observation."""
+
+    source = _trustworthy_sector_source_timestamp(value)
+    dataset_observed = _trustworthy_sector_source_timestamp(dataset_observed_at)
+    session_observed = _trustworthy_sector_source_timestamp(session_observed_at)
+    if source is None or dataset_observed is None or session_observed is None:
+        return None
+    try:
+        source_date = source.astimezone(SHANGHAI_TIMEZONE).date()
+        session_date = session_observed.astimezone(SHANGHAI_TIMEZONE).date()
+        if source > dataset_observed or source > session_observed or source_date != session_date:
+            return None
+    except Exception:
+        return None
+    return source
+
+
+def _validated_sector_state_item(
+    item: object,
+    *,
+    manifest_date: date | None = None,
+    generated_at: datetime | None = None,
+    now: datetime | None = None,
+) -> dict[str, Any]:
+    if not isinstance(item, Mapping) or set(item) != _SECTOR_STATE_KEYS:
+        raise ValueError
+    sector_type = item["sector_type"]
+    name = item["name"]
+    if sector_type not in _SECTOR_TYPES or not isinstance(name, str) or not name.strip():
+        raise ValueError
+    rank = item["rank"]
+    universe_size = item["universe_size"]
+    if type(rank) is not int or not 0 < rank <= 20:
+        raise ValueError
+    if type(universe_size) is not int or universe_size < rank:
+        raise ValueError
+    change_pct = _sector_state_number(item["change_pct"])
+    breadth_pct = _sector_state_number(item["breadth_pct"], nullable=True)
+    activity_percentile = _sector_state_number(item["activity_percentile"], nullable=True)
+    if (breadth_pct is not None and not 0 <= breadth_pct <= 100) or (
+        activity_percentile is not None and not 0 <= activity_percentile <= 100
+    ):
+        raise ValueError
+    rotation = item["rotation"]
+    persistence = item["persistence"]
+    crowding_risk = item["crowding_risk"]
+    if rotation not in _SECTOR_ROTATIONS or persistence not in _SECTOR_LEVELS or crowding_risk not in _SECTOR_LEVELS:
+        raise ValueError
+    source_timestamp = _sector_state_timestamp(item["source_timestamp"])
+    if generated_at is not None and source_timestamp > generated_at:
+        raise ValueError
+    if now is not None and source_timestamp > now:
+        raise ValueError
+    if manifest_date is not None and source_timestamp.astimezone(SHANGHAI_TIMEZONE).date() != manifest_date:
+        raise ValueError
+    return {
+        "sector_type": sector_type,
+        "name": name.strip(),
+        "rank": rank,
+        "change_pct": change_pct,
+        "breadth_pct": breadth_pct,
+        "activity_percentile": activity_percentile,
+        "universe_size": universe_size,
+        "rotation": rotation,
+        "persistence": persistence,
+        "crowding_risk": crowding_risk,
+        "source_timestamp": source_timestamp.isoformat(),
+    }
+
+
+def _validated_sector_state_collection(
+    items: object,
+    *,
+    manifest_date: date | None = None,
+    generated_at: datetime | None = None,
+    now: datetime | None = None,
+) -> list[dict[str, Any]]:
+    if (
+        not isinstance(items, Sequence)
+        or isinstance(items, (str, bytes, bytearray))
+        or len(items) > _SECTOR_STATE_MAX_ROWS
+    ):
+        raise ValueError
+    rows = [
+        _validated_sector_state_item(
+            item,
+            manifest_date=manifest_date,
+            generated_at=generated_at,
+            now=now,
+        )
+        for item in items
+    ]
+    identities: set[tuple[str, str]] = set()
+    by_type: dict[str, list[dict[str, Any]]] = {}
+    for row in rows:
+        identity = (row["sector_type"], row["name"])
+        if identity in identities:
+            raise ValueError
+        identities.add(identity)
+        by_type.setdefault(row["sector_type"], []).append(row)
+    for type_rows in by_type.values():
+        if len(type_rows) > _SECTOR_STATE_MAX_ROWS_PER_TYPE:
+            raise ValueError
+        universe_sizes = {row["universe_size"] for row in type_rows}
+        source_timestamps = {row["source_timestamp"] for row in type_rows}
+        if len(universe_sizes) != 1 or len(source_timestamps) != 1:
+            raise ValueError
+        universe_size = next(iter(universe_sizes))
+        expected_ranks = list(range(1, min(_SECTOR_STATE_MAX_ROWS_PER_TYPE, universe_size) + 1))
+        if sorted(row["rank"] for row in type_rows) != expected_ranks:
+            raise ValueError
+    rows.sort(key=lambda row: (row["sector_type"], row["rank"], row["name"]))
+    return rows
+
+
+def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    payload: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in payload:
+            raise ValueError
+        payload[key] = value
+    return payload
+
+
+def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple[Mapping[str, Any], ...]:
+    """Load one earlier sent postmarket sector snapshot without exposing its payload on failure."""
+
+    try:
+        if path is None or not path.is_file():
+            raise ValueError
+        if path.stat().st_size > _PRIOR_SECTOR_MANIFEST_MAX_BYTES:
+            raise ValueError
+        with path.open("rb") as manifest_file:
+            raw_manifest = manifest_file.read(_PRIOR_SECTOR_MANIFEST_MAX_BYTES + 1)
+        if len(raw_manifest) > _PRIOR_SECTOR_MANIFEST_MAX_BYTES:
+            raise ValueError
+        payload = json.loads(raw_manifest.decode("utf-8"), object_pairs_hook=_unique_json_object)
+        if (
+            not isinstance(payload, dict)
+            or type(payload.get("schema_version")) is not int
+            or payload.get("schema_version") != MANIFEST_SCHEMA_VERSION
+        ):
+            raise ValueError
+        trading_date = payload.get("trading_date")
+        if not isinstance(trading_date, str):
+            raise ValueError
+        parsed_date = date.fromisoformat(trading_date)
+        if parsed_date.isoformat() != trading_date or parsed_date >= session.trading_date:
+            raise ValueError
+        if (
+            payload.get("mode") != ReportMode.POSTMARKET.value
+            or payload.get("final_state") != FinalState.SENT.value
+            or payload.get("test_email") is not False
+            or payload.get("report_key") != f"{trading_date}-{ReportMode.POSTMARKET.value}"
+            or not isinstance(payload.get("sector_state"), list)
+        ):
+            raise ValueError
+        _canonical_report_key(str(payload["report_key"]))
+        generated_at = _sector_state_timestamp(payload.get("generated_at"))
+        if (
+            generated_at.astimezone(SHANGHAI_TIMEZONE).date() != parsed_date
+            or generated_at > session.now_shanghai
+        ):
+            raise ValueError
+        if report_data_session(ReportMode.POSTMARKET, parsed_date, generated_at) != parsed_date:
+            raise ValueError
+        rows = _validated_sector_state_collection(
+            payload["sector_state"],
+            manifest_date=parsed_date,
+            generated_at=generated_at,
+            now=session.now_shanghai,
+        )
+        return tuple(rows)
+    except (
+        OSError,
+        UnicodeError,
+        json.JSONDecodeError,
+        TypeError,
+        ValueError,
+        OverflowError,
+        RecursionError,
+        RuntimeError,
+    ):
+        raise _sector_state_error("prior sector state unavailable") from None
+
+
+def _sector_state(
+    analyses: Mapping[str, SectorAnalysis], source_timestamps: Mapping[str, datetime | None]
+) -> list[dict[str, Any]]:
+    """Serialize the privacy-safe state needed for the next sector comparison."""
+
+    try:
+        if not isinstance(analyses, Mapping) or not isinstance(source_timestamps, Mapping):
+            raise ValueError
+        rows: list[dict[str, Any]] = []
+        for sector_type, analysis in analyses.items():
+            if sector_type not in _SECTOR_TYPES or not isinstance(analysis, SectorAnalysis):
+                raise ValueError
+            source = _trustworthy_sector_source_timestamp(source_timestamps.get(sector_type))
+            if source is None:
+                continue
+            if type(analysis.valid_count) is not int or analysis.valid_count <= 0:
+                raise ValueError
+            for row in analysis.strongest:
+                if row.sector_type != sector_type:
+                    raise ValueError
+                if row.rank > 20:
+                    continue
+                rows.append({
+                    "sector_type": row.sector_type,
+                    "name": row.name,
+                    "rank": row.rank,
+                    "change_pct": row.change_pct,
+                    "breadth_pct": row.breadth_pct,
+                    "activity_percentile": row.activity_percentile,
+                    "universe_size": analysis.valid_count,
+                    "rotation": row.rotation,
+                    "persistence": row.persistence,
+                    "crowding_risk": row.crowding_risk,
+                    "source_timestamp": source.isoformat(),
+                })
+        return _validated_sector_state_collection(rows)
+    except (TypeError, ValueError, OverflowError, AttributeError):
+        raise _sector_state_error("sector state invalid") from None
+
+
 def _fsync_directory(path: Path) -> None:
     descriptor = os.open(path, os.O_RDONLY)
     try:
@@ -1206,6 +1918,25 @@ def _candidate_state(candidates: Sequence[Candidate], portfolio_codes: set[str])
     return state
 
 
+def _safe_manifest_source_timestamp(
+    value: object,
+    module_observed_at: object,
+    session_observed_at: object,
+) -> str:
+    if not isinstance(value, str):
+        return "unavailable"
+    try:
+        parsed = datetime.fromisoformat(value)
+    except (TypeError, ValueError):
+        return "unavailable"
+    trustworthy = _trusted_sector_snapshot_timestamp(
+        parsed,
+        module_observed_at,
+        session_observed_at,
+    )
+    return trustworthy.isoformat() if trustworthy is not None else "unavailable"
+
+
 def _redacted_manifest(
     session: ReportSession,
     modules: Mapping[str, ModuleResult],
@@ -1218,6 +1949,8 @@ def _redacted_manifest(
     test_email: bool,
     market_source_timestamp: str,
     generated_at: datetime | None = None,
+    sector_state: Sequence[Mapping[str, Any]] = (),
+    sector_source_timestamps: Mapping[str, object] | None = None,
 ) -> dict[str, Any]:
     generated = generated_at if generated_at is not None else session.now_shanghai
     source_timestamps = {
@@ -1225,6 +1958,15 @@ def _redacted_manifest(
     }
     if "market" in modules:
         source_timestamps["market"] = market_source_timestamp
+    if session.mode is ReportMode.POSTMARKET:
+        overrides = sector_source_timestamps if isinstance(sector_source_timestamps, Mapping) else {}
+        for name in ("industry_sectors", "concept_sectors"):
+            if name in modules:
+                source_timestamps[name] = _safe_manifest_source_timestamp(
+                    overrides.get(name),
+                    modules[name].observed_at,
+                    generated,
+                )
     manifest: dict[str, Any] = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
         "report_key": session.report_key,
@@ -1240,6 +1982,15 @@ def _redacted_manifest(
     if session.mode is ReportMode.PREMARKET:
         manifest["candidate_state"] = _candidate_state(candidates, portfolio_codes)
     else:
+        try:
+            manifest["sector_state"] = _validated_sector_state_collection(
+                sector_state,
+                manifest_date=session.trading_date,
+                generated_at=generated,
+                now=session.now_shanghai,
+            )
+        except (TypeError, ValueError, OverflowError):
+            raise _sector_state_error("sector state invalid") from None
         manifest["morning_candidate_statuses"] = [
             {"code": row.get("code"), "status": row.get("status")}
             for row in morning_candidates
@@ -1325,6 +2076,7 @@ def run_report(
     preview_only: bool = False,
     already_sent: bool = False,
     prior_report: Path | str | None = None,
+    prior_sector_report: Path | str | None = None,
     output_dir: Path | str = "reports/collaborative",
 ) -> RunResult:
     """Run one report without leaking third-party exception text to its result."""
@@ -1417,6 +2169,9 @@ def run_report(
 
     modules: dict[str, ModuleResult] = {}
     prior_candidates: tuple[Mapping[str, Any], ...] = ()
+    prior_sector_previous: dict[tuple[str, str], Mapping[str, object]] = {}
+    prior_sector_types: set[str] = set()
+    sector_history_artifact_unavailable = False
     if normalized_mode is ReportMode.POSTMARKET:
         try:
             prior_candidates = _load_prior_state(
@@ -1427,6 +2182,23 @@ def run_report(
             modules["morning_candidates"] = _unavailable(
                 "morning_candidates", session.now_shanghai, "早盘候选状态不可用"
             )
+        try:
+            prior_sector_rows = _load_prior_sector_state(
+                Path(prior_sector_report) if prior_sector_report is not None else None,
+                session,
+            )
+            prior_sector_previous = {
+                (str(row["sector_type"]), str(row["name"])): {
+                    key: row[key]
+                    for key in ("rank", "change_pct", "breadth_pct", "activity_percentile", "universe_size")
+                }
+                for row in prior_sector_rows
+            }
+            prior_sector_types = {str(row["sector_type"]) for row in prior_sector_rows}
+        except Exception:
+            prior_sector_previous = {}
+            prior_sector_types = set()
+            sector_history_artifact_unavailable = True
 
     try:
         global_data = active.gateway.get_global_snapshot()
@@ -1465,15 +2237,29 @@ def run_report(
             if snapshot_source_is_authoritative and snapshot.source_timestamp is not None:
                 market_source_timestamp = snapshot.source_timestamp.isoformat()
             market_warnings = snapshot.warnings
+            market_payload = _market_payload(
+                snapshot,
+                authoritative=snapshot_source_is_authoritative,
+            )
+            breadth_incomplete = (
+                snapshot_source_is_authoritative
+                and market_payload["上涨占比"] == "不可用"
+            )
+            if breadth_incomplete:
+                market_warnings = (*market_warnings, _MARKET_BREADTH_WARNING_CODE)
             if not snapshot_source_is_authoritative:
                 market_warnings = (*market_warnings, _SNAPSHOT_AUTHORITY_WARNING_CODE)
                 if snapshot.source_timestamp is None:
                     market_warnings = (*market_warnings, _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING)
             modules["market"] = ModuleResult(
                 "market",
-                "ok" if snapshot_source_is_authoritative and not snapshot.warnings else "partial",
+                (
+                    "ok"
+                    if snapshot_source_is_authoritative and not snapshot.warnings and not breadth_incomplete
+                    else "partial"
+                ),
                 snapshot.source_timestamp or snapshot.observed_at,
-                _market_payload(snapshot, authoritative=snapshot_source_is_authoritative),
+                market_payload,
                 tuple(dict.fromkeys(market_warnings)),
             )
         except Exception as exc:
@@ -1549,6 +2335,49 @@ def run_report(
     except Exception:
         pass
 
+    sector_analyses: dict[str, SectorAnalysis] = {}
+    sector_source_timestamps: dict[str, datetime | None] = {}
+    sector_manifest_timestamps: dict[str, str] = {}
+    sector_state: list[dict[str, Any]] = []
+    if normalized_mode is ReportMode.POSTMARKET:
+        for sector_type in ("industry", "concept"):
+            previous_for_type = {
+                key: value
+                for key, value in prior_sector_previous.items()
+                if key[0] == sector_type
+            }
+            previous = previous_for_type if sector_type in prior_sector_types else ()
+            module, complete, source_timestamp = _run_sector_module(
+                active.gateway,
+                sector_type,
+                previous=previous,
+                observed_at=session.now_shanghai,
+                history_unavailable=(
+                    sector_history_artifact_unavailable or sector_type not in prior_sector_types
+                ),
+            )
+            modules[module.name] = module
+            if complete is not None:
+                sector_analyses[sector_type] = complete
+            sector_source_timestamps[sector_type] = source_timestamp
+            sector_manifest_timestamps[module.name] = (
+                source_timestamp.isoformat() if source_timestamp is not None else "unavailable"
+            )
+        try:
+            sector_state = _sector_state(sector_analyses, sector_source_timestamps)
+        except Exception:
+            sector_state = []
+            for name in ("industry_sectors", "concept_sectors"):
+                module = modules[name]
+                if module.status != "unavailable":
+                    modules[name] = ModuleResult(
+                        module.name,
+                        "partial",
+                        module.observed_at,
+                        module.payload,
+                        tuple(dict.fromkeys((*module.warnings, _SECTOR_STATE_WARNING))),
+                    )
+
     screening = ScreeningResult((), ())
     if snapshot is None or not histories:
         modules["screening"] = _unavailable("screening", session.now_shanghai, "数据不足，建议观望")
@@ -1608,6 +2437,17 @@ def run_report(
         )
         modules["ths_financial_evidence"] = _unavailable(
             "ths_financial_evidence", session.now_shanghai, "无技术候选，同花顺财务证据未参与排序"
+        )
+
+    if normalized_mode is ReportMode.POSTMARKET:
+        screening = ScreeningResult(
+            _rerank_sector_ties(_candidate_sector_context(
+                screening.short_term, leading=leading, analyses=sector_analyses,
+            )),
+            _rerank_sector_ties(_candidate_sector_context(
+                screening.swing, leading=leading, analyses=sector_analyses,
+            )),
+            screening.warnings,
         )
 
     backtest_codes = tuple(
@@ -1745,6 +2585,8 @@ def run_report(
         modules["morning_candidates"] = _module(
             "morning_candidates", session.now_shanghai, {"候选数": len(morning_candidates)}
         )
+    if normalized_mode is ReportMode.POSTMARKET:
+        modules["decision_summary"] = _decision_summary(modules, session.now_shanghai)
 
     try:
         generated_at = _clock_checkpoint(session, active.clock(), previous=checkpoint)
@@ -1793,6 +2635,8 @@ def run_report(
             test_email=test_email,
             market_source_timestamp=market_source_timestamp,
             generated_at=generated_at,
+            sector_state=sector_state,
+            sector_source_timestamps=sector_manifest_timestamps,
         )
         paths = artifact_writer(
             output_dir,
