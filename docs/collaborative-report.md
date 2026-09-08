@@ -1,6 +1,6 @@
 # Collaborative A-share Report Delivery
 
-This workflow delivers a private A-share report at 09:00 and 16:30 China Standard Time on weekdays. The `premarket` run prepares the morning candidates; the `postmarket` run reviews the same-date morning candidate state when its private report artifact is available.
+This workflow delivers a private A-share report at 09:00 and 16:30 China Standard Time on weekdays. The `premarket` run prepares the morning candidates; the `postmarket` run reviews the same-date morning candidate state when its private report artifact is available and adds independently validated industry and concept analysis.
 
 ## QQ SMTP setup
 
@@ -63,6 +63,58 @@ one expired source can therefore invalidate the combined snapshot.
 Preview runs additionally produce bounded `provider-quality` diagnostics containing
 only counts and parsed dates. Raw responses, stderr and credentials are not uploaded.
 
+## Industry and concept analysis
+
+The postmarket report reads industry and concept board snapshots independently from
+the AkShare Eastmoney adapters. A failure in one board family does not suppress the
+other. Each accepted row requires a unique non-empty board name and a finite daily
+change. Breadth is calculated from advancing and declining constituent counts, and
+activity is the percentile rank of turnover rate within the same board family.
+Leader identity and leader change are supporting evidence. Missing optional evidence
+remains `不可用`; it is never converted to zero. Invalid timestamps, duplicate names,
+malformed values and rows without a valid change are rejected or disclosed as partial
+coverage before any conclusion is produced.
+
+Industry and concept universes are ranked separately by daily change, with board name
+as the deterministic tie-breaker. The report shows at most 10 strongest and 10 weakest
+boards from each universe, without overlap. The next-session watch list contains only
+strong boards whose persistence is `high` or `medium`; it is observation evidence, not
+an instruction to trade.
+
+Rotation labels use the current rank, change, breadth and the latest trustworthy prior
+postmarket state:
+
+- `first_observation`: no trustworthy prior state exists.
+- `new_start`: the board enters the top 20 from outside the prior top 20.
+- `accelerating`: it remains in the top 20, improves by at least five ranks and activity does not fall when both activity values are available.
+- `diverging`: price change is positive while breadth is below 50%, or activity declines from the prior observation.
+- `retreating`: a prior top-20 board turns negative or falls below the current universe midpoint.
+- `continuing`: none of the preceding transition rules applies.
+
+Persistence is unavailable without prior activity, current breadth or current activity.
+It is `low` when breadth is below 50%, activity falls, or rotation is retreating. It is
+`high` when current and prior ranks are both top 20, breadth is at least 55%, and
+activity does not fall. Other qualifying current top-20 observations are `medium`;
+remaining observations are `low`. Crowding risk is `high` for a top-20 board with
+activity at or above the 90th percentile and breadth below 50%, `medium` when activity
+is at or above the 75th percentile and breadth is at least 50%, and otherwise `low`.
+Crowding is unavailable when breadth or activity is missing.
+
+For rotation comparison, the workflow considers at most five unexpired production
+artifacts named `report-YYYY-MM-DD-postmarket`, newest earlier trading date first. It
+accepts only a completed `sent`, non-test postmarket manifest whose identity and date
+match, then passes a reduced file containing only sector state and required provenance.
+Preview, test, failed, current-day, future-dated and malformed artifacts are ignored.
+If no valid state is available, both board families remain usable but are labeled as a
+first observation and the fixed `prior_postmarket_sector_state_unavailable` warning is
+recorded.
+
+Sector context can annotate deterministic technical candidates with an industry,
+matched concepts, rotation and persistence. It may reorder candidates only within an
+already equal technical/THS score. It cannot create a candidate, change a score,
+override data-quality suppression, alter entry/stop/target levels, size a position, or
+remove the requirement for manual confirmation.
+
 ## Gold history completeness
 
 Empty or stale gold responses, or recognized connection/time-out failures, allow
@@ -118,6 +170,6 @@ For an unresolved claim, check QQ mailbox delivery and relevant delivery logs fi
 
 ## Privacy and retention
 
-The private production report artifact is named `report-<report-key>` and can contain portfolio analysis; a test email uses the separate `test-report-<report-key>` name and cannot obscure production prior-report lookup. Both are available only to repository users with Actions artifact access. Postmarket checks production artifacts newest-first, validates the redacted premarket state, and skips invalid candidates until it finds a valid one; otherwise it records `prior_premarket_report_unavailable`. The diagnostic artifact is redacted and contains only report state, module statuses, source timestamps, and warning codes. Workflow logs and the concise summary do not print the report HTML, report text, mailbox values, portfolio values, credentials, or raw model responses. All artifacts expire after seven days.
+The private production report artifact is named `report-<report-key>` and can contain portfolio analysis; a test email uses the separate `test-report-<report-key>` name and cannot obscure production prior-report lookup. Both are available only to repository users with Actions artifact access. Postmarket checks production artifacts newest-first, validates the redacted same-date premarket candidate state, and skips invalid candidates until it finds a valid one; otherwise it records `prior_premarket_report_unavailable`. Earlier postmarket sector lookup is separately bounded and writes only the validated sector-state subset to the runner. The diagnostic artifact is redacted and contains only report state, module statuses, source timestamps, and warning codes. Workflow logs and the concise summary do not print the report HTML, report text, mailbox values, portfolio values, credentials, remote errors, or raw model responses. All artifacts expire after seven days.
 
 If an authorization code, mailbox, portfolio value, or AI key leaks, revoke or rotate it immediately in its provider, replace the encrypted GitHub Secret, audit workflow runs and repository history, and then send a new manual test email. Never reuse a QQ login password as an SMTP authorization code.
