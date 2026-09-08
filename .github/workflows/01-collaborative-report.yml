@@ -79,17 +79,20 @@ jobs:
               "30 8 * * 1-5") mode="postmarket" ;;
               *) exit 1 ;;
             esac
+            # GitHub documents scheduled workflows as best-effort and may start
+            # them well after their cron time. Keep the market-session checks,
+            # but do not reject a valid scheduled run only because it was queued.
+            force="true"
           else
             case "$MANUAL_MODE" in
               premarket|postmarket) mode="$MANUAL_MODE" ;;
               *) exit 1 ;;
             esac
+            case "${FORCE_INPUT:-false}" in
+              true|false) force="${FORCE_INPUT:-false}" ;;
+              *) exit 1 ;;
+            esac
           fi
-
-          case "${FORCE_INPUT:-false}" in
-            true|false) force="${FORCE_INPUT:-false}" ;;
-            *) exit 1 ;;
-          esac
           case "${TEST_EMAIL_INPUT:-false}" in
             true|false) test_email="${TEST_EMAIL_INPUT:-false}" ;;
             *) exit 1 ;;
@@ -293,7 +296,7 @@ jobs:
 
       - name: Upload production delivery claim
         id: claim
-        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && steps.context.outputs.test_email == 'false' && steps.duplicate.outputs.already_sent == 'false' }}
+        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && steps.context.outputs.test_email == 'false' && steps.context.outputs.preview_only == 'false' && steps.duplicate.outputs.already_sent == 'false' }}
         uses: actions/upload-artifact@v6
         with:
           name: claim-${{ steps.context.outputs.report_key }}

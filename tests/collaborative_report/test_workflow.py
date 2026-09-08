@@ -272,6 +272,9 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
     assert '"0 1 * * 1-5") mode="premarket"' in context["run"]
     assert '"30 8 * * 1-5") mode="postmarket"' in context["run"]
     assert "premarket|postmarket" in context["run"]
+    assert 'if [ "$EVENT_NAME" = "schedule" ]; then' in context["run"]
+    assert 'force="true"' in context["run"]
+    assert context["run"].index('force="true"') < context["run"].index('case "${FORCE_INPUT:-false}"')
     assert "date +%F" in context["run"]
     assert "args=(" in runner["run"]
     assert 'args+=(--mode "$MODE")' in runner["run"]
@@ -567,6 +570,7 @@ def test_production_claim_is_mandatory_before_runner_and_blocks_crash_retries() 
     assert claim["with"]["include-hidden-files"] == "true"
     assert claim["with"]["retention-days"] == "7"
     assert "steps.context.outputs.test_email == 'false'" in claim["if"]
+    assert "steps.context.outputs.preview_only == 'false'" in claim["if"]
     assert _steps(workflow).index(claim) < _steps(workflow).index(runner)
     assert "steps.claim.outcome == 'success'" in runner["if"]
     assert "claim_upload_failed" in claim_failure["run"]
