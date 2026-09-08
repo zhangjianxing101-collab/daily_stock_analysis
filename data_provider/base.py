@@ -1881,7 +1881,8 @@ class DataFetcherManager:
         stock_code: str,
         start_date: Optional[str] = None,
         end_date: Optional[str] = None,
-        days: int = 30
+        days: int = 30,
+        validator: Optional[Callable[[pd.DataFrame], pd.DataFrame]] = None,
     ) -> Tuple[pd.DataFrame, str]:
         """
         获取日线数据（自动切换数据源）
@@ -1898,6 +1899,7 @@ class DataFetcherManager:
             start_date: 开始日期
             end_date: 结束日期
             days: 获取天数
+            validator: 可选的数据完整性校验；失败时继续尝试下一数据源
             
         Returns:
             Tuple[DataFrame, str]: (数据, 成功的数据源名称)
@@ -2001,6 +2003,8 @@ class DataFetcherManager:
                             days=days,
                         )
                         if df is not None and not df.empty:
+                            if validator is not None:
+                                df = validator(df)
                             duration_ms = int((time.time() - attempt_start) * 1000)
                             record_provider_run(
                                 data_type="daily_data",
@@ -2081,6 +2085,8 @@ class DataFetcherManager:
                 )
                 
                 if df is not None and not df.empty:
+                    if validator is not None:
+                        df = validator(df)
                     duration_ms = int((time.time() - attempt_start) * 1000)
                     record_provider_run(
                         data_type="daily_data",

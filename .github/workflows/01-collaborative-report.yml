@@ -417,7 +417,7 @@ jobs:
 
       - name: Extract prior sector state
         id: prior_sector
-        if: ${{ steps.context.outputs.mode == 'postmarket' && steps.duplicate.outputs.delivery_action == 'deliver' }}
+        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' }}
         env:
           GH_TOKEN: ${{ github.token }}
           CURRENT_TRADING_DATE: ${{ steps.context.outputs.trading_date }}

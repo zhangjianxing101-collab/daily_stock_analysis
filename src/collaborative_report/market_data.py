@@ -575,8 +575,6 @@ class MarketDataGateway:
         result = frame.copy(deep=True)
         result.attrs["screening_complete_count"] = 0
         warning = "snapshot_screening_fields_incomplete"
-        if source_timestamp is None:
-            return result, observed_at, source_timestamp, (warning,)
         supported_codes: list[str] = []
         for code in result["code"]:
             try:
@@ -599,9 +597,15 @@ class MarketDataGateway:
                 raise ValueError("supplement fields invalid")
         except Exception:
             return result, received_at, source_timestamp, (warning,)
-        # Session dates are always interpreted in the exchange's timezone.
+        # The THS snapshot timestamp is the response assembly time, not the
+        # quote's completed-session identity. Prove that identity independently.
+        from .session import latest_completed_xshg_session
+
         exchange_tz = "Asia/Shanghai"
-        expected = pd.Timestamp(source_timestamp).tz_convert(exchange_tz).date()
+        try:
+            expected = latest_completed_xshg_session(observed_at)
+        except Exception:
+            return result, received_at, source_timestamp, (warning,)
         indexed = records.set_index("code")
         timestamps = []
         for index, row in result.iterrows():
@@ -629,7 +633,11 @@ class MarketDataGateway:
                 continue
         result.attrs["screening_complete_count"] = len(timestamps)
         if timestamps:
-            source_timestamp = min(source_timestamp, *timestamps)
+            source_timestamp = (
+                min(timestamps)
+                if source_timestamp is None
+                else min(source_timestamp, *timestamps)
+            )
             result.attrs["supplement_source"] = "tencent"
             result.attrs["supplement_source_timestamp"] = min(timestamps).isoformat()
         warnings = (warning,) if len(timestamps) < len(result) else ()
@@ -744,7 +752,11 @@ class MarketDataGateway:
             if self._daily_fetcher is None:
                 from data_provider.base import DataFetcherManager
 
-                raw, source = DataFetcherManager().get_daily_data(code, days=days)
+                raw, source = DataFetcherManager().get_daily_data(
+                    code,
+                    days=days,
+                    validator=lambda frame: validate_daily_bars(frame, expected_session),
+                )
             else:
                 raw, source = self._daily_fetcher(code, days=days)
         except Exception:

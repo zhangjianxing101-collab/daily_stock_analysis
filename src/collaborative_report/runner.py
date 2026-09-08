@@ -973,6 +973,46 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
         )
 
 
+def _report_delivery_blockers(
+    mode: ReportMode,
+    modules: Mapping[str, ModuleResult],
+) -> tuple[str, ...]:
+    """Return stable reason codes when a report is too incomplete to deliver."""
+
+    blockers: list[str] = []
+    market = modules.get("market")
+    market_payload = market.payload if market is not None and isinstance(market.payload, Mapping) else {}
+    breadth = market_payload.get("上涨占比")
+    if (
+        market is None
+        or market.status == "unavailable"
+        or not isinstance(breadth, (int, float))
+        or isinstance(breadth, bool)
+        or not math.isfinite(float(breadth))
+    ):
+        blockers.append("market_breadth_unavailable")
+    if market is None or _SNAPSHOT_AUTHORITY_WARNING_CODE in market.warnings:
+        blockers.append("market_source_untrusted")
+
+    screening = modules.get("screening")
+    if screening is None or screening.status == "unavailable":
+        blockers.append("screening_unavailable")
+
+    if mode is ReportMode.POSTMARKET:
+        for name in ("industry_sectors", "concept_sectors"):
+            module = modules.get(name)
+            payload = module.payload if module is not None and isinstance(module.payload, Mapping) else {}
+            strongest = payload.get("strongest")
+            if (
+                module is None
+                or module.status == "unavailable"
+                or not isinstance(strongest, (tuple, list))
+                or not strongest
+            ):
+                blockers.append(f"{name}_unavailable")
+    return tuple(blockers)
+
+
 def _dataset_source_payload(dataset: MarketDataset) -> Mapping[str, Any]:
     return {
         "数据源": dataset.source,
@@ -1612,6 +1652,55 @@ def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple
         raise _sector_state_error("prior sector state unavailable") from None
 
 
+def _prior_sector_recap_modules(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, ModuleResult]:
+    """Project the last verified close's sector state into a premarket recap."""
+
+    modules: dict[str, ModuleResult] = {}
+    for sector_type in ("industry", "concept"):
+        selected = sorted(
+            (row for row in rows if row.get("sector_type") == sector_type),
+            key=lambda row: (int(row["rank"]), str(row["name"])),
+        )
+        if not selected:
+            continue
+        source_timestamp = _sector_state_timestamp(selected[0]["source_timestamp"])
+
+        def report_row(row: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                key: row[key]
+                for key in (
+                    "sector_type", "rank", "name", "change_pct", "breadth_pct",
+                    "activity_percentile", "rotation", "persistence", "crowding_risk",
+                )
+            } | {
+                "leader_name": None,
+                "leader_code": None,
+                "leader_change_pct": None,
+            }
+
+        strongest = [report_row(row) for row in selected[:10]]
+        watch = [
+            report_row(row)
+            for row in selected[:10]
+            if row.get("persistence") in {"high", "medium"}
+        ]
+        modules[f"{sector_type}_sectors"] = ModuleResult(
+            f"{sector_type}_sectors",
+            "partial",
+            source_timestamp,
+            {
+                "valid_count": int(selected[0]["universe_size"]),
+                "strongest": strongest,
+                "weakest": [],
+                "watch": watch,
+            },
+            ("盘前沿用最近一次已验证收盘板块状态",),
+        )
+    return modules
+
+
 def _sector_state(
     analyses: Mapping[str, SectorAnalysis], source_timestamps: Mapping[str, datetime | None]
 ) -> list[dict[str, Any]]:
@@ -2182,11 +2271,14 @@ def run_report(
             modules["morning_candidates"] = _unavailable(
                 "morning_candidates", session.now_shanghai, "早盘候选状态不可用"
             )
-        try:
-            prior_sector_rows = _load_prior_sector_state(
-                Path(prior_sector_report) if prior_sector_report is not None else None,
-                session,
-            )
+    try:
+        prior_sector_rows = _load_prior_sector_state(
+            Path(prior_sector_report) if prior_sector_report is not None else None,
+            session,
+        )
+        if normalized_mode is ReportMode.PREMARKET:
+            modules.update(_prior_sector_recap_modules(prior_sector_rows))
+        else:
             prior_sector_previous = {
                 (str(row["sector_type"]), str(row["name"])): {
                     key: row[key]
@@ -2195,10 +2287,10 @@ def run_report(
                 for row in prior_sector_rows
             }
             prior_sector_types = {str(row["sector_type"]) for row in prior_sector_rows}
-        except Exception:
-            prior_sector_previous = {}
-            prior_sector_types = set()
-            sector_history_artifact_unavailable = True
+    except Exception:
+        prior_sector_previous = {}
+        prior_sector_types = set()
+        sector_history_artifact_unavailable = True
 
     try:
         global_data = active.gateway.get_global_snapshot()
@@ -2602,6 +2694,15 @@ def run_report(
         checked_at=generated_at,
     ):
         return _failure("snapshot_source_expired", report_key=session.report_key, modules=modules)
+    delivery_blockers = _report_delivery_blockers(normalized_mode, modules)
+    if delivery_blockers:
+        modules["delivery_readiness"] = ModuleResult(
+            "delivery_readiness",
+            "unavailable",
+            generated_at,
+            {"status": "blocked", "reason_codes": delivery_blockers},
+            ("报告核心内容不完整，已阻止邮件发送",),
+        )
     try:
         rendered = active.renderer(
             normalized_mode,
@@ -2682,6 +2783,30 @@ def run_report(
             EXIT_SUCCESS, final_state, session.report_key, modules,
             final_paths.html_path, final_paths.text_path, final_paths.manifest_path,
             screening.short_term, screening.swing, morning_candidates,
+        )
+
+    if delivery_blockers:
+        blocked_manifest = dict(
+            manifest,
+            final_state=FinalState.HARD_FAILURE.value,
+            module_statuses={name: result.status for name, result in modules.items()},
+            warning_codes=_warning_codes(modules),
+        )
+        try:
+            blocked_paths = artifact_finalizer(
+                output_dir,
+                report_key=session.report_key,
+                rendered=rendered,
+                manifest=blocked_manifest,
+                test_email=test_email,
+            )
+        except Exception:
+            blocked_paths = paths
+        return _failure(
+            "report_content_incomplete",
+            report_key=session.report_key,
+            modules=modules,
+            paths=blocked_paths,
         )
 
     claim_id: str | None = None

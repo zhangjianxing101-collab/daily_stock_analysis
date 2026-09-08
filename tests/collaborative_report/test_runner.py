@@ -38,9 +38,11 @@ from src.collaborative_report.runner import (
 from src.collaborative_report.runner import (
     _PRIOR_SECTOR_MANIFEST_MAX_BYTES,
     _decision_summary,
+    _report_delivery_blockers,
     _load_prior_sector_state,
     _market_payload,
     _production_mail_sender,
+    _prior_sector_recap_modules,
     _redacted_manifest,
     _rerank_sector_ties,
     _sector_state,
@@ -341,7 +343,8 @@ def test_force_bypasses_only_window_gate(tmp_path, deps) -> None:
         output_dir=tmp_path,
     )
 
-    assert result.exit_code == EXIT_SUCCESS
+    assert result.exit_code == EXIT_FAILURE
+    assert result.error_code == "report_content_incomplete"
     session_builder.assert_called_once_with(ReportMode.PREMARKET, NOW, scheduled=False)
     assert result.modules["screening"].status == "unavailable"
     assert "provider secret" not in json.dumps(result.to_public_dict(), ensure_ascii=False)
@@ -500,13 +503,13 @@ def test_material_snapshot_history_conflict_forces_watch_and_suppresses_risk_and
     assert SNAPSHOT_DAILY_CLOSE_TOLERANCE == 0.01
     assert "snapshot_daily_close_conflict" in result.modules["market"].warnings
     assert result.modules["market"].status == "partial"
-    assert result.short_term_candidates[0].warning == "价格来源冲突，仅供观望"
     assert deps.renderer.call_args.kwargs["short_term_candidates"][0].warning == "价格来源冲突，仅供观望"
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert "snapshot_daily_close_conflict" in manifest["warning_codes"]
     risk_evaluator.assert_not_called()
     sizing_evaluator.assert_not_called()
     assert CANDIDATE_CODE not in ai_enricher.call_args.args[0]
+    deps.mail_sender.assert_not_called()
 
 
 def test_snapshot_history_price_within_tolerance_remains_actionable(tmp_path, deps) -> None:
@@ -546,11 +549,12 @@ def test_postmarket_early_intraday_source_timestamp_is_untrusted_and_suppressed(
     )
 
     assert "snapshot_timestamp_untrusted" in result.modules["market"].warnings
-    assert result.short_term_candidates[0].warning == "快照权威性不足，仅供观望"
+    assert deps.renderer.call_args.kwargs["short_term_candidates"][0].warning == "快照权威性不足，仅供观望"
     assert CANDIDATE_CODE not in ai_enricher.call_args.args[0]
     sizing_evaluator.assert_not_called()
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert manifest["source_timestamps"]["market"] == "unavailable"
+    deps.mail_sender.assert_not_called()
 
 
 def test_postmarket_stale_prior_session_source_timestamp_is_untrusted(tmp_path, deps) -> None:
@@ -608,11 +612,12 @@ def test_akshare_shape_without_timestamp_attrs_never_uses_snapshot_features_acti
 
     assert result.modules["market"].status == "partial"
     assert "快照来源时间不可用，所有建议仅供观察" in result.modules["market"].warnings
-    assert result.short_term_candidates[0].warning == "快照权威性不足，仅供观望"
+    assert deps.renderer.call_args.kwargs["short_term_candidates"][0].warning == "快照权威性不足，仅供观望"
     assert CANDIDATE_CODE not in ai_enricher.call_args.args[0]
     risk_evaluator.assert_not_called()
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert manifest["source_timestamps"]["market"] == "unavailable"
+    deps.mail_sender.assert_not_called()
 
 
 def test_inconsistent_session_identity_fails_closed(tmp_path, deps) -> None:
@@ -651,7 +656,7 @@ def test_external_duplicate_marker_skips_production_before_data(tmp_path, deps) 
     deps.mail_sender.assert_not_called()
 
 
-def test_ai_gold_and_screening_failures_degrade_and_still_send(tmp_path, deps) -> None:
+def test_ai_gold_and_screening_failures_block_incomplete_delivery(tmp_path, deps) -> None:
     def fail(*args, **kwargs):
         raise RuntimeError("smtp_password=do-not-leak")
 
@@ -661,14 +666,15 @@ def test_ai_gold_and_screening_failures_degrade_and_still_send(tmp_path, deps) -
         output_dir=tmp_path,
     )
 
-    assert result.exit_code == EXIT_SUCCESS
-    assert result.final_state is FinalState.SENT
+    assert result.exit_code == EXIT_FAILURE
+    assert result.final_state is FinalState.HARD_FAILURE
+    assert result.error_code == "report_content_incomplete"
     assert result.modules["screening"].status == "unavailable"
     assert result.modules["gold"].status == "unavailable"
     assert result.modules["ai"].status == "unavailable"
     assert "AI分析暂不可用" in result.modules["ai"].warnings
     assert not result.short_term_candidates
-    deps.mail_sender.assert_called_once()
+    deps.mail_sender.assert_not_called()
 
 
 def test_screening_failure_analyzes_only_portfolio_codes(tmp_path, deps) -> None:
@@ -805,12 +811,14 @@ def test_data_failure_warns_watch_only_and_never_fabricates_success(tmp_path, de
         output_dir=tmp_path,
     )
 
-    assert result.exit_code == EXIT_SUCCESS
+    assert result.exit_code == EXIT_FAILURE
+    assert result.error_code == "report_content_incomplete"
     assert result.modules["market"].status == "unavailable"
     assert "数据不足，建议观望" in result.modules["market"].warnings
     assert result.modules["portfolio"].status == "unavailable"
     assert not result.short_term_candidates
     assert "secret" not in json.dumps(result.to_public_dict(), ensure_ascii=False)
+    deps.mail_sender.assert_not_called()
 
 
 def test_renderer_receives_session_generation_time(tmp_path, deps) -> None:
@@ -930,7 +938,8 @@ def test_future_snapshot_source_is_never_promoted_after_its_receipt_time(tmp_pat
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert result.modules["market"].status == "partial"
     assert manifest["source_timestamps"]["market"] == "unavailable"
-    deps.mail_sender.assert_called_once()
+    assert result.error_code == "report_content_incomplete"
+    deps.mail_sender.assert_not_called()
 
 
 @pytest.mark.parametrize("clock_values", [
@@ -1736,6 +1745,66 @@ def test_test_email_prefix_does_not_change_report_identity(tmp_path, deps) -> No
     assert sent_report.subject.startswith("测试 ")
 
 
+def test_incomplete_test_report_is_written_but_never_emailed(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.snapshot = replace(gateway.snapshot, source_timestamp=None)
+    gateway.get_daily_bars = Mock(side_effect=ValueError("daily bars stale"))
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        test_email=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.final_state is FinalState.HARD_FAILURE
+    assert result.error_code == "report_content_incomplete"
+    assert result.manifest_path is not None and result.manifest_path.exists()
+    assert result.modules["delivery_readiness"].payload["reason_codes"] == (
+        "market_breadth_unavailable",
+        "market_source_untrusted",
+        "screening_unavailable",
+    )
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["final_state"] == "hard_failure"
+    assert manifest["module_statuses"]["delivery_readiness"] == "unavailable"
+    deps.mail_sender.assert_not_called()
+
+
+def test_incomplete_preview_remains_available_for_diagnostics(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.snapshot = replace(gateway.snapshot, source_timestamp=None)
+    gateway.get_daily_bars = Mock(side_effect=ValueError("daily bars stale"))
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.final_state is FinalState.PREVIEWED
+    assert result.html_path is not None and result.html_path.exists()
+    assert result.modules["delivery_readiness"].status == "unavailable"
+    assert "delivery_readiness" in deps.renderer.call_args.kwargs["modules"]
+    deps.mail_sender.assert_not_called()
+
+
+def test_postmarket_delivery_requires_both_sector_rankings() -> None:
+    modules = {
+        "market": ModuleResult("market", "ok", NOW, {"上涨占比": 60.0}),
+        "screening": ModuleResult("screening", "ok", NOW, {"短线候选数": 0, "波段候选数": 0}),
+        "industry_sectors": ModuleResult("industry_sectors", "ok", NOW, {"strongest": [{}]}),
+        "concept_sectors": ModuleResult("concept_sectors", "unavailable", NOW, {}),
+    }
+
+    assert _report_delivery_blockers(ReportMode.POSTMARKET, modules) == (
+        "concept_sectors_unavailable",
+    )
+
+
 def test_smtp_failure_is_fatal_with_sanitized_result(tmp_path, deps) -> None:
     mail_sender = Mock(side_effect=RuntimeError("receiver@example.com password=hunter2"))
 
@@ -1875,6 +1944,37 @@ def prior_sector_manifest(*, state: list[dict[str, object]], **overrides: object
     }
     payload.update(overrides)
     return payload
+
+
+def test_premarket_uses_verified_prior_close_sector_recap(tmp_path, deps) -> None:
+    prior = tmp_path / "prior-sector.json"
+    prior.write_text(
+        json.dumps(prior_sector_manifest(state=[
+            *sector_state_rows("industry", 2),
+            *sector_state_rows("concept", 2),
+        ])),
+        encoding="utf-8",
+    )
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, renderer=render_report),
+        force=True,
+        preview_only=True,
+        prior_sector_report=prior,
+        output_dir=tmp_path / "report",
+    )
+
+    assert result.modules["industry_sectors"].status == "partial"
+    assert result.modules["concept_sectors"].payload["strongest"][0]["name"] == "concept-01"
+    report = result.html_path.read_text(encoding="utf-8")
+    assert "行业板块" in report
+    assert "概念板块" in report
+    assert "盘前沿用最近一次已验证收盘板块状态" in report
+
+
+def test_prior_sector_recap_rejects_no_types() -> None:
+    assert _prior_sector_recap_modules(()) == {}
 
 
 def serialized_sector_state() -> list[dict[str, object]]:

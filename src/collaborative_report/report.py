@@ -38,6 +38,7 @@ _MODULE_TITLES = {
     "ths_market_evidence": "同花顺市场证据",
     "ths_financial_evidence": "同花顺基本面证据",
     "decision_summary": "决策摘要",
+    "delivery_readiness": "报告完整性检查",
 }
 _SECTOR_TITLES = {
     "industry_sectors": "行业板块",
@@ -503,8 +504,12 @@ def render_report(
             raise
         target_session = None
     if normalized_mode is ReportMode.PREMARKET:
-        leading_sections = _module_sections(modules, ("global", "gold", "portfolio"))
-        sector_sections: tuple[_SectorModuleView, ...] = ()
+        leading_sections = _module_sections(
+            modules,
+            ("global", "gold", "portfolio"),
+            excluded_keys=("industry_sectors", "concept_sectors"),
+        )
+        sector_sections = _sector_module_views(modules)
         trailing_sections: tuple[_ModuleView, ...] = ()
         short_title, swing_title = "短线候选池", "波段候选池"
     else:
