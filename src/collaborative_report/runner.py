@@ -46,6 +46,7 @@ _PRICE_CONFLICT_CANDIDATE_WARNING = "价格来源冲突，仅供观望"
 _UNTRUSTED_SNAPSHOT_CANDIDATE_WARNING = "快照权威性不足，仅供观望"
 _SNAPSHOT_AUTHORITY_WARNING_CODE = "snapshot_timestamp_untrusted"
 _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING = "快照来源时间不可用，所有建议仅供观察"
+_MARKET_BREADTH_WARNING_CODE = "market_breadth_incomplete"
 _REPORT_KEY_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2})-(premarket|postmarket)")
 _SECTOR_STATE_KEYS = frozenset((
     "sector_type", "name", "rank", "change_pct", "breadth_pct", "activity_percentile",
@@ -96,6 +97,7 @@ _DATA_FAILURE_CODES = {
 _SAFE_DATA_FAILURE_CODES = frozenset(_DATA_FAILURE_CODES.values()) | {
     "snapshot_data_failed", "gold_data_failed", "gold_analysis_failed",
     "ths_snapshot_unquoted_rows_excluded", "snapshot_screening_fields_incomplete",
+    _MARKET_BREADTH_WARNING_CODE,
 }
 
 
@@ -556,16 +558,8 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
     unavailable = _unavailable_market_payload()
     if not authoritative:
         return {**unavailable, "股票数量": int(len(frame)), **coverage}
-    changes = pd.to_numeric(frame.get("change_pct", pd.Series(dtype=float)), errors="coerce")
-    changes = changes[np.isfinite(changes)]
-    if changes.empty:
-        return {**unavailable, "股票数量": int(len(frame)), **coverage}
-    up_count = int((changes > 0).sum())
-    down_count = int((changes < 0).sum())
-    flat_count = int((changes == 0).sum())
-    up_ratio = up_count / len(changes) * 100
     total_amount: float | str = "不可用"
-    if "amount" in frame:
+    if len(frame) > 0 and "amount" in frame:
         raw_amounts = frame["amount"]
         try:
             parsed_amounts = pd.to_numeric(raw_amounts, errors="coerce")
@@ -583,19 +577,41 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
                     total_amount = amount_sum
         except (TypeError, ValueError, OverflowError):
             total_amount = "不可用"
+    base = {
+        **unavailable,
+        "股票数量": int(len(frame)),
+        "成交额": total_amount,
+        **coverage,
+    }
+    if len(frame) == 0 or "change_pct" not in frame:
+        return base
+    raw_changes = frame["change_pct"]
+    try:
+        parsed_changes = pd.to_numeric(raw_changes, errors="coerce")
+        changes = tuple(float(value) for value in parsed_changes)
+        raw_change_values = tuple(raw_changes.tolist())
+        breadth_complete = (
+            len(changes) == len(frame)
+            and not any(isinstance(value, (bool, np.bool_)) for value in raw_change_values)
+            and all(math.isfinite(value) for value in changes)
+        )
+    except (TypeError, ValueError, OverflowError):
+        breadth_complete = False
+        changes = ()
+    if not breadth_complete:
+        return base
+    up_count = sum(value > 0 for value in changes)
+    down_count = sum(value < 0 for value in changes)
+    flat_count = sum(value == 0 for value in changes)
+    up_ratio = up_count / len(changes) * 100
     temperature = "偏热" if up_ratio >= 60 else ("偏冷" if up_ratio <= 40 else "中性")
     return {
-        "股票数量": int(len(frame)),
+        **base,
         "上涨家数": up_count,
         "下跌家数": down_count,
         "平盘家数": flat_count,
         "上涨占比": up_ratio,
-        "成交额": total_amount,
         "市场温度": temperature,
-        "涨停家数": "不可用",
-        "跌停家数": "不可用",
-        "市场风格": "不可用",
-        **coverage,
     }
 
 
@@ -1418,7 +1434,9 @@ def _trusted_sector_snapshot_timestamp(
     if source is None or dataset_observed is None or session_observed is None:
         return None
     try:
-        if source > dataset_observed or source > session_observed:
+        source_date = source.astimezone(SHANGHAI_TIMEZONE).date()
+        session_date = session_observed.astimezone(SHANGHAI_TIMEZONE).date()
+        if source > dataset_observed or source > session_observed or source_date != session_date:
             return None
     except Exception:
         return None
@@ -1461,7 +1479,7 @@ def _validated_sector_state_item(
         raise ValueError
     if now is not None and source_timestamp > now:
         raise ValueError
-    if manifest_date is not None and source_timestamp.astimezone(SHANGHAI_TIMEZONE).date() > manifest_date:
+    if manifest_date is not None and source_timestamp.astimezone(SHANGHAI_TIMEZONE).date() != manifest_date:
         raise ValueError
     return {
         "sector_type": sector_type,
@@ -2219,15 +2237,29 @@ def run_report(
             if snapshot_source_is_authoritative and snapshot.source_timestamp is not None:
                 market_source_timestamp = snapshot.source_timestamp.isoformat()
             market_warnings = snapshot.warnings
+            market_payload = _market_payload(
+                snapshot,
+                authoritative=snapshot_source_is_authoritative,
+            )
+            breadth_incomplete = (
+                snapshot_source_is_authoritative
+                and market_payload["上涨占比"] == "不可用"
+            )
+            if breadth_incomplete:
+                market_warnings = (*market_warnings, _MARKET_BREADTH_WARNING_CODE)
             if not snapshot_source_is_authoritative:
                 market_warnings = (*market_warnings, _SNAPSHOT_AUTHORITY_WARNING_CODE)
                 if snapshot.source_timestamp is None:
                     market_warnings = (*market_warnings, _SNAPSHOT_UNAVAILABLE_OBSERVATION_WARNING)
             modules["market"] = ModuleResult(
                 "market",
-                "ok" if snapshot_source_is_authoritative and not snapshot.warnings else "partial",
+                (
+                    "ok"
+                    if snapshot_source_is_authoritative and not snapshot.warnings and not breadth_incomplete
+                    else "partial"
+                ),
                 snapshot.source_timestamp or snapshot.observed_at,
-                _market_payload(snapshot, authoritative=snapshot_source_is_authoritative),
+                market_payload,
                 tuple(dict.fromkeys(market_warnings)),
             )
         except Exception as exc:
