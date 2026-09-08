@@ -394,6 +394,19 @@ def test_ths_daily_bars_recoverable_failure_uses_existing_source_with_warning() 
     assert result.warnings == ("THS unavailable; existing daily source used",)
 
 
+def test_ths_stale_daily_bars_use_existing_source_with_warning() -> None:
+    client = Mock()
+    client.a_share_historical.return_value = ths_response(ths_bar_items(61)[:-1])
+    fallback = Mock(return_value=(daily_bars(), "fallback"))
+    gateway = MarketDataGateway(ths_client=client, daily_fetcher=fallback, clock=lambda: OBSERVED_AT)
+
+    result = gateway.get_daily_bars("600000", expected_session=SESSION)
+
+    fallback.assert_called_once_with("600000", days=160)
+    assert result.source == "fallback"
+    assert result.warnings == ("THS daily bars stale; existing daily source used",)
+
+
 def test_ths_daily_bars_quality_failure_never_falls_back() -> None:
     client = Mock()
     client.a_share_historical.return_value = ths_response([{**ths_bar_items()[0], "close_price": 0}])

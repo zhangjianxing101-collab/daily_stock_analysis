@@ -575,9 +575,9 @@ jobs:
           ALREADY_SENT: ${{ steps.duplicate.outputs.already_sent }}
           PRIOR_REPORT: ${{ steps.prior.outputs.prior_report }}
           PRIOR_SECTOR_STATE_PATH: ${{ steps.prior_sector.outputs.prior_sector_state_path }}
-          EMAIL_SENDER: ${{ secrets.EMAIL_SENDER }}
-          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
-          EMAIL_RECEIVERS: ${{ secrets.EMAIL_RECEIVERS }}
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD || secrets.QQEMAIL }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
           COLLAB_PORTFOLIO_JSON: ${{ secrets.COLLAB_PORTFOLIO_JSON }}
           THS_API_KEY: ${{ secrets.THS_API_KEY || secrets.THS }}
           ANSPIRE_API_KEYS: ${{ secrets.ANSPIRE_API_KEYS }}
