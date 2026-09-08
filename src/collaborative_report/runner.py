@@ -67,7 +67,10 @@ _SECTOR_DATA_PARTIAL_WARNING = "板块数据覆盖不完整，仅供参考"
 _SECTOR_UNAVAILABLE_WARNING = "板块数据暂不可用，仅供参考"
 _SECTOR_UNAVAILABLE_CODE = "sector_module_unavailable"
 _SECTOR_STATE_WARNING = "板块状态持久化不可用，未保留历史"
-_POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=4)
+# A completed-session quote remains valid for a late same-day postmarket rerun.
+# The checks below still require the exact report trading date and a post-close
+# timestamp, while this bound rejects unexpectedly old intraday observations.
+_POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=8)
 _PREMARKET_MAX_SOURCE_AGE = timedelta(days=4)
 _DATA_FAILURE_CODES = {
     "stale snapshot": "snapshot_acquisition_time_invalid",

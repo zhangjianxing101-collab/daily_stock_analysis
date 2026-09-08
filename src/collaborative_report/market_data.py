@@ -71,6 +71,7 @@ _SECTOR_SNAPSHOT_ALIASES = {
     "leader_change_pct": ("领涨股票-涨跌幅", "领涨股涨跌幅", "leader_change_pct"),
 }
 _SECTOR_POSTMARKET_FRESHNESS = timedelta(hours=4)
+_THS_SECTOR_BATCH_SIZE = 100
 _BAR_ALIASES = {
     "date": ("date", "Date", "日期", "时间"),
     "open": ("open", "Open", "开盘"),
@@ -881,10 +882,18 @@ class MarketDataGateway:
     def get_sector_snapshot(self, sector_type: str) -> MarketDataset:
         if not isinstance(sector_type, str) or sector_type not in {"industry", "concept"}:
             raise ValueError("sector type invalid")
-        requested_at = self._observed_at()
-        fetcher = (
+        configured_fetcher = (
             self._industry_sector_fetcher if sector_type == "industry" else self._concept_sector_fetcher
         )
+        if configured_fetcher is None and self._ths_client is not None:
+            try:
+                return self._ths_sector_snapshot(sector_type)
+            except ThsResponseError:
+                raise ValueError(f"{sector_type} sector provider returned invalid data") from None
+            except _RECOVERABLE_THS_ERRORS:
+                logger.warning("%s sector primary source unavailable", sector_type)
+        requested_at = self._observed_at()
+        fetcher = configured_fetcher
         try:
             if fetcher is None:
                 import akshare
@@ -922,6 +931,77 @@ class MarketDataGateway:
             f"akshare.eastmoney_{sector_type}_boards",
             received_at,
             tuple(dict.fromkeys((*normalization_warnings, *timestamp_warnings))),
+            source_timestamp,
+        )
+
+    def _ths_sector_snapshot(self, sector_type: str) -> MarketDataset:
+        """Build a sector board from the documented THS catalog and quote APIs."""
+
+        requested_at = self._observed_at()
+        client = self._require_ths_client()
+        tag = ThsIndexTag.INDUSTRY if sector_type == "industry" else ThsIndexTag.CONCEPT
+        catalog = client.ths_index_catalog(tag)
+        received_at = self._received_at(requested_at)
+        catalog_timestamp, catalog_warnings = _ths_timestamp(catalog.timestamp_ms, received_at)
+
+        names: dict[str, str] = {}
+        for item in catalog.items:
+            thscode = item.get("thscode")
+            name = item.get("name")
+            if (
+                not isinstance(thscode, str)
+                or not thscode.strip()
+                or not isinstance(name, str)
+                or not name.strip()
+            ):
+                continue
+            normalized_code = thscode.strip().upper()
+            normalized_name = name.strip()
+            if normalized_code in names or normalized_name in names.values():
+                raise ThsResponseError("THS API returned duplicate sector catalog rows")
+            names[normalized_code] = normalized_name
+        if not names:
+            raise ThsDataUnavailableError(3002)
+
+        rows: list[dict[str, object]] = []
+        seen: set[str] = set()
+        snapshot_timestamps: list[datetime] = []
+        codes = tuple(names)
+        for start in range(0, len(codes), _THS_SECTOR_BATCH_SIZE):
+            response = client.index_snapshot(codes[start:start + _THS_SECTOR_BATCH_SIZE])
+            received_at = self._received_at(received_at)
+            response_timestamp, _ = _ths_timestamp(response.timestamp_ms, received_at)
+            if response_timestamp is not None:
+                snapshot_timestamps.append(response_timestamp)
+            for item in response.items:
+                thscode = item.get("thscode")
+                if not isinstance(thscode, str):
+                    continue
+                normalized_code = thscode.strip().upper()
+                if normalized_code not in names or normalized_code in seen:
+                    continue
+                seen.add(normalized_code)
+                rows.append({
+                    "name": names[normalized_code],
+                    "change_pct": item.get("price_change_ratio_pct"),
+                    "amount": item.get("turnover"),
+                })
+        if not rows:
+            raise ThsDataUnavailableError(3002)
+
+        raw = pd.DataFrame(rows)
+        normalized, normalization_warnings = _normalize_sector_snapshot(raw, sector_type)
+        missing = len(names) - len(seen)
+        warnings = list(catalog_warnings)
+        warnings.extend(normalization_warnings)
+        if missing:
+            warnings.append(f"THS sector snapshot rows missing: {missing}")
+        source_timestamp = min(snapshot_timestamps) if snapshot_timestamps else catalog_timestamp
+        return MarketDataset(
+            normalized,
+            _THS_SOURCE + ".index_snapshot",
+            received_at,
+            tuple(dict.fromkeys(warnings)),
             source_timestamp,
         )
 

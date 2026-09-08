@@ -881,7 +881,7 @@ def test_snapshot_receipt_time_and_authority_age_guards_reject_future_data() -> 
     )
 
     close_snapshot = replace(gateway.snapshot, source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI))
-    boundary = datetime(2026, 8, 19, 19, 0, tzinfo=SHANGHAI)
+    boundary = datetime(2026, 8, 19, 23, 0, tzinfo=SHANGHAI)
     assert _snapshot_source_is_authoritative(
         close_snapshot, session, expected_session=NOW.date(), checked_at=boundary
     )
@@ -962,7 +962,7 @@ def test_invalid_advancing_clock_stops_before_delivery_claim(tmp_path, deps, clo
 
 
 def test_authoritative_snapshot_expiry_stops_before_delivery_claim(tmp_path, deps) -> None:
-    start = datetime(2026, 8, 19, 18, 50, tzinfo=SHANGHAI)
+    start = datetime(2026, 8, 19, 22, 50, tzinfo=SHANGHAI)
     gateway = FakeGateway()
     gateway.snapshot = replace(
         gateway.snapshot,
@@ -973,7 +973,7 @@ def test_authoritative_snapshot_expiry_stops_before_delivery_claim(tmp_path, dep
         start,
         start,
         start,
-        datetime(2026, 8, 19, 19, 0, 1, tzinfo=SHANGHAI),
+        datetime(2026, 8, 19, 23, 0, 1, tzinfo=SHANGHAI),
     ))
     session_builder = lambda mode, current_time, scheduled: ReportSession(
         mode,
@@ -997,7 +997,7 @@ def test_authoritative_snapshot_expiry_stops_before_delivery_claim(tmp_path, dep
 
 
 def test_authoritative_snapshot_expiry_stops_before_rendering(tmp_path, deps) -> None:
-    start = datetime(2026, 8, 19, 18, 50, tzinfo=SHANGHAI)
+    start = datetime(2026, 8, 19, 22, 50, tzinfo=SHANGHAI)
     gateway = FakeGateway()
     gateway.snapshot = replace(
         gateway.snapshot,
@@ -1007,7 +1007,7 @@ def test_authoritative_snapshot_expiry_stops_before_rendering(tmp_path, deps) ->
     clock = Mock(side_effect=(
         start,
         start,
-        datetime(2026, 8, 19, 19, 0, 1, tzinfo=SHANGHAI),
+        datetime(2026, 8, 19, 23, 0, 1, tzinfo=SHANGHAI),
     ))
     session_builder = lambda mode, current_time, scheduled: ReportSession(
         mode,

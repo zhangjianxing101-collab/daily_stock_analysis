@@ -884,6 +884,71 @@ def test_get_sector_snapshot_uses_correct_default_akshare_fetchers(monkeypatch) 
     concept.assert_called_once_with()
 
 
+@pytest.mark.parametrize(
+    ("sector_type", "tag"),
+    [("industry", "industry"), ("concept", "cn_concept")],
+)
+def test_get_sector_snapshot_uses_ths_catalog_and_batched_index_quotes(sector_type, tag) -> None:
+    catalog_rows = [
+        {"thscode": f"88{index:04d}.TI", "name": f"Sector {index}"}
+        for index in range(205)
+    ]
+    client = Mock()
+    client.ths_index_catalog.return_value = ths_response(catalog_rows)
+
+    def snapshot(codes):
+        return ths_response([
+            {
+                "thscode": code,
+                "price_change_ratio_pct": index / 10,
+                "turnover": 1_000 + index,
+            }
+            for index, code in enumerate(codes)
+        ])
+
+    client.index_snapshot.side_effect = snapshot
+    result = MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_sector_snapshot(sector_type)
+
+    assert client.ths_index_catalog.call_args.args[0].value == tag
+    assert [len(item.args[0]) for item in client.index_snapshot.call_args_list] == [100, 100, 5]
+    assert len(result.frame) == 205
+    assert result.frame["sector_type"].unique().tolist() == [sector_type]
+    assert result.frame.loc[0, "name"] == "Sector 0"
+    assert result.frame.loc[0, "change_pct"] == 0
+    assert result.frame.loc[0, "amount"] == 1_000
+    assert result.source == "ths.fuyao.index_snapshot"
+    assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+def test_get_sector_snapshot_marks_partial_ths_catalog_coverage() -> None:
+    client = Mock()
+    client.ths_index_catalog.return_value = ths_response([
+        {"thscode": "881001.TI", "name": "Industry A"},
+        {"thscode": "881002.TI", "name": "Industry B"},
+    ])
+    client.index_snapshot.return_value = ths_response([
+        {"thscode": "881001.TI", "price_change_ratio_pct": 1.2, "turnover": 10_000},
+    ])
+
+    result = MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.frame["name"].tolist() == ["Industry A"]
+    assert result.warnings == ("THS sector snapshot rows missing: 1",)
+
+
+def test_get_sector_snapshot_falls_back_to_akshare_when_ths_is_unavailable(monkeypatch) -> None:
+    client = Mock()
+    client.ths_index_catalog.side_effect = ThsNetworkError()
+    industry = Mock(return_value=pd.DataFrame({"name": ["Industry"], "change_pct": [1]}))
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(stock_board_industry_name_em=industry))
+
+    result = MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.source == "akshare.eastmoney_industry_boards"
+    assert result.frame["name"].tolist() == ["Industry"]
+    industry.assert_called_once_with()
+
+
 def test_get_sector_snapshot_rejects_invalid_type_and_isolates_provider_failures() -> None:
     industry = Mock(side_effect=RuntimeError("https://feed.invalid/?token=secret"))
     concept = Mock(return_value=pd.DataFrame({"name": ["Concept"], "change_pct": [1]}))
