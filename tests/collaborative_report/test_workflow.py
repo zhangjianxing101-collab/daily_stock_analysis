@@ -107,6 +107,48 @@ def _select_valid_prior_artifact(artifacts: list[dict], manifests: dict[int, obj
     return None
 
 
+def _production_prior_sector_candidates(artifacts: list[dict], current_trading_date: str) -> list[dict]:
+    """Model the bounded metadata gate for an earlier postmarket sector state."""
+
+    pattern = re.compile(r"^report-(\d{4}-\d{2}-\d{2})-postmarket$")
+    candidates = []
+    for artifact in artifacts:
+        match = pattern.fullmatch(str(artifact.get("name", "")))
+        workflow_run = artifact.get("workflow_run")
+        if (
+            match is None
+            or match.group(1) >= current_trading_date
+            or artifact.get("expired") is not False
+            or not str(artifact.get("id", "")).isdigit()
+            or not isinstance(workflow_run, dict)
+            or not str(workflow_run.get("id", "")).isdigit()
+        ):
+            continue
+        candidates.append(artifact)
+    return sorted(
+        candidates,
+        key=lambda item: (str(item["name"]), str(item.get("created_at", "")), int(item["id"])),
+        reverse=True,
+    )[:5]
+
+
+def _is_valid_prior_sector_manifest(payload: object, current_trading_date: str) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    trading_date = payload.get("trading_date")
+    return (
+        isinstance(trading_date, str)
+        and trading_date < current_trading_date
+        and payload.get("schema_version") == 1
+        and payload.get("report_key") == f"{trading_date}-postmarket"
+        and payload.get("mode") == "postmarket"
+        and payload.get("final_state") == "sent"
+        and payload.get("test_email") is False
+        and isinstance(payload.get("generated_at"), str)
+        and isinstance(payload.get("sector_state"), list)
+    )
+
+
 def _external_delivery_gate(
     *,
     test_email: bool,
@@ -272,6 +314,84 @@ def test_workflow_uses_external_duplicate_check_and_redacted_postmarket_prior_st
     assert "prior_report_warning=prior_premarket_report_unavailable" in prior_extract["run"]
     assert "--prior-report" in runner["run"]
     assert "curl " not in all_run_content(workflow)
+
+
+def test_workflow_selects_latest_earlier_completed_postmarket_artifact() -> None:
+    workflow = _workflow()
+    step = _step(workflow, "Extract prior sector state")
+    runner = _step(workflow, "Run collaborative report")
+
+    assert "report-" in step["run"]
+    assert "-postmarket" in step["run"]
+    assert "[:5]" in step["run"]
+    assert runner["env"]["PRIOR_SECTOR_STATE_PATH"] == "${{ steps.prior_sector.outputs.prior_sector_state_path }}"
+    assert 'args+=(--prior-sector-report "$PRIOR_SECTOR_STATE_PATH")' in runner["run"]
+
+
+def test_prior_sector_download_never_uses_preview_or_failed_artifacts() -> None:
+    script = _step(_workflow(), "Extract prior sector state")["run"]
+
+    assert 'final_state == "sent"' in script
+    assert "test_email is False" in script
+    assert "trading_date < current_trading_date" in script
+    assert "prior_postmarket_sector_state_unavailable" in script
+    assert "2>/dev/null" in script
+
+
+def test_prior_sector_metadata_selection_is_bounded_and_excludes_nonproduction_dates() -> None:
+    artifacts = [
+        {
+            "id": index,
+            "name": f"report-2026-09-{day:02d}-postmarket",
+            "expired": False,
+            "created_at": f"2026-09-{day:02d}T09:00:00Z",
+            "workflow_run": {"id": 1000 + index},
+        }
+        for index, day in enumerate(range(1, 8), start=1)
+    ]
+    artifacts.extend(
+        [
+            {"id": 20, "name": "report-2026-09-08-postmarket", "expired": False, "workflow_run": {"id": 1020}},
+            {"id": 21, "name": "test-report-2026-09-07-postmarket", "expired": False, "workflow_run": {"id": 1021}},
+            {"id": 22, "name": "report-2026-09-07-postmarket", "expired": True, "workflow_run": {"id": 1022}},
+        ]
+    )
+
+    selected = _production_prior_sector_candidates(artifacts, "2026-09-08")
+
+    assert [item["name"] for item in selected] == [
+        "report-2026-09-07-postmarket",
+        "report-2026-09-06-postmarket",
+        "report-2026-09-05-postmarket",
+        "report-2026-09-04-postmarket",
+        "report-2026-09-03-postmarket",
+    ]
+
+
+@pytest.mark.parametrize(
+    "overrides",
+    [
+        {"final_state": "hard_failure"},
+        {"final_state": "test_sent", "test_email": True},
+        {"report_key": "2026-09-07-premarket"},
+        {"trading_date": "2026-09-08", "report_key": "2026-09-08-postmarket"},
+        {"sector_state": None},
+    ],
+)
+def test_prior_sector_manifest_rejects_nonproduction_or_invalid_state(overrides) -> None:
+    payload = {
+        "schema_version": 1,
+        "report_key": "2026-09-07-postmarket",
+        "mode": "postmarket",
+        "trading_date": "2026-09-07",
+        "generated_at": "2026-09-07T16:30:00+08:00",
+        "final_state": "sent",
+        "test_email": False,
+        "sector_state": [],
+    }
+    payload.update(overrides)
+
+    assert _is_valid_prior_sector_manifest(payload, "2026-09-08") is False
 
 
 def test_external_marker_handoff_is_production_only_and_sent_marker_is_strict() -> None:

@@ -33,6 +33,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--no-send", action="store_true", help="Generate artifacts only; never send email or update delivery state")
     parser.add_argument("--already-sent", action="store_true", help="Skip a completed production report identity")
     parser.add_argument("--prior-report", type=Path)
+    parser.add_argument("--prior-sector-report", type=Path)
     parser.add_argument("--output-dir", type=Path)
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--ledger-status", metavar="REPORT_KEY")
@@ -148,7 +149,15 @@ def main(
         parser.error("--output-dir is required for report and ledger actions")
     operator_key = args.ledger_status or args.reconcile_sent or args.reconcile_failed
     if operator_key:
-        if args.mode is not None or args.force or args.test_email or args.no_send or args.already_sent or args.prior_report:
+        if (
+            args.mode is not None
+            or args.force
+            or args.test_email
+            or args.no_send
+            or args.already_sent
+            or args.prior_report
+            or args.prior_sector_report
+        ):
             parser.error("ledger operator actions cannot be combined with report-run arguments")
         ledger = LocalDeliveryLedger(args.output_dir)
         try:
@@ -200,6 +209,8 @@ def main(
     mode = ReportMode(args.mode)
     if mode is ReportMode.PREMARKET and args.prior_report is not None:
         parser.error("--prior-report is valid only for postmarket mode")
+    if mode is ReportMode.PREMARKET and args.prior_sector_report is not None:
+        parser.error("--prior-sector-report is valid only for postmarket mode")
     result = runner(
         mode,
         force=args.force,
@@ -207,6 +218,7 @@ def main(
         preview_only=args.no_send,
         already_sent=args.already_sent,
         prior_report=args.prior_report,
+        prior_sector_report=args.prior_sector_report,
         output_dir=args.output_dir,
     )
     print(json.dumps(result.to_public_dict(), ensure_ascii=False, sort_keys=True))
