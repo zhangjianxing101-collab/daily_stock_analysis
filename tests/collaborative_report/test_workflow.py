@@ -622,9 +622,6 @@ def test_workflow_maps_secrets_and_variables_without_literal_personal_data() -> 
     workflow = _workflow()
     env = _step(workflow, "Run collaborative report")["env"]
     secret_values = {
-        "EMAIL_SENDER",
-        "EMAIL_PASSWORD",
-        "EMAIL_RECEIVERS",
         "COLLAB_PORTFOLIO_JSON",
         "ANSPIRE_API_KEYS",
         "GEMINI_API_KEY",
@@ -653,6 +650,9 @@ def test_workflow_maps_secrets_and_variables_without_literal_personal_data() -> 
     for key in secret_values:
         assert env[key] == f"${{{{ secrets.{key} }}}}"
 
+    assert env["EMAIL_SENDER"] == "${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}"
+    assert env["EMAIL_PASSWORD"] == "${{ secrets.EMAIL_PASSWORD || secrets.QQEMAIL }}"
+    assert env["EMAIL_RECEIVERS"] == "${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}"
     assert env["THS_API_KEY"] == "${{ secrets.THS_API_KEY || secrets.THS }}"
 
     assert env["COLLAB_CAPITAL_CNY"] == "${{ vars.COLLAB_CAPITAL_CNY || '20000' }}"

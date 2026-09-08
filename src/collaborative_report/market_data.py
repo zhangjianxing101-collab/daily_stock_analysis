@@ -734,6 +734,10 @@ class MarketDataGateway:
             return self._ths_daily_bars(code, expected_session, days, observed_at)
         except ThsResponseError:
             raise ValueError("THS daily bars invalid") from None
+        except ValueError as exc:
+            if str(exc) != "daily bars stale":
+                raise
+            fallback_warnings = ("THS daily bars stale; existing daily source used",)
         except _RECOVERABLE_THS_ERRORS:
             fallback_warnings = ("THS unavailable; existing daily source used",)
         try:
