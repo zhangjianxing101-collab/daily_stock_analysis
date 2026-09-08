@@ -23,6 +23,11 @@
     .empty { color: #6b7280; font-size: 13px; }
     .footer { padding: 18px 24px 24px; color: #4b5563; font-size: 12px; line-height: 1.7; }
     .footer strong { color: #991b1b; }
+    .sector-table-wrap { width: 100%; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+    table.sector-table { min-width: 1080px; table-layout: auto; }
+    table.sector-table th, table.sector-table td { white-space: nowrap; }
+    .sector-summary { margin: 10px 0 0; color: #374151; font-size: 13px; line-height: 1.6; }
+    .sector-watch { margin: 6px 0 0; padding-left: 18px; color: #374151; font-size: 13px; line-height: 1.6; }
     @media only screen and (max-width: 600px) {
       .header, .section, .footer { padding-left: 14px; padding-right: 14px; }
       h1 { font-size: 21px; }
@@ -41,7 +46,66 @@
       <p class="date">报告日期 {{ report_date }}</p>
     </header>
 
-    {% for section in sections %}
+    {% for section in leading_sections %}
+    <section class="section">
+      <h2>{{ section.title }}</h2>
+      {% if section.rows %}
+      <table role="presentation">
+        <tbody>
+          {% for label, value in section.rows %}
+          <tr><td class="key">{{ label }}</td><td>{{ value }}</td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="empty">暂无可用数据</p>{% endif %}
+      <p class="meta">数据时间：{{ section.observed_at }}</p>
+      {% if section.status != "ok" %}<p class="warning">模块状态：{{ section.status }}</p>{% endif %}
+      {% for warning in section.warnings %}<p class="warning">警告：{{ warning }}</p>{% endfor %}
+    </section>
+    {% endfor %}
+
+    {% for section in sector_sections %}
+    <section class="section">
+      <h2>{{ section.title }}</h2>
+      <p class="meta">数据时间：{{ section.observed_at }}<br>{{ section.coverage }}</p>
+      {% if section.status != "ok" %}<p class="warning">模块状态：{{ section.status }}</p>{% endif %}
+
+      <h3>强势榜</h3>
+      <div class="sector-table-wrap">
+        <table class="sector-table" role="presentation">
+          <thead><tr><th>排名</th><th>板块</th><th>涨跌幅</th><th>宽度</th><th>活跃度</th><th>领涨标的</th><th>领涨涨跌幅</th><th>轮动</th><th>持续性</th><th>拥挤风险</th></tr></thead>
+          <tbody>
+          {% for row in section.strongest %}
+            <tr><td>{{ row.rank }}</td><td>{{ row.name }}</td><td>{{ row.change }}</td><td>{{ row.breadth }}</td><td>{{ row.activity }}</td><td>{{ row.leader }}</td><td>{{ row.leader_change }}</td><td>{{ row.rotation }}</td><td>{{ row.persistence }}</td><td>{{ row.crowding }}</td></tr>
+          {% else %}<tr><td colspan="10" class="empty">暂无可用数据</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <h3>弱势榜</h3>
+      <div class="sector-table-wrap">
+        <table class="sector-table" role="presentation">
+          <thead><tr><th>排名</th><th>板块</th><th>涨跌幅</th><th>宽度</th><th>活跃度</th><th>领涨标的</th><th>领涨涨跌幅</th><th>轮动</th><th>持续性</th><th>拥挤风险</th></tr></thead>
+          <tbody>
+          {% for row in section.weakest %}
+            <tr><td>{{ row.rank }}</td><td>{{ row.name }}</td><td>{{ row.change }}</td><td>{{ row.breadth }}</td><td>{{ row.activity }}</td><td>{{ row.leader }}</td><td>{{ row.leader_change }}</td><td>{{ row.rotation }}</td><td>{{ row.persistence }}</td><td>{{ row.crowding }}</td></tr>
+          {% else %}<tr><td colspan="10" class="empty">暂无可用数据</td></tr>{% endfor %}
+          </tbody>
+        </table>
+      </div>
+
+      <p class="sector-summary"><strong>轮动摘要：</strong>{{ section.rotation_summary }}</p>
+      <p class="sector-summary"><strong>下一交易日观察</strong></p>
+      {% if section.watch %}
+      <ul class="sector-watch">
+        {% for row in section.watch %}<li>{{ row.name }}：轮动 {{ row.rotation }}；持续性 {{ row.persistence }}；拥挤风险 {{ row.crowding }}</li>{% endfor %}
+      </ul>
+      {% else %}<p class="empty">暂无基于持续性的观察项</p>{% endif %}
+      {% for warning in section.warnings %}<p class="warning">警告：{{ warning }}</p>{% endfor %}
+    </section>
+    {% endfor %}
+
+    {% for section in trailing_sections %}
     <section class="section">
       <h2>{{ section.title }}</h2>
       {% if section.rows %}
@@ -84,7 +148,7 @@
             <td data-label="触发条件">{{ item.trigger }}</td>
             <td data-label="止损">{{ item.stop }}</td>
             <td data-label="目标">{{ item.target }}</td>
-            <td data-label="依据与时间">{{ item.rules }}<br>{{ item.observed_at }} / {{ item.source }}</td>
+            <td data-label="依据与时间">{{ item.rules }}<br>{{ item.observed_at }} / {{ item.source }}{% for detail in item.sector_context %}<br>{{ detail }}{% endfor %}</td>
           </tr>
         {% endfor %}
         </tbody>
