@@ -16,6 +16,7 @@ from email.utils import parsedate_to_datetime
 from typing import Any, Dict, List, Optional
 from urllib.parse import parse_qsl, urlencode, urljoin, urlparse, urlunparse
 from xml.etree import ElementTree as ET
+from zoneinfo import ZoneInfo
 
 import requests
 from sqlalchemy.exc import IntegrityError
@@ -37,6 +38,8 @@ _REDIRECT_STATUS_CODES = {301, 302, 303, 307, 308}
 _DISABLE_REQUEST_PROXIES = {"http": None, "https": None}
 _DNS_GUARD_LOCK = threading.Lock()
 _AUTO_FETCH_MIN_INTERVAL_SECONDS = 60 * 60
+_ORZ_DAILYNEWS_PATH = "/api/v1/dailynews"
+_SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
 _BUILTIN_SOURCE_TEMPLATES = [
     {
         "template_id": "sec-company-news",
@@ -68,39 +71,39 @@ _BUILTIN_SOURCE_TEMPLATES = [
 ]
 _NEWSNOW_DEFAULT_SOURCE_DEFS = [
     {
-        "template_id": "newsnow-cls-hot",
-        "name": "NewsNow 财联社热门",
-        "source_id": "cls-hot",
+        "template_id": "orz-cls",
+        "name": "ORZ 财联社热榜",
+        "source_id": "cls",
         "market": "cn",
-        "description": "NewsNow 财联社热门财经资讯，适合 A 股大盘和题材热点。",
+        "description": "ORZ 聚合的财联社财经快讯，仅用于发现 A 股题材和市场事件，关键事实需要二次核验。",
     },
     {
-        "template_id": "newsnow-xueqiu-hotstock",
-        "name": "NewsNow 雪球热门股票",
-        "source_id": "xueqiu-hotstock",
+        "template_id": "orz-xueqiu",
+        "name": "ORZ 雪球热榜",
+        "source_id": "xueqiu",
         "market": "cn",
-        "description": "NewsNow 雪球热门股票，适合捕捉 A 股和港美股散户关注度。",
+        "description": "ORZ 聚合的雪球热门内容，仅用于观察市场关注度和候选线索。",
     },
     {
-        "template_id": "newsnow-wallstreetcn-quick",
-        "name": "NewsNow 华尔街见闻快讯",
-        "source_id": "wallstreetcn-quick",
+        "template_id": "orz-sina-finance",
+        "name": "ORZ 新浪财经热榜",
+        "source_id": "sina_finance",
         "market": "cn",
-        "description": "NewsNow 华尔街见闻快讯，适合宏观、商品和市场事件上下文。",
+        "description": "ORZ 聚合的新浪财经资讯，用于补充 A 股和宏观市场线索。",
     },
     {
-        "template_id": "newsnow-jin10",
-        "name": "NewsNow 金十数据",
-        "source_id": "jin10",
-        "market": "global",
-        "description": "NewsNow 金十数据实时财经消息，适合全球宏观和外盘事件。",
+        "template_id": "orz-eastmoney",
+        "name": "ORZ 东方财富热榜",
+        "source_id": "eastmoney",
+        "market": "cn",
+        "description": "ORZ 聚合的东方财富财经资讯，用于补充板块和个股热度线索。",
     },
     {
-        "template_id": "newsnow-gelonghui",
-        "name": "NewsNow 格隆汇事件",
-        "source_id": "gelonghui",
-        "market": "hk",
-        "description": "NewsNow 格隆汇事件资讯，适合港股和中概股市场上下文。",
+        "template_id": "orz-baidu",
+        "name": "ORZ 百度热榜",
+        "source_id": "baidu",
+        "market": "cn",
+        "description": "ORZ 聚合的百度社会热榜，仅用于宏观舆情辅助，不直接用于个股推荐。",
     },
 ]
 
@@ -611,6 +614,13 @@ class IntelligenceService:
         if not isinstance(payload, dict):
             raise IntelligenceServiceError("invalid NewsNow response: expected object")
         items = payload.get("items")
+        orz_payload = False
+        if not isinstance(items, list) and isinstance(payload.get("data"), list):
+            status = str(payload.get("status") or "").strip().lower()
+            if status not in {"200", "success", "ok"}:
+                raise IntelligenceServiceError("invalid NewsNow response: unsuccessful status")
+            items = payload["data"]
+            orz_payload = True
         if not isinstance(items, list):
             raise IntelligenceServiceError("invalid NewsNow response: missing items")
         entries = []
@@ -618,14 +628,26 @@ class IntelligenceService:
             if not isinstance(item, dict):
                 continue
             extra = item.get("extra") if isinstance(item.get("extra"), dict) else {}
-            published_raw = item.get("pubDate") or extra.get("date")
-            entries.append(self._build_entry(
+            published_raw = item.get("publish_time") or item.get("pubDate") or extra.get("date")
+            published_at = (
+                self._parse_orz_datetime(published_raw)
+                if orz_payload
+                else self._parse_datetime_or_timestamp(published_raw)
+            )
+            entry = self._build_entry(
                 str(item.get("title") or ""),
-                str(extra.get("info") or extra.get("hover") or ""),
+                str(item.get("content") or item.get("desc") or extra.get("info") or extra.get("hover") or ""),
                 str(item.get("url") or item.get("mobileUrl") or ""),
                 source_name,
-                self._parse_datetime_or_timestamp(published_raw),
-            ))
+                published_at,
+                raw_payload={
+                    "aggregator": "orz" if orz_payload else "newsnow",
+                    "platform": str(item.get("source") or ""),
+                    "score": item.get("score"),
+                    "rank": item.get("rank"),
+                },
+            )
+            entries.append(entry)
         return [entry for entry in entries if entry]
 
     def _parse_rss_item(self, node: ET.Element, source_name: str) -> Optional[FeedEntry]:
@@ -651,7 +673,15 @@ class IntelligenceService:
             self._parse_datetime(self._text(node, "published") or self._text(node, "updated")),
         )
 
-    def _build_entry(self, title: str, summary: str, url: str, source_name: str, published_at: Optional[datetime]) -> Optional[FeedEntry]:
+    def _build_entry(
+        self,
+        title: str,
+        summary: str,
+        url: str,
+        source_name: str,
+        published_at: Optional[datetime],
+        raw_payload: Optional[Dict[str, Any]] = None,
+    ) -> Optional[FeedEntry]:
         title = self._clean_text(title)[:300]
         summary = self._clean_text(summary)[:2000]
         url = url.strip()
@@ -666,7 +696,9 @@ class IntelligenceService:
         else:
             digest = hashlib.sha256(f"{source_name}|{title}|{published_at}".encode("utf-8")).hexdigest()[:24]
             url_key = f"no-url:intel:{digest}"
-        return FeedEntry(title or url_key, summary, url_key, source_name, published_at, {"source": source_name})
+        payload = dict(raw_payload or {})
+        payload.setdefault("source", source_name)
+        return FeedEntry(title or url_key, summary, url_key, source_name, published_at, payload)
 
     def _entry_to_item_fields(self, entry: FeedEntry, source: IntelligenceSource, now: datetime) -> Dict[str, Any]:
         return {
@@ -801,6 +833,19 @@ class IntelligenceService:
             return cls._parse_datetime_or_timestamp(float(raw))
         return cls._parse_datetime(raw)
 
+    @classmethod
+    def _parse_orz_datetime(cls, value: Any) -> Optional[datetime]:
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        try:
+            parsed = datetime.fromisoformat(raw.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None or parsed.utcoffset() is None:
+            parsed = parsed.replace(tzinfo=_SHANGHAI_TIMEZONE)
+        return parsed.astimezone(timezone.utc).replace(tzinfo=None)
+
     def _builtin_source_templates(self) -> List[Dict[str, Any]]:
         templates = [dict(template) for template in _BUILTIN_SOURCE_TEMPLATES]
         for item in _NEWSNOW_DEFAULT_SOURCE_DEFS:
@@ -816,10 +861,21 @@ class IntelligenceService:
         return templates
 
     def _build_newsnow_url(self, source_id: str) -> str:
-        base_url = (self.config.newsnow_base_url or "https://newsnow.busiyi.world").strip().rstrip("/")
+        base_url = (
+            self.config.newsnow_base_url
+            or "https://news.orz.ai/api/v1/dailynews"
+        ).strip().rstrip("/")
+        parsed_base = urlparse(base_url)
+        if parsed_base.path.rstrip("/").endswith(_ORZ_DAILYNEWS_PATH):
+            parsed = parsed_base._replace(path=f"{parsed_base.path.rstrip('/')}/")
+            query = dict(parse_qsl(parsed.query, keep_blank_values=True))
+            query["platform"] = source_id
+            return urlunparse(parsed._replace(query=urlencode(query)))
+
+        legacy_ids = {"cls": "cls-hot", "xueqiu": "xueqiu-hotstock"}
         parsed = urlparse(f"{base_url}/api/s")
         query = dict(parse_qsl(parsed.query, keep_blank_values=True))
-        query["id"] = source_id
+        query["id"] = legacy_ids.get(source_id, source_id)
         return urlunparse(parsed._replace(query=urlencode(query)))
 
 

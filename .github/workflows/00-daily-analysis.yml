@@ -310,6 +310,8 @@ jobs:
           SEARXNG_BASE_URLS: ${{ vars.SEARXNG_BASE_URLS || secrets.SEARXNG_BASE_URLS }}
           SEARXNG_PUBLIC_INSTANCES_ENABLED: ${{ vars.SEARXNG_PUBLIC_INSTANCES_ENABLED || secrets.SEARXNG_PUBLIC_INSTANCES_ENABLED }}
           SEARXNG_TIMEOUT_SECONDS: ${{ vars.SEARXNG_TIMEOUT_SECONDS || secrets.SEARXNG_TIMEOUT_SECONDS }}
+          NEWS_INTEL_AUTO_FETCH_ENABLED: ${{ vars.NEWS_INTEL_AUTO_FETCH_ENABLED || 'true' }}
+          NEWSNOW_BASE_URL: ${{ vars.NEWSNOW_BASE_URL || 'https://news.orz.ai/api/v1/dailynews' }}
           
           # ==========================================
           # 通知渠道（可同时配置多个，全部推送）

@@ -996,7 +996,7 @@ class Config:
     news_intel_fetch_timeout_sec: float = 8.0  # 单个资讯源拉取超时
     news_intel_max_items_per_source: int = 50  # 单次每个资讯源最多采集条数
     news_intel_auto_fetch_enabled: bool = False  # 是否在分析前自动初始化并拉取本地资讯源
-    newsnow_base_url: str = "https://newsnow.busiyi.world"  # NewsNow HTTP API base URL (数据源侧，不影响 LLM/provider base URL)
+    newsnow_base_url: str = "https://news.orz.ai/api/v1/dailynews"  # News aggregator API base URL
     bias_threshold: float = 5.0  # 乖离率阈值（%），超过此值提示不追高
 
     # === Agent 模式配置 ===
@@ -1915,7 +1915,7 @@ class Config:
                 os.getenv('NEWS_INTEL_AUTO_FETCH_ENABLED'),
                 False,
             ),
-            newsnow_base_url=((os.getenv('NEWSNOW_BASE_URL') or '').strip().rstrip('/') or 'https://newsnow.busiyi.world'),
+            newsnow_base_url=((os.getenv('NEWSNOW_BASE_URL') or '').strip().rstrip('/') or 'https://news.orz.ai/api/v1/dailynews'),
             bias_threshold=parse_env_float(os.getenv('BIAS_THRESHOLD'), 5.0, field_name='BIAS_THRESHOLD', minimum=1.0),
             agent_backend=(os.getenv('AGENT_BACKEND', 'auto') or 'auto').strip().lower(),
             agent_generation_backend=agent_generation_backend,
