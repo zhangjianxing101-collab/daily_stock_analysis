@@ -46,6 +46,7 @@ from src.collaborative_report.runner import (
     _redacted_manifest,
     _rerank_sector_ties,
     _sector_state,
+    _trusted_sector_snapshot_timestamp,
 )
 from src.collaborative_report.sector_analysis import SectorAnalysis, SectorRow, analyze_sectors
 from src.collaborative_report.screener import ScreeningResult, screen_aggressive
@@ -56,6 +57,14 @@ from src.collaborative_report.ths_market_data import ThsApiResponse, ThsMarketDa
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 8, 19, 16, 30, tzinfo=SHANGHAI)
+
+
+def test_sector_source_may_follow_report_start_when_received_later() -> None:
+    report_start = datetime(2026, 8, 19, 15, 2, tzinfo=SHANGHAI)
+    source = datetime(2026, 8, 19, 15, 5, tzinfo=SHANGHAI)
+    received = datetime(2026, 8, 19, 15, 6, tzinfo=SHANGHAI)
+
+    assert _trusted_sector_snapshot_timestamp(source, received, report_start) == source
 PORTFOLIO_CODE = "600000"
 CANDIDATE_CODE = "600001"
 SECTOR_STATE_KEYS = (

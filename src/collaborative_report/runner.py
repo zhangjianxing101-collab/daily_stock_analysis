@@ -64,6 +64,7 @@ _SECTOR_STATE_MAX_ROWS_PER_TYPE = 20
 _SECTOR_HISTORY_UNAVAILABLE_WARNING = "板块历史状态不可用，按首次观察处理"
 _SECTOR_SOURCE_TIMESTAMP_WARNING = "板块来源时间不可用，未持久化状态"
 _SECTOR_DATA_PARTIAL_WARNING = "板块数据覆盖不完整，仅供参考"
+_SECTOR_ACTIVITY_AMOUNT_WARNING = "板块活跃度按成交额分位计算"
 _SECTOR_UNAVAILABLE_WARNING = "板块数据暂不可用，仅供参考"
 _SECTOR_UNAVAILABLE_CODE = "sector_module_unavailable"
 _SECTOR_STATE_WARNING = "板块状态持久化不可用，未保留历史"
@@ -683,14 +684,10 @@ def _run_sector_module(
         if display.valid_count <= 0 or complete.valid_count <= 0:
             raise ValueError("sector snapshot invalid")
         warnings: list[str] = []
-        evidence_columns = ("leader_name", "leader_code", "leader_change_pct")
-        evidence_incomplete = (
-            any(column not in snapshot.frame for column in evidence_columns)
-            or any(
-                frame[column].isna().any()
-                for column in evidence_columns
-                if column in frame
-            )
+        displayed_rows = (*display.strongest, *display.weakest)
+        evidence_incomplete = any(
+            row.leader_name is None or row.leader_code is None or row.leader_change_pct is None
+            for row in displayed_rows
         )
         excluded_rows = any(
             frame.attrs.get(key, 0)
@@ -698,6 +695,13 @@ def _run_sector_module(
         )
         if history_unavailable:
             warnings.append(_SECTOR_HISTORY_UNAVAILABLE_WARNING)
+        if (
+            "amount" in frame
+            and "turnover_rate" in frame
+            and frame["turnover_rate"].isna().all()
+            and frame["amount"].notna().any()
+        ):
+            warnings.append(_SECTOR_ACTIVITY_AMOUNT_WARNING)
         if (
             snapshot.warnings or display.warnings or complete.warnings
             or display.valid_count != len(frame) or evidence_incomplete or excluded_rows
@@ -1479,7 +1483,7 @@ def _trusted_sector_snapshot_timestamp(
     try:
         source_date = source.astimezone(SHANGHAI_TIMEZONE).date()
         session_date = session_observed.astimezone(SHANGHAI_TIMEZONE).date()
-        if source > dataset_observed or source > session_observed or source_date != session_date:
+        if source > dataset_observed or source_date != session_date:
             return None
     except Exception:
         return None

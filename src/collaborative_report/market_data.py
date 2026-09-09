@@ -554,6 +554,8 @@ class MarketDataGateway:
         self._ths_client = ths_client
         self._snapshot_supplement_fetcher = snapshot_supplement_fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._latest_full_snapshot: pd.DataFrame | None = None
+        self._latest_full_snapshot_timestamp: datetime | None = None
 
     def _observed_at(self) -> datetime:
         return self._clock()
@@ -589,13 +591,17 @@ class MarketDataGateway:
             warnings = (*warnings, *supplement_warnings)
             if frame.attrs.get("screening_complete_count", 0):
                 source += "+tencent"
-        return MarketDataset(
+        dataset = MarketDataset(
             frame,
             source,
             observed_at,
             warnings,
             source_timestamp,
         )
+        if codes is None:
+            self._latest_full_snapshot = frame.copy(deep=True)
+            self._latest_full_snapshot_timestamp = source_timestamp
+        return dataset
 
     def _enrich_snapshot(self, frame, observed_at, source_timestamp):
         result = frame.copy(deep=True)
@@ -736,13 +742,17 @@ class MarketDataGateway:
         if normalized.empty:
             raise ValueError("snapshot provider returned empty data")
         source_timestamp, warnings = _snapshot_source_timestamp(raw)
-        return MarketDataset(
+        dataset = MarketDataset(
             normalized,
             "akshare.stock_zh_a_spot_em",
             self._received_at(observed_at),
             fallback_warnings + warnings,
             source_timestamp,
         )
+        if codes is None:
+            self._latest_full_snapshot = normalized.copy(deep=True)
+            self._latest_full_snapshot_timestamp = source_timestamp
+        return dataset
 
     def _ths_daily_bars(self, code: str, expected_session: date, days: int, observed_at: datetime) -> MarketDataset:
         if type(days) is not int or days <= 0:
@@ -1006,6 +1016,7 @@ class MarketDataGateway:
                     continue
                 seen.add(normalized_code)
                 rows.append({
+                    "thscode": normalized_code,
                     "name": names[normalized_code],
                     "change_pct": item.get("price_change_ratio_pct"),
                     "amount": item.get("turnover"),
@@ -1014,13 +1025,22 @@ class MarketDataGateway:
             raise ThsDataUnavailableError(3002)
 
         raw = pd.DataFrame(rows)
+        raw, received_at, constituent_warnings = self._enrich_ths_sector_rows(
+            raw,
+            client,
+            received_at,
+        )
         normalized, normalization_warnings = _normalize_sector_snapshot(raw, sector_type)
         missing = len(names) - len(seen)
         warnings = list(catalog_warnings)
+        warnings.extend(constituent_warnings)
         warnings.extend(normalization_warnings)
         if missing:
             warnings.append(f"THS sector snapshot rows missing: {missing}")
-        source_timestamp = min(snapshot_timestamps) if snapshot_timestamps else catalog_timestamp
+        evidence_timestamps = [*snapshot_timestamps]
+        if self._latest_full_snapshot_timestamp is not None:
+            evidence_timestamps.append(self._latest_full_snapshot_timestamp)
+        source_timestamp = min(evidence_timestamps) if evidence_timestamps else catalog_timestamp
         return MarketDataset(
             normalized,
             _THS_SOURCE + ".index_snapshot",
@@ -1028,6 +1048,61 @@ class MarketDataGateway:
             tuple(dict.fromkeys(warnings)),
             source_timestamp,
         )
+
+    def _enrich_ths_sector_rows(
+        self,
+        rows: pd.DataFrame,
+        client: ThsMarketDataClient,
+        received_at: datetime,
+    ) -> tuple[pd.DataFrame, datetime, tuple[str, ...]]:
+        """Derive breadth and leaders for displayed sectors from the full stock snapshot."""
+
+        snapshot = self._latest_full_snapshot
+        if snapshot is None or snapshot.empty or "thscode" not in rows or "change_pct" not in rows:
+            return rows, received_at, ()
+        required = {"code", "name", "change_pct"}
+        if not required.issubset(snapshot.columns) or snapshot["code"].duplicated().any():
+            return rows, received_at, ("THS sector constituent evidence unavailable",)
+
+        ranked = rows.assign(_change=pd.to_numeric(rows["change_pct"], errors="coerce"))
+        ranked = ranked.dropna(subset=["_change"]).sort_values(
+            ["_change", "name"], ascending=[False, True], kind="stable",
+        )
+        selected = tuple(dict.fromkeys((*ranked.head(20).index, *ranked.tail(10).index)))
+        quotes = snapshot.set_index("code", drop=False)
+        enriched = rows.copy(deep=True)
+        failures = 0
+        for index in selected:
+            try:
+                response = client.ths_index_constituents(str(enriched.at[index, "thscode"]))
+                received_at = self._received_at(received_at)
+                member_codes = {
+                    code
+                    for item in response.items
+                    for code in (_optional_canonical_code(str(item.get("thscode", ""))[:6]),)
+                    if code is not None
+                }
+                members = quotes.loc[quotes.index.intersection(member_codes)].copy()
+                changes = pd.to_numeric(members["change_pct"], errors="coerce")
+                valid = np.isfinite(changes)
+                members = members.loc[valid].copy()
+                changes = changes.loc[valid]
+                if members.empty:
+                    raise ValueError
+                enriched.at[index, "advance_count"] = int((changes > 0).sum())
+                enriched.at[index, "decline_count"] = int((changes < 0).sum())
+                leader_index = changes.sort_values(ascending=False, kind="stable").index[0]
+                leader = members.loc[leader_index]
+                leader_name = leader["name"]
+                if not isinstance(leader_name, str) or not leader_name.strip():
+                    raise ValueError
+                enriched.at[index, "leader_name"] = leader_name.strip()
+                enriched.at[index, "leader_code"] = str(leader["code"])
+                enriched.at[index, "leader_change_pct"] = float(changes.loc[leader_index])
+            except Exception:
+                failures += 1
+        warnings = (f"THS sector constituent evidence unavailable: {failures}",) if failures else ()
+        return enriched, received_at, warnings
 
     def _download(self, *args, **kwargs) -> pd.DataFrame:
         if self._yfinance_download is None:

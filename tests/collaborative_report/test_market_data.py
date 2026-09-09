@@ -987,6 +987,60 @@ def test_get_sector_snapshot_uses_ths_catalog_and_batched_index_quotes(sector_ty
     assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
 
 
+def test_ths_sector_snapshot_derives_breadth_and_leader_from_cached_full_snapshot() -> None:
+    stamp = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    client = Mock()
+    client.a_share_snapshot.return_value = ThsApiResponse(
+        {
+            "timestamp": int(stamp.timestamp() * 1000),
+            "total": 2,
+            "item": [
+                ths_snapshot_item("600000"),
+                {**ths_snapshot_item("600001"), "price_change_ratio_pct": -2.0},
+            ],
+        },
+        None,
+    )
+    client.ths_index_catalog.return_value = ths_response([
+        {"thscode": "881001.TI", "name": "Industry A"},
+    ])
+    client.index_snapshot.return_value = ths_response([
+        {"thscode": "881001.TI", "price_change_ratio_pct": 1.2, "turnover": 10_000},
+    ])
+    client.ths_index_constituents.return_value = ths_response([
+        {"thscode": "600000.SH"}, {"thscode": "600001.SH"},
+    ])
+    supplement = Mock(return_value=SimpleNamespace(
+        frame=pd.DataFrame([
+            {
+                "code": "600000", "name": "Leader", "price": 10.0,
+                "volume_ratio": 1.2, "turnover": 2.3, "source_timestamp": stamp,
+            },
+            {
+                "code": "600001", "name": "Decliner", "price": 10.0,
+                "volume_ratio": 1.1, "turnover": 2.0, "source_timestamp": stamp,
+            },
+        ]),
+        observed_at=OBSERVED_AT,
+    ))
+    gateway = MarketDataGateway(
+        ths_client=client,
+        snapshot_supplement_fetcher=supplement,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    gateway.get_a_share_snapshot()
+    result = gateway.get_sector_snapshot("industry")
+
+    row = result.frame.iloc[0]
+    assert row["advance_count"] == 1
+    assert row["decline_count"] == 1
+    assert row["leader_name"] == "Leader"
+    assert row["leader_code"] == "600000"
+    assert row["leader_change_pct"] == 1.2
+    client.ths_index_constituents.assert_called_once_with("881001.TI")
+
+
 def test_get_sector_snapshot_marks_partial_ths_catalog_coverage() -> None:
     client = Mock()
     client.ths_index_catalog.return_value = ths_response([
