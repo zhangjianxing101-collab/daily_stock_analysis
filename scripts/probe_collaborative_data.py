@@ -3,6 +3,7 @@
 from datetime import datetime, timedelta, timezone
 import json
 from pathlib import Path
+import re
 import sys
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -22,7 +23,14 @@ from src.collaborative_report.ths_market_data import ThsMarketDataClient  # noqa
 
 def snapshot_summary(items):
     frame = pd.DataFrame([dict(item) for item in items])
-    result = {"rows": len(frame)}
+    result = {
+        "rows": len(frame),
+        "schema_fields": sorted(
+            str(column)
+            for column in frame.columns
+            if re.fullmatch(r"[A-Za-z][A-Za-z0-9_]{0,63}", str(column))
+        ),
+    }
     for field in ("last_price", "volume", "turnover", "name", "volume_ratio", "turnover_ratio_pct"):
         result[field + "_present"] = int(frame[field].notna().sum()) if field in frame else 0
     if {"ticker", "last_price", "volume", "turnover"}.issubset(frame.columns):
