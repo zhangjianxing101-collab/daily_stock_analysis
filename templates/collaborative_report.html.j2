@@ -134,6 +134,27 @@
     </section>
     {% endif %}
 
+    <section class="section">
+      <h2>{{ featured_title }}</h2>
+      {% if featured_candidates %}
+      <table class="candidates" role="presentation">
+        <thead><tr><th>标的</th><th>状态</th><th>触发条件</th><th>止损</th><th>目标</th><th>板块依据</th></tr></thead>
+        <tbody>
+        {% for item in featured_candidates %}
+          <tr>
+            <td data-label="标的"><strong>{{ item.code }} {{ item.name }}</strong><br>{{ item.horizon }} / 评分 {{ item.score }}</td>
+            <td data-label="状态" class="{{ 'status' if item.actionable else 'watch' }}">{{ '等待人工确认' if item.actionable else '仅供观察' }}{% if item.warning %}<br>{{ item.warning }}{% endif %}</td>
+            <td data-label="触发条件">{{ item.trigger }}</td>
+            <td data-label="止损">{{ item.stop }}</td>
+            <td data-label="目标">{{ item.target }}</td>
+            <td data-label="板块依据">{% if item.sector_context %}{% for detail in item.sector_context %}{{ detail }}{% if not loop.last %}<br>{% endif %}{% endfor %}{% else %}板块龙头规则命中{% endif %}<br>{{ item.observed_at }} / {{ item.source }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+      {% else %}<p class="empty">暂无具备完整板块证据的精选标的。</p>{% endif %}
+    </section>
+
     {% for title, candidates in ((short_title, short_candidates), (swing_title, swing_candidates)) %}
     <section class="section">
       <h2>{{ title }}</h2>

@@ -208,6 +208,7 @@ def settings() -> CollaborativeSettings:
         short_limit=5,
         swing_limit=5,
         screen_prefilter=20,
+        position_sizing=True,
     )
 
 
@@ -374,6 +375,26 @@ def test_force_still_applies_risk_and_board_lot_sizing(tmp_path, deps) -> None:
         available_cash=18_980,
         risk_fraction=0.02,
     )
+
+
+def test_position_sizing_is_skipped_when_report_scope_disables_it(tmp_path, deps, settings) -> None:
+    sizing_evaluator = Mock(return_value=100)
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(
+            deps,
+            settings_loader=lambda: replace(settings, position_sizing=False),
+            sizing_evaluator=sizing_evaluator,
+        ),
+        force=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert result.modules["sizing"].status == "skipped"
+    assert result.modules["sizing"].payload == {"状态": "已按当前报告范围关闭，不依据持仓分配资金"}
+    sizing_evaluator.assert_not_called()
 
 
 def test_quarantined_held_snapshot_row_suppresses_all_new_position_sizing(tmp_path, deps) -> None:

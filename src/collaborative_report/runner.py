@@ -2637,38 +2637,47 @@ def run_report(
             tuple(dict.fromkeys(portfolio_warnings)) or (() if portfolio_payload else ("数据不足，建议观望",)),
         )
 
-    portfolio_valuations_complete = all(position.code in prices for position in settings.positions)
-    available_cash: float | None = None
-    if portfolio_valuations_complete:
-        current_market_value = sum(prices[position.code] * position.quantity for position in settings.positions)
-        available_cash = max(settings.capital_cny - current_market_value, 0.0)
-    sizing_payload: dict[str, int] = {}
-    sizing_warnings: list[str] = []
-    if not portfolio_valuations_complete:
-        sizing_warnings.append("持仓估值不可用，未提供仓位建议")
-    for item in (*screening.short_term, *screening.swing):
+    if not settings.position_sizing:
+        modules["sizing"] = ModuleResult(
+            "sizing",
+            "skipped",
+            session.now_shanghai,
+            {"状态": "已按当前报告范围关闭，不依据持仓分配资金"},
+            (),
+        )
+    else:
+        portfolio_valuations_complete = all(position.code in prices for position in settings.positions)
+        available_cash: float | None = None
+        if portfolio_valuations_complete:
+            current_market_value = sum(prices[position.code] * position.quantity for position in settings.positions)
+            available_cash = max(settings.capital_cny - current_market_value, 0.0)
+        sizing_payload: dict[str, int] = {}
+        sizing_warnings: list[str] = []
         if not portfolio_valuations_complete:
-            continue
-        if item.warning.strip():
-            sizing_warnings.append("候选不可操作，未提供仓位建议")
-            continue
-        try:
-            sizing_payload[item.code] = active.sizing_evaluator(
-                item.close,
-                item.stop_price,
-                capital=settings.capital_cny,
-                available_cash=available_cash,
-                risk_fraction=settings.risk_fraction,
-            )
-        except Exception:
-            sizing_warnings.append("候选仓位计算不可用")
-    modules["sizing"] = ModuleResult(
-        "sizing",
-        "ok" if sizing_payload and not sizing_warnings else ("partial" if sizing_payload else "unavailable"),
-        session.now_shanghai,
-        sizing_payload,
-        tuple(dict.fromkeys(sizing_warnings)) or (() if sizing_payload else ("暂无可计算候选",)),
-    )
+            sizing_warnings.append("持仓估值不可用，未提供仓位建议")
+        for item in (*screening.short_term, *screening.swing):
+            if not portfolio_valuations_complete:
+                continue
+            if item.warning.strip():
+                sizing_warnings.append("候选不可操作，未提供仓位建议")
+                continue
+            try:
+                sizing_payload[item.code] = active.sizing_evaluator(
+                    item.close,
+                    item.stop_price,
+                    capital=settings.capital_cny,
+                    available_cash=available_cash,
+                    risk_fraction=settings.risk_fraction,
+                )
+            except Exception:
+                sizing_warnings.append("候选仓位计算不可用")
+        modules["sizing"] = ModuleResult(
+            "sizing",
+            "ok" if sizing_payload and not sizing_warnings else ("partial" if sizing_payload else "unavailable"),
+            session.now_shanghai,
+            sizing_payload,
+            tuple(dict.fromkeys(sizing_warnings)) or (() if sizing_payload else ("暂无可计算候选",)),
+        )
 
     morning_candidates: tuple[Mapping[str, Any], ...] = ()
     if normalized_mode is ReportMode.POSTMARKET and prior_candidates:

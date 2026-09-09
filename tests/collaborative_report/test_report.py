@@ -6,6 +6,7 @@ import pytest
 
 from src.collaborative_report.models import Candidate, ModuleResult, ReportMode
 from src.collaborative_report.report import (
+    _featured_candidates,
     build_subject,
     evaluate_candidate_actionability,
     render_report,
@@ -29,17 +30,20 @@ def candidate(
     concept_sectors: tuple[str, ...] = (),
     sector_rotation: str = "",
     sector_persistence: str = "",
+    code: str = "600001",
+    score: float = 85.0,
+    matched_rules: tuple[str, ...] = ("ma5>ma10>ma20", "volume_expansion"),
 ) -> Candidate:
     return Candidate(
-        code="600001",
+        code=code,
         name=name,
         horizon="1-5个交易日",
-        score=85.0,
+        score=score,
         close=10.5,
         trigger="放量突破10.60",
         stop_price=9.8,
         target_price=12.0,
-        matched_rules=("ma5>ma10>ma20", "volume_expansion"),
+        matched_rules=matched_rules,
         observed_at=observed_at,
         source="synthetic",
         warning=warning,
@@ -48,6 +52,31 @@ def candidate(
         sector_rotation=sector_rotation,
         sector_persistence=sector_persistence,
     )
+
+
+def test_featured_candidates_require_sector_evidence_deduplicate_and_cap_at_five() -> None:
+    plain = candidate(code="600000", score=99)
+    duplicate_lower = candidate(
+        code="600001", score=80, industry_sector="有色金属",
+    )
+    candidates = tuple(
+        candidate(
+            code=f"60000{index}",
+            score=90 - index,
+            industry_sector="有色金属",
+        )
+        for index in range(1, 7)
+    )
+
+    result = _featured_candidates(
+        (plain, duplicate_lower, *candidates),
+        (candidate(code="600001", score=95, concept_sectors=("黄金概念",)),),
+    )
+
+    assert len(result) == 5
+    assert [item.code for item in result].count("600001") == 1
+    assert result[0].code == "600001"
+    assert all(item.code != "600000" for item in result)
 
 
 def test_premarket_report_contains_required_sections_levels_warnings_and_disclaimer() -> None:
@@ -92,12 +121,15 @@ def test_postmarket_report_contains_required_sections_and_optional_morning_statu
             "backtests": module("backtests", {"短线胜率": "55%", "最大回撤": "8%"}, "样本有限"),
         },
         morning_candidates=({"code": "600001", "name": "示例股份", "status": "继续观察"},),
-        short_term_candidates=(candidate(),),
+        short_term_candidates=(candidate(industry_sector="有色金属", sector_rotation="accelerating"),),
         swing_candidates=(candidate(name="波段股份"),),
     )
 
     assert rendered.subject == "A股收盘日报 2026-08-19"
-    for expected in ("市场宽度", "早盘候选跟踪", "继续观察", "下一交易日短线池", "回测摘要", "样本有限"):
+    for expected in (
+        "市场宽度", "早盘候选跟踪", "继续观察", "板块龙头精选观察（最多5只）",
+        "有色金属", "下一交易日短线池", "回测摘要", "样本有限",
+    ):
         assert expected in rendered.html
         assert expected in rendered.text
 

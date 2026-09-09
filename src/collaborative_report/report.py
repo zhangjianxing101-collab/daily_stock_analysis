@@ -27,6 +27,7 @@ _DISCLAIMER_LINES = (
     "盘前参考价不代表成交价。",
 )
 _NO_MORNING_STATUS = "暂无早盘候选记录，状态不可用"
+_FEATURED_TITLE = "板块龙头精选观察（最多5只）"
 _MODULE_TITLES = {
     "global": "全球与黄金背景",
     "gold": "黄金量化背景",
@@ -35,6 +36,7 @@ _MODULE_TITLES = {
     "backtests": "回测摘要",
     "ai": "AI分析",
     "screening": "筛选状态",
+    "sizing": "资金分配",
     "ths_market_evidence": "同花顺市场证据",
     "ths_financial_evidence": "同花顺基本面证据",
     "decision_summary": "决策摘要",
@@ -402,6 +404,44 @@ def _morning_rows(items: Sequence[Mapping[str, Any]]) -> tuple[tuple[str, str, s
     )
 
 
+def _featured_candidates(
+    short_term: Sequence[Candidate],
+    swing: Sequence[Candidate],
+    *,
+    limit: int = 5,
+) -> tuple[Candidate, ...]:
+    """Select a deduplicated watchlist backed by explicit sector evidence."""
+
+    eligible = [
+        item
+        for item in (*short_term, *swing)
+        if (
+            item.industry_sector.strip()
+            or item.concept_sectors
+            or "leading_sector" in item.matched_rules
+        )
+    ]
+    eligible.sort(
+        key=lambda item: (
+            bool(item.warning),
+            -(bool(item.industry_sector.strip()) + len(item.concept_sectors)),
+            -item.score,
+            item.code,
+            item.horizon,
+        )
+    )
+    selected: list[Candidate] = []
+    seen: set[str] = set()
+    for item in eligible:
+        if item.code in seen:
+            continue
+        seen.add(item.code)
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return tuple(selected)
+
+
 def _plain_text(
     mode: ReportMode,
     report_date: date,
@@ -412,6 +452,7 @@ def _plain_text(
     short_candidates: Sequence[_CandidateView],
     swing_title: str,
     swing_candidates: Sequence[_CandidateView],
+    featured_candidates: Sequence[_CandidateView],
     morning_rows: Sequence[tuple[str, str, str]],
 ) -> str:
     lines = [build_subject(mode, report_date), ""]
@@ -465,6 +506,18 @@ def _plain_text(
         else:
             lines.append(_NO_MORNING_STATUS)
         lines.append("")
+    lines.append(_FEATURED_TITLE)
+    if not featured_candidates:
+        lines.append("暂无具备完整板块证据的精选标的")
+    for item in featured_candidates:
+        lines.append(f"{item.code} {item.name}（{item.horizon}，评分 {item.score}）")
+        lines.append(f"状态：{'等待人工确认' if item.actionable else '仅供观察'}")
+        lines.append(f"触发条件：{item.trigger}；止损：{item.stop}；目标：{item.target}")
+        if item.sector_context:
+            lines.append("；".join(item.sector_context))
+        if item.warning:
+            lines.append(f"警告：{item.warning}")
+    lines.append("")
     for title, candidates in ((short_title, short_candidates), (swing_title, swing_candidates)):
         lines.append(title)
         if not candidates:
@@ -536,6 +589,10 @@ def render_report(
         _candidate_view(item, target_session, generated_at)
         for item in swing_candidates
     )
+    featured_views = tuple(
+        _candidate_view(item, target_session, generated_at)
+        for item in _featured_candidates(short_term_candidates, swing_candidates)
+    )
     morning_rows = _morning_rows(morning_candidates)
     subject = build_subject(normalized_mode, report_date, prefix=subject_prefix)
     template = _ENVIRONMENT.get_template("collaborative_report.html.j2")
@@ -550,6 +607,8 @@ def render_report(
         swing_title=swing_title,
         short_candidates=short_views,
         swing_candidates=swing_views,
+        featured_title=_FEATURED_TITLE,
+        featured_candidates=featured_views,
         morning_rows=morning_rows,
         no_morning_status=_NO_MORNING_STATUS,
         disclaimer_lines=_DISCLAIMER_LINES,
@@ -564,6 +623,7 @@ def render_report(
         short_views,
         swing_title,
         swing_views,
+        featured_views,
         morning_rows,
     )
     return RenderedReport(subject=subject, html=html, text=text)
