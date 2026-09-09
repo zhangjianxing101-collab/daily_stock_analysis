@@ -643,7 +643,7 @@ jobs:
           if [ -n "$PRIOR_REPORT" ]; then
             args+=(--prior-report "$PRIOR_REPORT")
           fi
-          if [ -n "$PRIOR_SECTOR_STATE_PATH" ]; then
+          if [ "$MODE" = "postmarket" ] && [ -n "$PRIOR_SECTOR_STATE_PATH" ]; then
             args+=(--prior-sector-report "$PRIOR_SECTOR_STATE_PATH")
           fi
 
