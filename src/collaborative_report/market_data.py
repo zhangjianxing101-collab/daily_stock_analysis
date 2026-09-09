@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import logging
 from typing import Any, Callable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 import exchange_calendars
 import numpy as np
@@ -90,6 +91,8 @@ _SYMBOL_CALENDARS = {
     "CL=F": "CMES",
 }
 _THS_SOURCE = "ths.fuyao"
+_XSHG_OPEN = time(9, 30)
+_XSHG_CLOSE = time(15, 0)
 logger = logging.getLogger(__name__)
 _THS_FAILURE_CODES = {
     ThsAuthenticationError: "ths_authentication_failed",
@@ -226,6 +229,28 @@ def _ths_timestamp(timestamp_ms: int | None, observed_at: datetime) -> tuple[dat
     if timestamp > observed_at:
         raise ValueError("THS source timestamp is in the future")
     return timestamp, ()
+
+
+def _supplement_session_identity(
+    timestamp: pd.Timestamp,
+    observed_at: datetime,
+    expected_session: date,
+) -> datetime | None:
+    """Resolve a Tencent quote to the completed session it can prove."""
+
+    local = timestamp.tz_convert("Asia/Shanghai")
+    if local.date() == expected_session and local.time() >= _XSHG_CLOSE:
+        return local.to_pydatetime()
+
+    observed_local = observed_at.astimezone(ZoneInfo("Asia/Shanghai"))
+    if local.date() != observed_local.date() or observed_local.time() >= _XSHG_OPEN:
+        return None
+    try:
+        if not exchange_calendars.get_calendar("XSHG").is_session(pd.Timestamp(observed_local.date())):
+            return None
+    except Exception:
+        return None
+    return datetime.combine(expected_session, _XSHG_CLOSE, tzinfo=ZoneInfo("Asia/Shanghai"))
 
 
 def _ths_items_frame(items: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
@@ -602,7 +627,6 @@ class MarketDataGateway:
         # quote's completed-session identity. Prove that identity independently.
         from .session import latest_completed_xshg_session
 
-        exchange_tz = "Asia/Shanghai"
         try:
             expected = latest_completed_xshg_session(observed_at)
         except Exception:
@@ -618,8 +642,8 @@ class MarketDataGateway:
                 stamp = pd.Timestamp(other["source_timestamp"])
                 if pd.isna(stamp) or stamp.tzinfo is None:
                     continue
-                local = stamp.tz_convert(exchange_tz)
-                if local.date() != expected or local.hour < 15 or stamp > supplement.observed_at:
+                identity = _supplement_session_identity(stamp, observed_at, expected)
+                if identity is None or stamp > supplement.observed_at:
                     continue
                 name = other["name"]
                 price, ratio, turnover = (float(other[key]) for key in ("price", "volume_ratio", "turnover"))
@@ -629,7 +653,7 @@ class MarketDataGateway:
                         or abs(price - float(row["price"])) > 0.01 + 1e-9):
                     continue
                 result.loc[index, ["name", "volume_ratio", "turnover"]] = [name, ratio, turnover]
-                timestamps.append(stamp.to_pydatetime())
+                timestamps.append(identity)
             except (TypeError, ValueError, OverflowError):
                 continue
         result.attrs["screening_complete_count"] = len(timestamps)

@@ -219,6 +219,73 @@ def test_premarket_supplement_uses_last_completed_session_not_ths_response_time(
     assert result.source.endswith("+tencent")
 
 
+def test_premarket_current_day_quote_proves_prior_close_before_xshg_open() -> None:
+    observed = datetime(2026, 8, 20, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    prior_close = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    client = Mock()
+    client.a_share_snapshot.return_value = ThsApiResponse(
+        {
+            "timestamp": int(observed.timestamp() * 1000),
+            "item": [ths_snapshot_item()],
+        },
+        None,
+    )
+    supplement = Mock(return_value=SimpleNamespace(
+        frame=pd.DataFrame([{
+            "code": "600000",
+            "name": "Stock",
+            "price": 10.0,
+            "volume_ratio": 1.2,
+            "turnover": 2.3,
+            "source_timestamp": observed,
+        }]),
+        observed_at=observed,
+    ))
+
+    result = MarketDataGateway(
+        ths_client=client,
+        snapshot_supplement_fetcher=supplement,
+        clock=lambda: observed,
+    ).get_a_share_snapshot(["600000"])
+
+    assert result.source_timestamp == prior_close
+    assert result.frame.attrs["screening_complete_count"] == 1
+    assert result.source.endswith("+tencent")
+
+
+def test_current_day_supplement_is_rejected_after_xshg_open() -> None:
+    observed = datetime(2026, 8, 20, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    client = Mock()
+    client.a_share_snapshot.return_value = ThsApiResponse(
+        {
+            "timestamp": int(observed.timestamp() * 1000),
+            "item": [ths_snapshot_item()],
+        },
+        None,
+    )
+    supplement = Mock(return_value=SimpleNamespace(
+        frame=pd.DataFrame([{
+            "code": "600000",
+            "name": "Stock",
+            "price": 10.0,
+            "volume_ratio": 1.2,
+            "turnover": 2.3,
+            "source_timestamp": observed,
+        }]),
+        observed_at=observed,
+    ))
+
+    result = MarketDataGateway(
+        ths_client=client,
+        snapshot_supplement_fetcher=supplement,
+        clock=lambda: observed,
+    ).get_a_share_snapshot(["600000"])
+
+    assert result.frame.attrs["screening_complete_count"] == 0
+    assert not result.source.endswith("+tencent")
+    assert "snapshot_screening_fields_incomplete" in result.warnings
+
+
 def test_ths_supplement_skips_unsupported_code_without_losing_supported_coverage() -> None:
     stamp = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
     fetcher = Mock(return_value=SimpleNamespace(
