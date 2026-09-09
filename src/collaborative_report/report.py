@@ -41,6 +41,7 @@ _MODULE_TITLES = {
     "ths_financial_evidence": "同花顺基本面证据",
     "decision_summary": "决策摘要",
     "delivery_readiness": "报告完整性检查",
+    "news": "市场新闻与事件线索",
 }
 _SECTOR_TITLES = {
     "industry_sectors": "行业板块",

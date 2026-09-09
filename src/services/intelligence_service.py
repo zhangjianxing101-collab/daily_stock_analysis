@@ -40,6 +40,7 @@ _DNS_GUARD_LOCK = threading.Lock()
 _AUTO_FETCH_MIN_INTERVAL_SECONDS = 60 * 60
 _ORZ_DAILYNEWS_PATH = "/api/v1/dailynews"
 _SHANGHAI_TIMEZONE = ZoneInfo("Asia/Shanghai")
+_PROXY_FAKE_IP_NETWORK = ipaddress.ip_network("198.18.0.0/15")
 _BUILTIN_SOURCE_TEMPLATES = [
     {
         "template_id": "sec-company-news",
@@ -149,7 +150,11 @@ class IntelligenceService:
 
     def create_source(self, payload: Dict[str, Any]) -> Dict[str, Any]:
         fields = self._normalize_source_fields(payload)
-        self._validate_url(fields["url"])
+        parsed_source = urlparse(fields["url"])
+        self._validate_url(
+            fields["url"],
+            allow_builtin_orz_fake_ip=self._is_builtin_orz_url(parsed_source),
+        )
         try:
             return self._source_to_dict(self.repo.create_source(fields))
         except IntegrityError as exc:
@@ -392,7 +397,13 @@ class IntelligenceService:
             "description": description,
         }
 
-    def _validate_url(self, raw_url: str, *, allow_no_url: bool = False) -> None:
+    def _validate_url(
+        self,
+        raw_url: str,
+        *,
+        allow_no_url: bool = False,
+        allow_builtin_orz_fake_ip: bool = False,
+    ) -> None:
         if allow_no_url and raw_url.startswith("no-url:intel:"):
             return
         parsed = urlparse(raw_url)
@@ -425,7 +436,11 @@ class IntelligenceService:
                 ip = ipaddress.ip_address(info[4][0])
             except (IndexError, ValueError):
                 continue
-            if self._is_blocked_ip(ip):
+            if self._is_blocked_ip(ip) and not (
+                allow_builtin_orz_fake_ip
+                and self._is_builtin_orz_url(parsed)
+                and ip in _PROXY_FAKE_IP_NETWORK
+            ):
                 raise IntelligenceServiceError("source url must not target private or local network addresses")
             has_public_address = True
         if not has_public_address:
@@ -440,6 +455,14 @@ class IntelligenceService:
             or ip.is_link_local
             or ip.is_reserved
             or ip.is_multicast
+        )
+
+    @staticmethod
+    def _is_builtin_orz_url(parsed: Any) -> bool:
+        return (
+            parsed.scheme.lower() == "https"
+            and (parsed.hostname or "").strip().lower().rstrip(".") == "news.orz.ai"
+            and parsed.path.rstrip("/") == _ORZ_DAILYNEWS_PATH
         )
 
     def _fetch_feed_entries(self, fields: Dict[str, Any], *, limit: int) -> List[FeedEntry]:
@@ -509,7 +532,12 @@ class IntelligenceService:
             ),
             "Accept": "application/json",
         }
-        self._validate_url(fields["url"])
+        parsed_source = urlparse(fields["url"])
+        allow_builtin_orz_fake_ip = self._is_builtin_orz_url(parsed_source)
+        self._validate_url(
+            fields["url"],
+            allow_builtin_orz_fake_ip=allow_builtin_orz_fake_ip,
+        )
         response = None
         try:
             response = self._get_with_validated_dns(
@@ -518,12 +546,16 @@ class IntelligenceService:
                 headers=headers,
                 allow_redirects=False,
                 stream=True,
+                _allow_builtin_orz_fake_ip=allow_builtin_orz_fake_ip,
             )
             status_code = int(getattr(response, "status_code", 200))
             if status_code in _REDIRECT_STATUS_CODES:
                 raise IntelligenceServiceError("NewsNow API redirects are not followed")
             response.raise_for_status()
-            self._validate_url(response.url or fields["url"])
+            self._validate_url(
+                response.url or fields["url"],
+                allow_builtin_orz_fake_ip=allow_builtin_orz_fake_ip,
+            )
 
             content = self._read_limited_response(response)
             try:
@@ -559,12 +591,18 @@ class IntelligenceService:
     def _get_with_validated_dns(self, raw_url: str, **kwargs: Any) -> requests.Response:
         parsed = urlparse(raw_url)
         target_hostname = self._normalize_hostname(parsed.hostname)
+        allow_builtin_orz_fake_ip = bool(kwargs.pop("_allow_builtin_orz_fake_ip", False))
         original_getaddrinfo = socket.getaddrinfo
 
         def guarded_getaddrinfo(host: Any, port: Any, *args: Any, **inner_kwargs: Any) -> Any:
             addrinfos = original_getaddrinfo(host, port, *args, **inner_kwargs)
             if self._normalize_hostname(host) == target_hostname:
-                self._validate_addrinfos(addrinfos)
+                self._validate_addrinfos(
+                    addrinfos,
+                    allow_builtin_orz_fake_ip=(
+                        allow_builtin_orz_fake_ip and self._is_builtin_orz_url(parsed)
+                    ),
+                )
             return addrinfos
 
         with _DNS_GUARD_LOCK:
@@ -587,13 +625,19 @@ class IntelligenceService:
             return normalized
 
     @staticmethod
-    def _validate_addrinfos(addr_infos: Any) -> None:
+    def _validate_addrinfos(
+        addr_infos: Any,
+        *,
+        allow_builtin_orz_fake_ip: bool = False,
+    ) -> None:
         for info in addr_infos or []:
             try:
                 ip = ipaddress.ip_address(info[4][0])
             except (IndexError, TypeError, ValueError):
                 continue
-            if IntelligenceService._is_blocked_ip(ip):
+            if IntelligenceService._is_blocked_ip(ip) and not (
+                allow_builtin_orz_fake_ip and ip in _PROXY_FAKE_IP_NETWORK
+            ):
                 raise IntelligenceServiceError("source url must not target private or local network addresses")
 
     def _parse_feed(self, content: bytes, *, source_name: str, limit: int) -> List[FeedEntry]:
@@ -646,8 +690,10 @@ class IntelligenceService:
                     "score": item.get("score"),
                     "rank": item.get("rank"),
                 },
+                preserve_without_url_on_validation_failure=True,
             )
-            entries.append(entry)
+            if entry is not None:
+                entries.append(entry)
         return [entry for entry in entries if entry]
 
     def _parse_rss_item(self, node: ET.Element, source_name: str) -> Optional[FeedEntry]:
@@ -681,19 +727,22 @@ class IntelligenceService:
         source_name: str,
         published_at: Optional[datetime],
         raw_payload: Optional[Dict[str, Any]] = None,
+        preserve_without_url_on_validation_failure: bool = False,
     ) -> Optional[FeedEntry]:
         title = self._clean_text(title)[:300]
         summary = self._clean_text(summary)[:2000]
         url = url.strip()
         if not title and not url:
             return None
+        url_key = url
         if url:
             try:
                 self._validate_url(url, allow_no_url=True)
             except IntelligenceServiceError:
-                return None
-            url_key = url
-        else:
+                if not preserve_without_url_on_validation_failure:
+                    return None
+                url_key = ""
+        if not url_key:
             digest = hashlib.sha256(f"{source_name}|{title}|{published_at}".encode("utf-8")).hexdigest()[:24]
             url_key = f"no-url:intel:{digest}"
         payload = dict(raw_payload or {})

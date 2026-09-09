@@ -169,8 +169,16 @@ Set non-secret Repository variables for the delivery policy and model choices.
 `COLLAB_SCREEN_PREFILTER` defaults to `120`. `COLLAB_POSITION_SIZING` defaults to
 `false`; leave it disabled when the report should analyze only the market, sectors,
 and candidates. `COLLAB_CAPITAL_CNY` and `COLLAB_RISK_FRACTION` apply only when
-position sizing is explicitly enabled. Model names are repository variables; the
+position sizing is explicitly enabled; the default reference capital is CNY 20,000.
+Model names are repository variables; the
 workflow has safe defaults when a model variable is omitted.
+
+The report's market-news section uses enabled ORZ/NewsNow China-market templates
+as discovery-only clues. It diversifies financial sources, keeps Baidu items in a
+separate macro-attention count, rejects stale, undated, or future-dated items, and
+does not add these clues to technical scores. Aggregator timestamps and repeated
+landing-page links are not treated as proof; material facts must be checked against
+the original publisher or an official disclosure before any manual decision.
 
 ## Manual operation
 

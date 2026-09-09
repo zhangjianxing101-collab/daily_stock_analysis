@@ -25,6 +25,7 @@ from .gold import analyze_gold
 from .mailer import DeliveryInDoubtError, DeliveryNotAcceptedError, send_with_retry
 from .market_data import MarketDataGateway, MarketDataset
 from .models import Candidate, ModuleResult, Position, ReportMode
+from .news_intel import fetch_market_news
 from .report import RenderedReport, render_report
 from .risk import evaluate_position, suggested_board_lots
 from .screener import ScreeningResult, prefilter_universe, rank_with_ths_evidence, screen_aggressive
@@ -61,6 +62,7 @@ _SECTOR_LEVELS = frozenset(("high", "medium", "low", "unavailable"))
 _PRIOR_SECTOR_MANIFEST_MAX_BYTES = 1024 * 1024
 _SECTOR_STATE_MAX_ROWS = 40
 _SECTOR_STATE_MAX_ROWS_PER_TYPE = 20
+_AI_FEATURED_LIMIT = 5
 _SECTOR_HISTORY_UNAVAILABLE_WARNING = "板块历史状态不可用，按首次观察处理"
 _SECTOR_SOURCE_TIMESTAMP_WARNING = "板块来源时间不可用，未持久化状态"
 _SECTOR_DATA_PARTIAL_WARNING = "板块数据覆盖不完整，仅供参考"
@@ -448,6 +450,7 @@ class RunnerDependencies:
     artifact_writer: Callable[..., ArtifactPaths] | None = None
     artifact_finalizer: Callable[..., ArtifactPaths] | None = None
     artifact_publisher: Callable[..., None] | None = None
+    news_loader: Callable[..., ModuleResult] | None = None
 
 
 def _production_mail_sender(rendered: RenderedReport, *, test_email: bool = False) -> Any:
@@ -495,6 +498,7 @@ def default_dependencies(*, clock: Callable[[], datetime] | None = None) -> Runn
         renderer=render_report,
         mail_sender=_production_mail_sender,
         sizing_evaluator=suggested_board_lots,
+        news_loader=fetch_market_news,
     )
 
 
@@ -1334,6 +1338,50 @@ def _suppress_unactionable_candidates(
         else:
             projected.append(item)
     return tuple(projected)
+
+
+def _select_ai_codes(
+    candidates: Sequence[Candidate],
+    portfolio_codes: Sequence[str],
+    suppressed_codes: set[str],
+    *,
+    limit: int = _AI_FEATURED_LIMIT,
+) -> tuple[str, ...]:
+    """Bound AI work to actionable, sector-backed report candidates."""
+
+    eligible = sorted(
+        (
+            item
+            for item in candidates
+            if item.code not in suppressed_codes
+            and not item.warning.strip()
+            and (
+                item.industry_sector.strip()
+                or item.concept_sectors
+                or "leading_sector" in item.matched_rules
+            )
+        ),
+        key=lambda item: (
+            -(bool(item.industry_sector.strip()) + len(item.concept_sectors)),
+            -item.score,
+            item.code,
+            item.horizon,
+        ),
+    )
+    selected: list[str] = []
+    for item in eligible:
+        if item.code in selected:
+            continue
+        selected.append(item.code)
+        if len(selected) >= limit:
+            break
+    if selected:
+        return tuple(selected)
+    return tuple(
+        code
+        for code in dict.fromkeys(portfolio_codes)
+        if code not in suppressed_codes
+    )[:limit]
 
 
 def _last_session_bar(dataset: MarketDataset, expected_session: date) -> pd.Series | None:
@@ -2307,6 +2355,12 @@ def run_report(
     except Exception:
         modules["global"] = _unavailable("global", session.now_shanghai, "全球市场数据暂不可用")
 
+    if active.news_loader is not None:
+        try:
+            modules["news"] = active.news_loader(observed_at=session.now_shanghai)
+        except Exception:
+            modules["news"] = _unavailable("news", session.now_shanghai, "市场新闻线索暂不可用")
+
     snapshot: MarketDataset | None
     snapshot_source_is_authoritative = False
     market_source_timestamp = "unavailable"
@@ -2587,20 +2641,10 @@ def run_report(
             "gold", session.now_shanghai, "黄金模块暂不可用", exc, gold_failure_stage,
         )
 
-    ai_codes = tuple(
-        code
-        for code in dict.fromkeys(
-            (*portfolio_codes, *(item.code for item in screening.short_term), *(item.code for item in screening.swing))
-        )
-        if code not in suppressed_codes
-        and not next(
-            (
-                item.warning.strip()
-                for item in (*screening.short_term, *screening.swing)
-                if item.code == code
-            ),
-            "",
-        )
+    ai_codes = _select_ai_codes(
+        (*screening.short_term, *screening.swing),
+        tuple(portfolio_codes),
+        suppressed_codes,
     )
     try:
         modules["ai"] = active.ai_enricher(ai_codes, observed_at=session.now_shanghai)

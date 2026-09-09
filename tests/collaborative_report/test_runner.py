@@ -46,6 +46,7 @@ from src.collaborative_report.runner import (
     _redacted_manifest,
     _rerank_sector_ties,
     _sector_state,
+    _select_ai_codes,
     _trusted_sector_snapshot_timestamp,
 )
 from src.collaborative_report.sector_analysis import SectorAnalysis, SectorRow, analyze_sectors
@@ -95,6 +96,31 @@ def candidate(code: str = CANDIDATE_CODE, *, observed_at: datetime = NOW) -> Can
         observed_at=observed_at,
         source="fixture",
     )
+
+
+def test_ai_selection_prefers_at_most_five_sector_backed_candidates() -> None:
+    sector_candidates = tuple(
+        replace(
+            candidate(f"60000{index}"),
+            score=90 - index,
+            industry_sector="有色金属",
+        )
+        for index in range(1, 7)
+    )
+    plain = candidate("000001")
+
+    selected = _select_ai_codes(
+        (*sector_candidates, plain),
+        (PORTFOLIO_CODE,),
+        {"600002"},
+    )
+
+    assert selected == ("600001", "600003", "600004", "600005", "600006")
+    assert PORTFOLIO_CODE not in selected
+
+
+def test_ai_selection_uses_portfolio_only_without_sector_candidates() -> None:
+    assert _select_ai_codes((candidate(),), (PORTFOLIO_CODE,), set()) == (PORTFOLIO_CODE,)
 
 
 def bars(*, high: float = 10.4, low: float = 10.0, close: float = 10.2) -> pd.DataFrame:
@@ -338,6 +364,31 @@ def test_incomplete_supplement_marks_market_and_screening_partial(tmp_path, deps
     assert result.modules["market"].payload["无报价剔除记录"] == 1
     assert result.modules["market"].payload["选股字段齐全记录"] == 1
     assert result.modules["screening"].status == "partial"
+    deps.mail_sender.assert_not_called()
+
+
+def test_news_module_is_included_without_affecting_trade_scoring(tmp_path, deps) -> None:
+    news_loader = Mock(
+        return_value=ModuleResult(
+            "news",
+            "partial",
+            NOW,
+            {"财经线索数": 2},
+            ("聚合新闻仅作事件线索，关键事实需核验",),
+        )
+    )
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, news_loader=news_loader),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["news"].payload == {"财经线索数": 2}
+    news_loader.assert_called_once_with(observed_at=NOW)
+    assert result.short_term_candidates[0].score == candidate().score
     deps.mail_sender.assert_not_called()
 
 

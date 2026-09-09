@@ -396,6 +396,43 @@ class IntelligenceServiceTestCase(unittest.TestCase):
         self.assertEqual(result["sample_items"][0]["summary"], "Sector activity increased during the session.")
         self.assertEqual(result["sample_items"][0]["published_at"], "2026-09-09T01:06:04")
 
+    def test_builtin_orz_source_allows_local_proxy_fake_ip_only(self) -> None:
+        fake_ip = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.137", 0))]
+        response = self._mock_json_response(
+            ORZ_FIXTURE,
+            "https://news.orz.ai/api/v1/dailynews/?platform=cls",
+        )
+        with (
+            patch("src.services.intelligence_service.socket.getaddrinfo", return_value=fake_ip),
+            patch("src.services.intelligence_service.requests.get", return_value=response),
+        ):
+            payload = {
+                "name": "ORZ 财联社热榜",
+                "url": "https://news.orz.ai/api/v1/dailynews/?platform=cls",
+                "source_type": "newsnow",
+                "scope_type": "market",
+                "market": "cn",
+            }
+            created = self.service.create_source(payload)
+            result = self.service.test_source(payload)
+
+        self.assertEqual(created["name"], "ORZ 财联社热榜")
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["fetched_count"], 2)
+        self.assertTrue(all(item["url"].startswith("no-url:intel:") for item in result["sample_items"]))
+
+    def test_proxy_fake_ip_remains_blocked_for_untrusted_source(self) -> None:
+        fake_ip = [(socket.AF_INET, socket.SOCK_STREAM, 6, "", ("198.18.0.137", 0))]
+        with patch("src.services.intelligence_service.socket.getaddrinfo", return_value=fake_ip):
+            with self.assertRaises(IntelligenceServiceError):
+                self.service.test_source({
+                    "name": "untrusted",
+                    "url": "https://untrusted.example/api",
+                    "source_type": "newsnow",
+                    "scope_type": "market",
+                    "market": "cn",
+                })
+
     def test_default_newsnow_templates_use_orz_dailynews_platforms(self) -> None:
         templates = self.service.list_source_templates(source_type="newsnow", market="cn")["items"]
 
