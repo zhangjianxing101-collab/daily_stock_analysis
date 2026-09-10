@@ -537,6 +537,8 @@ class MarketDataGateway:
         daily_fetcher: Callable[..., tuple[pd.DataFrame, str]] | None = None,
         sector_names_fetcher: Callable[[], pd.DataFrame] | None = None,
         sector_members_fetcher: Callable[[str], pd.DataFrame] | None = None,
+        limit_up_fetcher: Callable[..., pd.DataFrame] | None = None,
+        limit_down_fetcher: Callable[..., pd.DataFrame] | None = None,
         industry_sector_fetcher: Callable[[], pd.DataFrame] | None = None,
         concept_sector_fetcher: Callable[[], pd.DataFrame] | None = None,
         yfinance_download: Callable[..., pd.DataFrame] | None = None,
@@ -548,6 +550,8 @@ class MarketDataGateway:
         self._daily_fetcher = daily_fetcher
         self._sector_names_fetcher = sector_names_fetcher
         self._sector_members_fetcher = sector_members_fetcher
+        self._limit_up_fetcher = limit_up_fetcher
+        self._limit_down_fetcher = limit_down_fetcher
         self._industry_sector_fetcher = industry_sector_fetcher
         self._concept_sector_fetcher = concept_sector_fetcher
         self._yfinance_download = yfinance_download
@@ -924,6 +928,43 @@ class MarketDataGateway:
 
         frame = pd.DataFrame(records, columns=["code", "sector"])
         return MarketDataset(frame, "akshare.industry_boards", self._observed_at(), tuple(warnings))
+
+    def get_limit_counts(self, expected_session: date) -> MarketDataset:
+        """Return exact Eastmoney limit-pool counts for one completed session."""
+
+        if not isinstance(expected_session, date) or isinstance(expected_session, datetime):
+            raise ValueError("expected_session must be a date")
+        requested_at = self._observed_at()
+        try:
+            if self._limit_up_fetcher is None or self._limit_down_fetcher is None:
+                import akshare
+
+                up_fetcher = self._limit_up_fetcher or akshare.stock_zt_pool_em
+                down_fetcher = self._limit_down_fetcher or akshare.stock_zt_pool_dtgc_em
+            else:
+                up_fetcher = self._limit_up_fetcher
+                down_fetcher = self._limit_down_fetcher
+            session_key = expected_session.strftime("%Y%m%d")
+            limit_up = up_fetcher(date=session_key)
+            limit_down = down_fetcher(date=session_key)
+        except Exception:
+            raise ValueError("limit pool provider unavailable") from None
+        if not isinstance(limit_up, pd.DataFrame) or not isinstance(limit_down, pd.DataFrame):
+            raise ValueError("limit pool provider returned invalid data")
+        received_at = self._received_at(requested_at)
+        source_timestamp = datetime.combine(expected_session, time(15), tzinfo=ZoneInfo("Asia/Shanghai"))
+        if source_timestamp > received_at:
+            raise ValueError("limit pool session incomplete")
+        frame = pd.DataFrame([{
+            "limit_up_count": len(limit_up),
+            "limit_down_count": len(limit_down),
+        }])
+        return MarketDataset(
+            frame,
+            "akshare.eastmoney_limit_pools",
+            received_at,
+            source_timestamp=source_timestamp,
+        )
 
     def get_sector_snapshot(self, sector_type: str) -> MarketDataset:
         if not isinstance(sector_type, str) or sector_type not in {"industry", "concept"}:

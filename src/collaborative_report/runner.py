@@ -2420,6 +2420,37 @@ def run_report(
                 snapshot,
                 authoritative=snapshot_source_is_authoritative,
             )
+            limit_loader = getattr(active.gateway, "get_limit_counts", None)
+            if snapshot_source_is_authoritative and callable(limit_loader):
+                try:
+                    limit_counts = limit_loader(expected_session)
+                    limit_frame = limit_counts.frame
+                    if len(limit_frame) != 1 or not {
+                        "limit_up_count", "limit_down_count",
+                    }.issubset(limit_frame.columns):
+                        raise ValueError("limit counts invalid")
+                    up = limit_frame.iloc[0]["limit_up_count"]
+                    down = limit_frame.iloc[0]["limit_down_count"]
+                    if (
+                        not isinstance(up, (int, np.integer))
+                        or isinstance(up, (bool, np.bool_))
+                        or not isinstance(down, (int, np.integer))
+                        or isinstance(down, (bool, np.bool_))
+                        or int(up) < 0
+                        or int(down) < 0
+                        or limit_counts.source_timestamp is None
+                        or limit_counts.source_timestamp.date() != expected_session
+                    ):
+                        raise ValueError("limit counts invalid")
+                    market_payload = {
+                        **market_payload,
+                        "涨停家数": int(up),
+                        "跌停家数": int(down),
+                        "涨跌停数据源": limit_counts.source,
+                        "涨跌停数据时间": limit_counts.source_timestamp.isoformat(),
+                    }
+                except Exception:
+                    market_warnings = (*market_warnings, "market_limit_counts_unavailable")
             breadth_incomplete = (
                 snapshot_source_is_authoritative
                 and market_payload["上涨占比"] == "不可用"
@@ -2434,7 +2465,7 @@ def run_report(
                 "market",
                 (
                     "ok"
-                    if snapshot_source_is_authoritative and not snapshot.warnings and not breadth_incomplete
+                    if snapshot_source_is_authoritative and not market_warnings and not breadth_incomplete
                     else "partial"
                 ),
                 snapshot.source_timestamp or snapshot.observed_at,

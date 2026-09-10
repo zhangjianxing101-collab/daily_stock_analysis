@@ -2745,6 +2745,47 @@ def test_market_overview_has_safe_breadth_semantics_and_decision_summary(tmp_pat
     assert deps.mail_sender.assert_not_called() is None
 
 
+def test_market_overview_includes_verified_limit_pool_counts(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.get_limit_counts = Mock(return_value=replace(
+        dataset(pd.DataFrame([{"limit_up_count": 42, "limit_down_count": 7}]), "fixture.limit-pools"),
+        source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI),
+    ))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    market = result.modules["market"].payload
+    assert market["涨停家数"] == 42
+    assert market["跌停家数"] == 7
+    assert market["涨跌停数据源"] == "fixture.limit-pools"
+    gateway.get_limit_counts.assert_called_once_with(NOW.date())
+
+
+def test_limit_pool_failure_is_redacted_and_marks_market_partial(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.get_limit_counts = Mock(side_effect=RuntimeError("token=private"))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    market = result.modules["market"]
+    assert market.status == "partial"
+    assert market.payload["涨停家数"] == "不可用"
+    assert "market_limit_counts_unavailable" in market.warnings
+    assert "private" not in json.dumps(market.payload, ensure_ascii=False)
+
+
 def test_untrusted_market_breadth_is_unavailable_and_forces_watch_summary(tmp_path, deps) -> None:
     gateway = FakeGateway()
     gateway.snapshot = replace(gateway.snapshot, source_timestamp=None)

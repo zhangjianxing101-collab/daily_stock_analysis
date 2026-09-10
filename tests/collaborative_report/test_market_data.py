@@ -837,6 +837,36 @@ def test_get_leading_sector_codes_wraps_sector_list_failure() -> None:
     assert "https://feed.invalid" not in formatted_traceback(caught)
 
 
+def test_get_limit_counts_uses_completed_session_pools() -> None:
+    up = Mock(return_value=pd.DataFrame({"代码": ["600000", "000001"]}))
+    down = Mock(return_value=pd.DataFrame({"代码": ["300001"]}))
+    gateway = MarketDataGateway(
+        limit_up_fetcher=up,
+        limit_down_fetcher=down,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    result = gateway.get_limit_counts(SESSION)
+
+    up.assert_called_once_with(date="20260819")
+    down.assert_called_once_with(date="20260819")
+    assert result.frame.to_dict("records") == [{"limit_up_count": 2, "limit_down_count": 1}]
+    assert result.source == "akshare.eastmoney_limit_pools"
+    assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+def test_get_limit_counts_rejects_incomplete_session() -> None:
+    before_close = datetime(2026, 8, 19, 14, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+    gateway = MarketDataGateway(
+        limit_up_fetcher=lambda **kwargs: pd.DataFrame(),
+        limit_down_fetcher=lambda **kwargs: pd.DataFrame(),
+        clock=lambda: before_close,
+    )
+
+    with pytest.raises(ValueError, match="^limit pool session incomplete$"):
+        gateway.get_limit_counts(SESSION)
+
+
 def test_get_sector_snapshot_normalizes_industry_fields_and_preserves_raw_input() -> None:
     raw = pd.DataFrame(
         {
