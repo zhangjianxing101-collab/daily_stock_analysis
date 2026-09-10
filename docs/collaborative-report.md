@@ -66,6 +66,20 @@ one expired source can therefore invalidate the combined snapshot.
 Preview runs additionally produce bounded `provider-quality` diagnostics containing
 only counts and parsed dates. Raw responses, stderr and credentials are not uploaded.
 
+The market overview derives style only when every quoted stock has a finite,
+positive total-market-cap value. It compares the equal-weight returns of the
+largest and smallest 30% of the verified snapshot and reports both group averages
+beside `大盘占优`, `小盘占优`, or `均衡`. A 0.5 percentage-point spread is required
+before declaring either size group dominant.
+
+Post-close limit-up and limit-down counts come from AKShare's documented
+Eastmoney daily pools (`stock_zt_pool_em` and `stock_zt_pool_dtgc_em`) for the
+report's exact completed session. The report records the source and session time.
+It does not infer these counts from percentage-change thresholds because board,
+ST, IPO, and price-rounding rules make that approximation unsafe. A provider
+failure, malformed response, or session before 15:00 leaves the counts unavailable
+and marks the market module partial.
+
 ## Industry and concept analysis
 
 The postmarket report reads industry and concept board snapshots independently,
