@@ -3123,6 +3123,7 @@ def test_complete_market_breadth_counts_are_internally_consistent() -> None:
     market = _market_payload(dataset(pd.DataFrame({
         "change_pct": [1.0, -1.0, 0.0, 2.0],
         "amount": [10.0, 20.0, 30.0, 40.0],
+        "total_mv": [10.0, 20.0, 30.0, 40.0],
     })), authoritative=True)
 
     assert market["股票数量"] == 4
@@ -3133,6 +3134,21 @@ def test_complete_market_breadth_counts_are_internally_consistent() -> None:
     assert market["上涨占比"] == 50.0
     assert market["市场温度"] == "中性"
     assert market["成交额"] == 100.0
+    assert market["市场风格"] == "大盘占优"
+    assert market["大盘组平均涨跌幅"] == 2.0
+    assert market["小盘组平均涨跌幅"] == 1.0
+
+
+def test_market_style_requires_complete_positive_market_cap_evidence() -> None:
+    market = _market_payload(dataset(pd.DataFrame({
+        "change_pct": [1.0, -1.0, 0.0, 2.0],
+        "amount": [10.0, 20.0, 30.0, 40.0],
+        "total_mv": [10.0, None, 30.0, 40.0],
+    })), authoritative=True)
+
+    assert market["市场风格"] == "不可用"
+    assert "大盘组平均涨跌幅" not in market
+    assert "小盘组平均涨跌幅" not in market
 
 
 def test_incomplete_authoritative_breadth_marks_market_partial_and_summary_watch(tmp_path, deps) -> None:

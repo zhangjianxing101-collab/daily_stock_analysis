@@ -613,6 +613,30 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
     flat_count = sum(value == 0 for value in changes)
     up_ratio = up_count / len(changes) * 100
     temperature = "偏热" if up_ratio >= 60 else ("偏冷" if up_ratio <= 40 else "中性")
+    style: str = "不可用"
+    style_evidence: dict[str, float] = {}
+    if len(frame) >= 4 and "total_mv" in frame:
+        raw_market_values = frame["total_mv"]
+        try:
+            market_values = tuple(float(value) for value in pd.to_numeric(raw_market_values, errors="coerce"))
+            market_values_complete = (
+                len(market_values) == len(frame)
+                and not any(isinstance(value, (bool, np.bool_)) for value in raw_market_values.tolist())
+                and all(math.isfinite(value) and value > 0 for value in market_values)
+            )
+            if market_values_complete:
+                group_size = max(len(frame) * 3 // 10, 1)
+                ranked = sorted(zip(market_values, changes), key=lambda item: item[0])
+                small_return = math.fsum(item[1] for item in ranked[:group_size]) / group_size
+                large_return = math.fsum(item[1] for item in ranked[-group_size:]) / group_size
+                spread = large_return - small_return
+                style = "大盘占优" if spread >= 0.5 else ("小盘占优" if spread <= -0.5 else "均衡")
+                style_evidence = {
+                    "大盘组平均涨跌幅": large_return,
+                    "小盘组平均涨跌幅": small_return,
+                }
+        except (TypeError, ValueError, OverflowError):
+            pass
     return {
         **base,
         "上涨家数": up_count,
@@ -620,6 +644,8 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
         "平盘家数": flat_count,
         "上涨占比": up_ratio,
         "市场温度": temperature,
+        "市场风格": style,
+        **style_evidence,
     }
 
 
