@@ -563,9 +563,30 @@ jobs:
           printf 'prior_sector_state_path=%s\n' "$prior_sector_state_path" >> "$GITHUB_OUTPUT"
           printf 'prior_sector_warning=%s\n' "$prior_sector_warning" >> "$GITHUB_OUTPUT"
 
+      - name: Send latest archived postmarket test report
+        id: archived
+        if: ${{ github.event_name == 'workflow_dispatch' && steps.context.outputs.mode == 'postmarket' && steps.context.outputs.force == 'true' && steps.context.outputs.test_email == 'true' && steps.context.outputs.preview_only == 'false' && steps.duplicate.outputs.delivery_action == 'deliver' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+          EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD || secrets.QQEMAIL }}
+          EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+        run: |
+          printf 'final_state=hard_failure\nrunner_exit=1\nreport_key=unavailable\n' >> "$GITHUB_OUTPUT"
+          set +e
+          python scripts/send_archived_collaborative_report.py \
+            --repository "$GITHUB_REPOSITORY" \
+            --before "${{ steps.context.outputs.trading_date }}" \
+            --output-dir .workflow-artifacts
+          archived_exit=$?
+          if [ "$archived_exit" -ne 0 ]; then
+            printf 'runner_exit=%s\n' "$archived_exit" >> "$GITHUB_OUTPUT"
+          fi
+          exit 0
+
       - name: Run collaborative report
         id: runner
-        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.context.outputs.preview_only == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
+        if: ${{ steps.archived.outcome == 'skipped' && steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.context.outputs.preview_only == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
         env:
           MODE: ${{ steps.context.outputs.mode }}
           FORCE: ${{ steps.context.outputs.force }}
@@ -878,8 +899,9 @@ jobs:
         env:
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           MODE: ${{ steps.context.outputs.mode }}
-          FINAL_STATE: ${{ steps.runner.outputs.final_state || steps.duplicate.outputs.blocked_final_state || steps.claim_failure.outputs.final_state || steps.reconcile.outputs.final_state }}
-          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
+          FINAL_STATE: ${{ steps.archived.outputs.final_state || steps.runner.outputs.final_state || steps.duplicate.outputs.blocked_final_state || steps.claim_failure.outputs.final_state || steps.reconcile.outputs.final_state }}
+          RUNNER_EXIT: ${{ steps.archived.outputs.runner_exit || steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
+          ARCHIVED_REPORT_KEY: ${{ steps.archived.outputs.report_key }}
           DUPLICATE_CHECK: ${{ steps.duplicate.outputs.duplicate_check }}
           DELIVERY_ACTION: ${{ steps.duplicate.outputs.delivery_action }}
           BLOCK_REASON: ${{ steps.duplicate.outputs.block_reason }}
@@ -894,6 +916,9 @@ jobs:
             printf -- '- runner exit: %s\n' "$RUNNER_EXIT"
             printf -- '- external duplicate check: %s\n' "$DUPLICATE_CHECK"
             printf -- '- delivery action: %s\n' "$DELIVERY_ACTION"
+            if [ -n "$ARCHIVED_REPORT_KEY" ]; then
+              printf -- '- archived report key: %s\n' "$ARCHIVED_REPORT_KEY"
+            fi
             if [ -n "$BLOCK_REASON" ]; then
               printf -- '- delivery status: %s\n' "$BLOCK_REASON"
             fi
@@ -908,7 +933,7 @@ jobs:
       - name: Fail when the runner failed
         if: ${{ always() }}
         env:
-          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
+          RUNNER_EXIT: ${{ steps.archived.outputs.runner_exit || steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
         run: |
           set -euo pipefail
           if [ "$RUNNER_EXIT" -ne 0 ]; then
