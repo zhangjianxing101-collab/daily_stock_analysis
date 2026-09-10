@@ -1289,7 +1289,7 @@ def test_get_global_snapshot_supports_simple_and_multiindex_closes(multi_index: 
     result = gateway.get_global_snapshot()
 
     download.assert_called_once_with(
-        ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F"],
+        ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F", "CNY=X"],
         period="5d",
         interval="1d",
         auto_adjust=False,
@@ -1299,6 +1299,19 @@ def test_get_global_snapshot_supports_simple_and_multiindex_closes(multi_index: 
     assert result.frame["symbol"].tolist() == ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F"]
     assert result.frame["change_pct"].tolist() == pytest.approx([2.0] * 6)
     assert result.observed_at == OBSERVED_AT
+
+
+def test_get_global_snapshot_includes_optional_usd_cny_when_available() -> None:
+    raw = global_download_frame(multi_index=False)
+    raw["CNY=X"] = [7.10, 7.20]
+
+    result = MarketDataGateway(
+        yfinance_download=Mock(return_value=raw), clock=lambda: OBSERVED_AT,
+    ).get_global_snapshot()
+
+    fx = result.frame.loc[result.frame["symbol"] == "CNY=X"].iloc[0]
+    assert fx["close"] == pytest.approx(7.20)
+    assert fx["change_pct"] == pytest.approx((7.20 / 7.10 - 1) * 100)
 
 
 def test_get_global_snapshot_rejects_empty_provider_response() -> None:

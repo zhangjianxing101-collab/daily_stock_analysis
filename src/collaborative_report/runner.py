@@ -553,7 +553,26 @@ def _global_payload(dataset: MarketDataset) -> Mapping[str, Any]:
     if dataset.frame.empty:
         return {}
     rows = dataset.frame.to_dict(orient="records")
-    return {str(row.get("symbol", index)): _as_payload(row) for index, row in enumerate(rows)}
+    return {
+        "data_source": dataset.source,
+        **{str(row.get("symbol", index)): _as_payload(row) for index, row in enumerate(rows)},
+    }
+
+
+def _gold_cny_per_gram(modules: Mapping[str, ModuleResult], gold_usd_per_ounce: Any) -> float | None:
+    if not isinstance(gold_usd_per_ounce, (int, float)) or isinstance(gold_usd_per_ounce, bool):
+        return None
+    global_result = modules.get("global")
+    payload = global_result.payload if global_result is not None else {}
+    fx = payload.get("CNY=X") if isinstance(payload, Mapping) else None
+    usd_cny = fx.get("close") if isinstance(fx, Mapping) else None
+    if not isinstance(usd_cny, (int, float)) or isinstance(usd_cny, bool):
+        return None
+    if not math.isfinite(float(gold_usd_per_ounce)) or not math.isfinite(float(usd_cny)):
+        return None
+    if float(gold_usd_per_ounce) <= 0 or float(usd_cny) <= 0:
+        return None
+    return float(gold_usd_per_ounce) * float(usd_cny) / 31.1034768
 
 
 def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[str, Any]:
@@ -615,7 +634,7 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
     temperature = "偏热" if up_ratio >= 60 else ("偏冷" if up_ratio <= 40 else "中性")
     style: str = "不可用"
     style_evidence: dict[str, float] = {}
-    if len(frame) >= 4 and "total_mv" in frame:
+    if len(frame) >= 2 and "total_mv" in frame:
         raw_market_values = frame["total_mv"]
         try:
             market_values = tuple(float(value) for value in pd.to_numeric(raw_market_values, errors="coerce"))
@@ -1036,6 +1055,13 @@ def _report_delivery_blockers(
         blockers.append("screening_unavailable")
 
     if mode is ReportMode.POSTMARKET:
+        if (
+            not _finite_nonnegative(market_payload.get("成交额"))
+            or not _nonnegative_count(market_payload.get("涨停家数"))
+            or not _nonnegative_count(market_payload.get("跌停家数"))
+            or market_payload.get("市场风格") in (None, "", "不可用")
+        ):
+            blockers.append("market_overview_incomplete")
         for name in ("industry_sectors", "concept_sectors"):
             module = modules.get(name)
             payload = module.payload if module is not None and isinstance(module.payload, Mapping) else {}
@@ -1047,7 +1073,113 @@ def _report_delivery_blockers(
                 or not strongest
             ):
                 blockers.append(f"{name}_unavailable")
+        global_result = modules.get("global")
+        global_payload = global_result.payload if global_result is not None else {}
+        global_rows = (
+            [value for key, value in global_payload.items() if key != "data_source"]
+            if isinstance(global_payload, Mapping) else []
+        )
+        if (
+            global_result is None
+            or global_result.status == "unavailable"
+            or not any(isinstance(value, Mapping) and _finite_close(value.get("close")) for value in global_rows)
+        ):
+            blockers.append("global_context_unavailable")
+
+        gold = modules.get("gold")
+        gold_payload = gold.payload if gold is not None and isinstance(gold.payload, Mapping) else {}
+        gold_backtest = gold_payload.get("backtest")
+        gold_risk_checks = gold_payload.get("risk_checks")
+        if (
+            gold is None
+            or gold.status == "unavailable"
+            or not _finite_close(gold_payload.get("latest_close"))
+            or not _finite_close(gold_payload.get("china_reference_cny_per_gram"))
+            or not isinstance(gold_backtest, Mapping)
+            or not gold_backtest
+            or not isinstance(gold_risk_checks, Mapping)
+            or not gold_risk_checks
+        ):
+            blockers.append("gold_analysis_incomplete")
+
+        backtests = modules.get("backtests")
+        backtest_payload = backtests.payload if backtests is not None and isinstance(backtests.payload, Mapping) else {}
+        has_backtest_metrics = any(
+            isinstance(strategies, Mapping)
+            and bool(strategies.get("name"))
+            and any(
+                isinstance(result, Mapping)
+                and isinstance(result.get("trade_count"), (int, float))
+                and isinstance(result.get("max_drawdown"), (int, float))
+                for result in (strategies.get("short"), strategies.get("swing"))
+            )
+            for strategies in backtest_payload.values()
+        )
+        if (
+            backtests is None
+            or backtests.status == "unavailable"
+            or not has_backtest_metrics
+        ):
+            blockers.append("backtests_unavailable")
+
+        screening_payload = screening.payload if screening is not None and isinstance(screening.payload, Mapping) else {}
+        candidate_groups = (
+            screening_payload.get("短线候选"), screening_payload.get("波段候选"),
+        )
+        candidates = tuple(
+            candidate
+            for group in candidate_groups
+            if isinstance(group, (tuple, list))
+            for candidate in group
+        )
+        if not any(
+            isinstance(candidate, Mapping)
+            and isinstance(candidate.get("code"), str)
+            and len(candidate["code"]) == 6
+            and candidate["code"].isdigit()
+            and bool(candidate.get("name"))
+            for candidate in candidates
+        ):
+            blockers.append("screening_candidates_unavailable")
+
+        ai = modules.get("ai")
+        ai_payload = ai.payload if ai is not None and isinstance(ai.payload, Mapping) else {}
+        if (
+            ai is None
+            or ai.status in {"unavailable", "skipped"}
+            or not any(
+                isinstance(code, str) and len(code) == 6 and code.isdigit() and isinstance(value, Mapping)
+                and any(value.get(key) not in (None, "", (), []) for key in (
+                    "conclusion", "operation_advice", "action_label", "action",
+                    "risk_warning", "news_summary", "fundamental_analysis",
+                ))
+                for code, value in ai_payload.items()
+            )
+        ):
+            blockers.append("ai_analysis_unavailable")
     return tuple(blockers)
+
+
+def _finite_close(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) > 0
+    )
+
+
+def _finite_nonnegative(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) >= 0
+    )
+
+
+def _nonnegative_count(value: Any) -> bool:
+    return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)) and int(value) >= 0
 
 
 def _dataset_source_payload(dataset: MarketDataset) -> Mapping[str, Any]:
@@ -2617,7 +2749,12 @@ def run_report(
                 "screening",
                 status,
                 session.now_shanghai,
-                {"短线候选数": len(screening.short_term), "波段候选数": len(screening.swing)},
+                {
+                    "短线候选数": len(screening.short_term),
+                    "波段候选数": len(screening.swing),
+                    "短线候选": [_as_payload(item) for item in screening.short_term],
+                    "波段候选": [_as_payload(item) for item in screening.swing],
+                },
                 screening.warnings,
             )
         except Exception:
@@ -2660,6 +2797,21 @@ def run_report(
             screening.warnings,
         )
 
+    screening_module = modules.get("screening")
+    if screening_module is not None and screening_module.status != "unavailable":
+        modules["screening"] = ModuleResult(
+            screening_module.name,
+            screening_module.status,
+            screening_module.observed_at,
+            {
+                "短线候选数": len(screening.short_term),
+                "波段候选数": len(screening.swing),
+                "短线候选": [_as_payload(item) for item in screening.short_term],
+                "波段候选": [_as_payload(item) for item in screening.swing],
+            },
+            screening_module.warnings,
+        )
+
     backtest_codes = tuple(
         dict.fromkeys(candidate.code for candidate in (*screening.short_term, *screening.swing))
     )
@@ -2667,6 +2819,9 @@ def run_report(
         backtest_codes = tuple(portfolio_codes)
     backtest_payload: dict[str, Any] = {}
     backtest_warnings: list[str] = []
+    candidate_names = {
+        candidate.code: candidate.name for candidate in (*screening.short_term, *screening.swing)
+    }
     for code in backtest_codes:
         history = histories.get(code)
         if history is None:
@@ -2674,6 +2829,7 @@ def run_report(
             continue
         try:
             backtest_payload[code] = {
+                "name": candidate_names.get(code, "名称不可用"),
                 "short": _as_payload(active.short_backtest(history.frame, capital=settings.capital_cny)),
                 "swing": _as_payload(active.swing_backtest(history.frame, capital=settings.capital_cny)),
             }
@@ -2692,7 +2848,19 @@ def run_report(
         gold_data = active.gateway.get_gold_bars()
         gold_failure_stage = "gold_analysis_failed"
         gold = active.gold_analyzer(gold_data.frame, capital=settings.capital_cny)
-        modules["gold"] = _module("gold", gold_data.observed_at, _as_payload(gold), *gold_data.warnings)
+        projected_gold = _as_payload(gold)
+        if not isinstance(projected_gold, Mapping):
+            raise ValueError("gold analysis invalid")
+        gold_latest_close = projected_gold.get("latest_close")
+        gold_payload = {
+            **projected_gold,
+            "data_source": gold_data.source,
+            "china_reference_cny_per_gram": _gold_cny_per_gram(modules, gold_latest_close),
+        }
+        gold_warnings = gold_data.warnings
+        if gold_payload["china_reference_cny_per_gram"] is None:
+            gold_warnings = (*gold_warnings, "USD/CNY unavailable; CNY/gram reference unavailable")
+        modules["gold"] = _module("gold", gold_data.observed_at, gold_payload, *gold_warnings)
     except Exception as exc:
         modules["gold"] = _data_unavailable(
             "gold", session.now_shanghai, "黄金模块暂不可用", exc, gold_failure_stage,
@@ -2704,7 +2872,16 @@ def run_report(
         suppressed_codes,
     )
     try:
-        modules["ai"] = active.ai_enricher(ai_codes, observed_at=session.now_shanghai)
+        ai_result = active.ai_enricher(ai_codes, observed_at=session.now_shanghai)
+        if isinstance(ai_result.payload, Mapping):
+            ai_payload = {
+                code: ({"name": candidate_names.get(code, "名称不可用"), **dict(value)} if isinstance(value, Mapping) else value)
+                for code, value in ai_result.payload.items()
+            }
+            ai_result = ModuleResult(
+                ai_result.name, ai_result.status, ai_result.observed_at, ai_payload, ai_result.warnings,
+            )
+        modules["ai"] = ai_result
     except Exception:
         modules["ai"] = _unavailable("ai", session.now_shanghai, "AI分析暂不可用")
 

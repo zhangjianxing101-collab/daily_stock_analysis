@@ -82,6 +82,8 @@ _BAR_ALIASES = {
     "volume": ("volume", "Volume", "成交量"),
 }
 _GLOBAL_SYMBOLS = ("^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F")
+_OPTIONAL_GLOBAL_SYMBOLS = ("CNY=X",)
+_GLOBAL_DOWNLOAD_SYMBOLS = (*_GLOBAL_SYMBOLS, *_OPTIONAL_GLOBAL_SYMBOLS)
 _SYMBOL_CALENDARS = {
     "^GSPC": "XNYS",
     "^IXIC": "XNYS",
@@ -89,6 +91,7 @@ _SYMBOL_CALENDARS = {
     "GC=F": "CMES",
     "HG=F": "CMES",
     "CL=F": "CMES",
+    "CNY=X": "XNYS",
 }
 _THS_SOURCE = "ths.fuyao"
 _XSHG_OPEN = time(9, 30)
@@ -1181,14 +1184,15 @@ class MarketDataGateway:
                     return raw.xs("Close", axis=1, level=level, drop_level=True).copy()
             raise ValueError("global provider returned invalid data")
         if all(symbol in raw.columns for symbol in _GLOBAL_SYMBOLS):
-            return raw.loc[:, _GLOBAL_SYMBOLS].copy()
+            available = [symbol for symbol in _GLOBAL_DOWNLOAD_SYMBOLS if symbol in raw.columns]
+            return raw.loc[:, available].copy()
         raise ValueError("global provider returned invalid data")
 
     def get_global_snapshot(self) -> MarketDataset:
         observed_at = self._observed_at()
         try:
             raw = self._download(
-                list(_GLOBAL_SYMBOLS),
+                list(_GLOBAL_DOWNLOAD_SYMBOLS),
                 period="5d",
                 interval="1d",
                 auto_adjust=False,
@@ -1202,9 +1206,10 @@ class MarketDataGateway:
         closes = self._global_closes(raw)
         records: list[dict[str, object]] = []
         warnings: list[str] = []
-        for symbol in _GLOBAL_SYMBOLS:
+        for symbol in _GLOBAL_DOWNLOAD_SYMBOLS:
             if symbol not in closes.columns:
-                warnings.append(f"global close unavailable: {symbol}")
+                if symbol in _GLOBAL_SYMBOLS:
+                    warnings.append(f"global close unavailable: {symbol}")
                 continue
             values = pd.to_numeric(closes[symbol], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
             latest_completed = _latest_completed_session_date(symbol, observed_at)
@@ -1212,12 +1217,14 @@ class MarketDataGateway:
             values = values.loc[completed]
             values = values.sort_index()
             if len(values) < 2:
-                warnings.append(f"global close unavailable: {symbol}")
+                if symbol in _GLOBAL_SYMBOLS:
+                    warnings.append(f"global close unavailable: {symbol}")
                 continue
             previous_close = float(values.iloc[-2])
             close = float(values.iloc[-1])
             if previous_close <= 0 or close <= 0:
-                warnings.append(f"global close unavailable: {symbol}")
+                if symbol in _GLOBAL_SYMBOLS:
+                    warnings.append(f"global close unavailable: {symbol}")
                 continue
             records.append(
                 {

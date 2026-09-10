@@ -5,7 +5,7 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date, datetime, timedelta, tzinfo
+from datetime import date, datetime, time, timedelta, tzinfo
 from pathlib import Path
 from unittest.mock import Mock, call, patch
 from zoneinfo import ZoneInfo
@@ -38,6 +38,7 @@ from src.collaborative_report.runner import (
 from src.collaborative_report.runner import (
     _PRIOR_SECTOR_MANIFEST_MAX_BYTES,
     _decision_summary,
+    _gold_cny_per_gram,
     _report_delivery_blockers,
     _load_prior_sector_state,
     _market_payload,
@@ -66,6 +67,20 @@ def test_sector_source_may_follow_report_start_when_received_later() -> None:
     received = datetime(2026, 8, 19, 15, 6, tzinfo=SHANGHAI)
 
     assert _trusted_sector_snapshot_timestamp(source, received, report_start) == source
+
+
+def test_gold_cny_per_gram_uses_verified_global_fx_snapshot() -> None:
+    modules = {
+        "global": ModuleResult(
+            "global", "ok", NOW,
+            {"CNY=X": {"close": 7.2, "as_of_date": "2026-08-18"}}, (),
+        ),
+    }
+
+    assert _gold_cny_per_gram(modules, 3_000.0) == pytest.approx(694.4562, rel=1e-5)
+    assert _gold_cny_per_gram({}, 3_000.0) is None
+
+
 PORTFOLIO_CODE = "600000"
 CANDIDATE_CODE = "600001"
 SECTOR_STATE_KEYS = (
@@ -228,7 +243,17 @@ class FakeGateway:
         return self.sector_snapshots[sector_type]
 
     def get_global_snapshot(self):
-        return dataset(pd.DataFrame([{"symbol": "^GSPC", "change_pct": 0.5}]))
+        return dataset(pd.DataFrame([
+            {"symbol": "^GSPC", "close": 6_000.0, "previous_close": 5_970.0, "change_pct": 0.5, "as_of_date": date(2026, 8, 18)},
+            {"symbol": "GC=F", "close": 3_000.0, "previous_close": 2_990.0, "change_pct": 0.33, "as_of_date": date(2026, 8, 18)},
+            {"symbol": "CNY=X", "close": 7.2, "previous_close": 7.19, "change_pct": 0.14, "as_of_date": date(2026, 8, 18)},
+        ]))
+
+    def get_limit_counts(self, expected_session):
+        return replace(
+            dataset(pd.DataFrame([{"limit_up_count": 42, "limit_down_count": 7}]), "fixture.limit-pools"),
+            source_timestamp=datetime.combine(expected_session, time(15, 0), tzinfo=SHANGHAI),
+        )
 
     def get_gold_bars(self):
         return dataset(bars())
@@ -269,10 +294,22 @@ def deps(settings) -> RunnerDependencies:
         gateway=gateway,
         screener=lambda *args, **kwargs: ScreeningResult((candidate(),), ()),
         risk_evaluator=lambda position, price, capital: {"状态": "正常"},
-        short_backtest=lambda frame, **kwargs: {"strategy": "short", "trade_count": 3},
-        swing_backtest=lambda frame, **kwargs: {"strategy": "swing", "trade_count": 4},
-        gold_analyzer=lambda frame, **kwargs: {"direction": "neutral"},
-        ai_enricher=lambda codes, **kwargs: ModuleResult("ai", "ok", NOW, {"count": len(tuple(codes))}),
+        short_backtest=lambda frame, **kwargs: {
+            "strategy": "short", "trade_count": 3, "max_drawdown": 0.05,
+        },
+        swing_backtest=lambda frame, **kwargs: {
+            "strategy": "swing", "trade_count": 4, "max_drawdown": 0.08,
+        },
+        gold_analyzer=lambda frame, **kwargs: {
+            "direction": "neutral", "signal": "hold", "risk_level": "low", "watch_only": False,
+            "latest_close": 3_000.0, "fast_ma": 2_980.0, "slow_ma": 2_900.0,
+            "backtest": {"trade_count": 12, "max_drawdown": 0.08, "win_rate": 0.5},
+            "risk_checks": {"single_trade_risk_limit": 0.02, "drawdown_pause": 0.10},
+        },
+        ai_enricher=lambda codes, **kwargs: ModuleResult(
+            "ai", "ok", NOW,
+            {code: {"conclusion": "fixture analysis"} for code in tuple(codes)},
+        ),
         renderer=renderer,
         mail_sender=mailer,
         data_session_resolver=lambda mode, report_date, generated_at: report_date,
@@ -1875,14 +1912,54 @@ def test_incomplete_preview_remains_available_for_diagnostics(tmp_path, deps) ->
 
 def test_postmarket_delivery_requires_both_sector_rankings() -> None:
     modules = {
-        "market": ModuleResult("market", "ok", NOW, {"上涨占比": 60.0}),
-        "screening": ModuleResult("screening", "ok", NOW, {"短线候选数": 0, "波段候选数": 0}),
+        "market": ModuleResult("market", "ok", NOW, {
+            "上涨占比": 60.0, "成交额": 100_000_000.0,
+            "涨停家数": 1, "跌停家数": 0, "市场风格": "均衡",
+        }),
+        "screening": ModuleResult("screening", "ok", NOW, {
+            "短线候选数": 1, "波段候选数": 0,
+            "短线候选": [{"code": "600001", "name": "示例股份"}], "波段候选": [],
+        }),
         "industry_sectors": ModuleResult("industry_sectors", "ok", NOW, {"strongest": [{}]}),
         "concept_sectors": ModuleResult("concept_sectors", "unavailable", NOW, {}),
+        "global": ModuleResult("global", "ok", NOW, {"^GSPC": {"close": 6_000.0}}),
+        "gold": ModuleResult("gold", "ok", NOW, {
+            "latest_close": 3_000.0, "china_reference_cny_per_gram": 694.45,
+            "backtest": {"trade_count": 12}, "risk_checks": {"drawdown_pause": 0.10},
+        }),
+        "backtests": ModuleResult("backtests", "ok", NOW, {
+            "600001": {
+                "name": "示例股份",
+                "short": {"trade_count": 3, "max_drawdown": 0.05},
+            },
+        }),
+        "ai": ModuleResult("ai", "ok", NOW, {"600001": {"conclusion": "趋势偏强"}}),
     }
 
     assert _report_delivery_blockers(ReportMode.POSTMARKET, modules) == (
         "concept_sectors_unavailable",
+    )
+
+
+def test_postmarket_delivery_blocks_every_empty_analysis_section() -> None:
+    modules = {
+        "market": ModuleResult("market", "ok", NOW, {"上涨占比": 60.0}),
+        "screening": ModuleResult("screening", "ok", NOW, {"短线候选数": 0, "波段候选数": 0}),
+        "industry_sectors": ModuleResult("industry_sectors", "ok", NOW, {"strongest": [{}]}),
+        "concept_sectors": ModuleResult("concept_sectors", "ok", NOW, {"strongest": [{}]}),
+        "global": ModuleResult("global", "unavailable", NOW, {}),
+        "gold": ModuleResult("gold", "ok", NOW, {"latest_close": 3_000.0}),
+        "backtests": ModuleResult("backtests", "unavailable", NOW, {}),
+        "ai": ModuleResult("ai", "skipped", NOW, {}),
+    }
+
+    assert _report_delivery_blockers(ReportMode.POSTMARKET, modules) == (
+        "market_overview_incomplete",
+        "global_context_unavailable",
+        "gold_analysis_incomplete",
+        "backtests_unavailable",
+        "screening_candidates_unavailable",
+        "ai_analysis_unavailable",
     )
 
 
@@ -2743,6 +2820,26 @@ def test_market_overview_has_safe_breadth_semantics_and_decision_summary(tmp_pat
     }
     assert "人工确认" in summary.payload["操作建议"]
     assert deps.mail_sender.assert_not_called() is None
+
+
+def test_report_modules_preserve_names_and_complete_analysis_details(tmp_path, deps) -> None:
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=deps,
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    screening = result.modules["screening"].payload
+    assert screening["短线候选"][0]["name"] == "示例股份"
+    assert screening["短线候选"][0]["industry_sector"] == "示例板块"
+    assert result.modules["backtests"].payload[CANDIDATE_CODE]["name"] == "示例股份"
+    assert result.modules["backtests"].payload[CANDIDATE_CODE]["short"]["max_drawdown"] == 0.05
+    assert result.modules["gold"].payload["china_reference_cny_per_gram"] == pytest.approx(694.4562, rel=1e-5)
+    assert result.modules["gold"].payload["backtest"]["trade_count"] == 12
+    assert result.modules["ai"].payload[CANDIDATE_CODE]["name"] == "示例股份"
+    assert result.modules["ai"].payload[CANDIDATE_CODE]["conclusion"] == "fixture analysis"
 
 
 def test_market_overview_includes_verified_limit_pool_counts(tmp_path, deps) -> None:
