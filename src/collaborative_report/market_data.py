@@ -556,6 +556,7 @@ class MarketDataGateway:
         self._clock = clock or (lambda: datetime.now(timezone.utc))
         self._latest_full_snapshot: pd.DataFrame | None = None
         self._latest_full_snapshot_timestamp: datetime | None = None
+        self._latest_leading_industry_codes: dict[str, str] = {}
 
     def _observed_at(self) -> datetime:
         return self._clock()
@@ -869,6 +870,17 @@ class MarketDataGateway:
         return MarketDataset(normalized, _THS_SOURCE + ".index_historical", observed_at, warnings, source_timestamp)
 
     def get_leading_sector_codes(self, limit: int = 10) -> MarketDataset:
+        if self._ths_client is not None and self._latest_leading_industry_codes:
+            allowed_sectors = tuple(dict.fromkeys(self._latest_leading_industry_codes.values()))[:max(limit, 0)]
+            frame = pd.DataFrame(
+                (
+                    {"code": code, "sector": sector}
+                    for code, sector in self._latest_leading_industry_codes.items()
+                    if sector in allowed_sectors
+                ),
+                columns=["code", "sector"],
+            )
+            return MarketDataset(frame, _THS_SOURCE + ".index_constituents", self._observed_at())
         try:
             if self._sector_names_fetcher is None or self._sector_members_fetcher is None:
                 import akshare
@@ -1029,6 +1041,7 @@ class MarketDataGateway:
             raw,
             client,
             received_at,
+            sector_type=sector_type,
         )
         normalized, normalization_warnings = _normalize_sector_snapshot(raw, sector_type)
         missing = len(names) - len(seen)
@@ -1054,9 +1067,13 @@ class MarketDataGateway:
         rows: pd.DataFrame,
         client: ThsMarketDataClient,
         received_at: datetime,
+        *,
+        sector_type: str,
     ) -> tuple[pd.DataFrame, datetime, tuple[str, ...]]:
         """Derive breadth and leaders for displayed sectors from the full stock snapshot."""
 
+        if sector_type == "industry":
+            self._latest_leading_industry_codes = {}
         snapshot = self._latest_full_snapshot
         if snapshot is None or snapshot.empty or "thscode" not in rows or "change_pct" not in rows:
             return rows, received_at, ()
@@ -1082,6 +1099,10 @@ class MarketDataGateway:
                     for code in (_optional_canonical_code(str(item.get("thscode", ""))[:6]),)
                     if code is not None
                 }
+                if sector_type == "industry" and index in ranked.head(20).index:
+                    sector_name = str(enriched.at[index, "name"]).strip()
+                    for code in sorted(member_codes):
+                        self._latest_leading_industry_codes.setdefault(code, sector_name)
                 members = quotes.loc[quotes.index.intersection(member_codes)].copy()
                 changes = pd.to_numeric(members["change_pct"], errors="coerce")
                 valid = np.isfinite(changes)

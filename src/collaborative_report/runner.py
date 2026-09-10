@@ -2477,17 +2477,6 @@ def run_report(
         )
         prices = {code: price for code, price in prices.items() if code not in untrusted_codes}
 
-    leading: dict[str, str] = {}
-    try:
-        sectors = active.gateway.get_leading_sector_codes()
-        if {"code", "sector"}.issubset(sectors.frame.columns):
-            leading = {
-                str(row["code"]): str(row["sector"])
-                for _, row in sectors.frame.iterrows()
-            }
-    except Exception:
-        pass
-
     sector_analyses: dict[str, SectorAnalysis] = {}
     sector_source_timestamps: dict[str, datetime | None] = {}
     sector_manifest_timestamps: dict[str, str] = {}
@@ -2530,6 +2519,17 @@ def run_report(
                         module.payload,
                         tuple(dict.fromkeys((*module.warnings, _SECTOR_STATE_WARNING))),
                     )
+
+    leading: dict[str, str] = {}
+    try:
+        sectors = active.gateway.get_leading_sector_codes()
+        if {"code", "sector"}.issubset(sectors.frame.columns):
+            leading = {
+                str(row["code"]): str(row["sector"])
+                for _, row in sectors.frame.iterrows()
+            }
+    except Exception:
+        pass
 
     screening = ScreeningResult((), ())
     if snapshot is None or not histories:

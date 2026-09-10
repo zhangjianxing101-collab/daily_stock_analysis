@@ -1038,6 +1038,12 @@ def test_ths_sector_snapshot_derives_breadth_and_leader_from_cached_full_snapsho
     assert row["leader_name"] == "Leader"
     assert row["leader_code"] == "600000"
     assert row["leader_change_pct"] == 1.2
+    leading = gateway.get_leading_sector_codes()
+    assert leading.source == "ths.fuyao.index_constituents"
+    assert leading.frame.to_dict("records") == [
+        {"code": "600000", "sector": "Industry A"},
+        {"code": "600001", "sector": "Industry A"},
+    ]
     client.ths_index_constituents.assert_called_once_with("881001.TI")
 
 

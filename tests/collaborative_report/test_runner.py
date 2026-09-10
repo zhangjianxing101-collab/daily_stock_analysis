@@ -7,7 +7,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
 from datetime import date, datetime, timedelta, tzinfo
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -2660,6 +2660,25 @@ def test_postmarket_runs_independent_sector_modules_and_persists_safe_state(tmp_
     assert manifest["module_statuses"]["industry_sectors"] == "partial"
     assert {row["sector_type"] for row in manifest["sector_state"]} == {"industry", "concept"}
     deps.mail_sender.assert_not_called()
+
+
+def test_postmarket_builds_sector_snapshots_before_leading_membership_map(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    calls = Mock()
+    calls.attach_mock(Mock(wraps=gateway.get_sector_snapshot), "sector")
+    calls.attach_mock(Mock(wraps=gateway.get_leading_sector_codes), "leading")
+    gateway.get_sector_snapshot = calls.sector
+    gateway.get_leading_sector_codes = calls.leading
+
+    run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert calls.mock_calls.index(call.sector("concept")) < calls.mock_calls.index(call.leading())
 
 
 def test_postmarket_sector_source_failure_does_not_suppress_other_module(tmp_path, deps) -> None:
