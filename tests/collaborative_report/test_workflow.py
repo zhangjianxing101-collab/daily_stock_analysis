@@ -292,6 +292,24 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
     assert "github.event." not in all_run_content
 
 
+def test_workflow_preserves_non_trading_day_skip_and_transfers_exact_session_snapshot() -> None:
+    workflow = _workflow()
+    data_session = _step(workflow, "Resolve report data session")
+    prior_market = _step(workflow, "Extract prior market snapshot")
+    runner = _step(workflow, "Run collaborative report")
+
+    assert 'str(exc) != "report date is not an XSHG session"' in data_session["run"]
+    assert "session = trading_date" in data_session["run"]
+    assert prior_market["env"]["EXPECTED_SESSION"] == "${{ steps.data_session.outputs.date }}"
+    assert prior_market["env"]["EXPECTED_BRANCH"] == "${{ github.event.repository.default_branch }}"
+    assert "read_a_share_snapshot_archive" in prior_market["run"]
+    assert 'run.get("head_branch") == expected_branch' in prior_market["run"]
+    assert "[:5]" in prior_market["run"]
+    assert runner["env"]["PRIOR_MARKET_SNAPSHOT_PATH"] == "${{ steps.prior_market.outputs.path }}"
+    assert 'args+=(--prior-market-snapshot "$PRIOR_MARKET_SNAPSHOT_PATH")' in runner["run"]
+    assert 'args+=(--market-snapshot-output ".workflow-artifacts/market-snapshot.json")' in runner["run"]
+
+
 def test_workflow_uses_external_duplicate_check_and_redacted_postmarket_prior_state() -> None:
     workflow = _workflow()
     duplicate_check = _step(workflow, "Check external sent marker")

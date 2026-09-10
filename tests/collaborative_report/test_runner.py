@@ -595,6 +595,28 @@ def test_premarket_restores_exact_previous_close_snapshot_archive(tmp_path, deps
     gateway.get_a_share_snapshot.assert_not_called()
 
 
+def test_premarket_invalid_archive_falls_back_to_live_snapshot(tmp_path, deps) -> None:
+    archive = tmp_path / "prior-market-snapshot.json"
+    archive.write_text("invalid", encoding="utf-8")
+    gateway = FakeGateway()
+    live_snapshot = Mock(return_value=gateway.snapshot)
+    gateway.get_a_share_snapshot = live_snapshot
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        prior_market_snapshot=archive,
+        output_dir=tmp_path / "reports",
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert result.modules["market"].status == "partial"
+    assert "prior_market_snapshot_unavailable" in result.modules["market"].warnings
+    live_snapshot.assert_called_once_with()
+
+
 def test_postmarket_writes_completed_session_snapshot_archive(tmp_path, deps) -> None:
     archive = tmp_path / "market-snapshot.json"
 

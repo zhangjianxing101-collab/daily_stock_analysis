@@ -167,6 +167,8 @@ def test_repository_entrypoint_help_executes_without_running_report() -> None:
     assert "--mode {premarket,postmarket}" in completed.stdout
     assert "--already-sent" in completed.stdout
     assert "--prior-sector-report" in completed.stdout
+    assert "--prior-market-snapshot" in completed.stdout
+    assert "--market-snapshot-output" in completed.stdout
     assert "--ledger-status" in completed.stdout
     assert "--reconcile-sent" in completed.stdout
     assert "--reconcile-failed" in completed.stdout

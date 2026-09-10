@@ -138,11 +138,18 @@ jobs:
           from src.collaborative_report.models import ReportMode
           from src.collaborative_report.session import report_data_session
 
-          session = report_data_session(
-              ReportMode(os.environ["MODE"]),
-              date.fromisoformat(os.environ["TRADING_DATE"]),
-              datetime.now(ZoneInfo("Asia/Shanghai")),
-          )
+          trading_date = date.fromisoformat(os.environ["TRADING_DATE"])
+          try:
+              session = report_data_session(
+                  ReportMode(os.environ["MODE"]),
+                  trading_date,
+                  datetime.now(ZoneInfo("Asia/Shanghai")),
+              )
+          except RuntimeError as exc:
+              if str(exc) != "report date is not an XSHG session":
+                  raise
+              # Let the runner retain its successful non-trading-day skip.
+              session = trading_date
           print(f"date={session.isoformat()}")
           print(f"artifact=market-snapshot-{session.isoformat()}")
           PY
@@ -445,19 +452,21 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           MARKET_SNAPSHOT_ARTIFACT: ${{ steps.data_session.outputs.artifact }}
           EXPECTED_SESSION: ${{ steps.data_session.outputs.date }}
+          EXPECTED_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           prior_market_snapshot=""
           mkdir -p .workflow-artifacts/prior-market
           : > .workflow-artifacts/prior-market-candidates.tsv
           if gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$MARKET_SNAPSHOT_ARTIFACT&per_page=100" > .workflow-artifacts/prior-market-metadata.json 2>/dev/null; then
-            MARKET_SNAPSHOT_ARTIFACT="$MARKET_SNAPSHOT_ARTIFACT" python - <<'PY'
+            MARKET_SNAPSHOT_ARTIFACT="$MARKET_SNAPSHOT_ARTIFACT" EXPECTED_BRANCH="$EXPECTED_BRANCH" python - <<'PY'
           import json
           import os
           from pathlib import Path
 
           pages = json.loads(Path(".workflow-artifacts/prior-market-metadata.json").read_text(encoding="utf-8"))
           expected = os.environ["MARKET_SNAPSHOT_ARTIFACT"]
+          expected_branch = os.environ["EXPECTED_BRANCH"]
           candidates = []
           for page in pages if isinstance(pages, list) else []:
               for artifact in page.get("artifacts", ()) if isinstance(page, dict) else ():
@@ -467,6 +476,7 @@ jobs:
                       and artifact.get("name") == expected
                       and artifact.get("expired") is False
                       and isinstance(run, dict)
+                      and run.get("head_branch") == expected_branch
                       and str(artifact.get("id", "")).isdigit()
                       and str(run.get("id", "")).isdigit()
                       and isinstance(artifact.get("created_at"), str)

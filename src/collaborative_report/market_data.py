@@ -161,12 +161,18 @@ def write_a_share_snapshot_archive(
     frame = normalize_a_share_snapshot(dataset.frame)
     if frame.empty or frame["code"].duplicated().any():
         raise ValueError("snapshot archive frame invalid")
+    quality = {}
+    for key in ("provider_row_count", "quarantined_row_count", "screening_complete_count"):
+        value = dataset.frame.attrs.get(key)
+        if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)) and int(value) >= 0:
+            quality[key] = int(value)
     payload = {
         "schema_version": _SNAPSHOT_ARCHIVE_SCHEMA_VERSION,
         "session": expected_session.isoformat(),
         "source": dataset.source,
         "source_timestamp": source_timestamp.isoformat(),
         "warnings": list(dataset.warnings),
+        "quality": quality,
         "frame": json.loads(frame.to_json(orient="records", force_ascii=False)),
     }
     target = Path(path)
@@ -192,14 +198,14 @@ def read_a_share_snapshot_archive(
 
     if observed_at.tzinfo is None or observed_at.utcoffset() is None:
         raise ValueError("observed_at must be timezone-aware")
-    source_path = Path(path)
-    if source_path.is_symlink() or source_path.stat().st_size > _SNAPSHOT_ARCHIVE_MAX_BYTES:
-        raise ValueError("snapshot archive invalid")
     try:
+        source_path = Path(path)
+        if source_path.is_symlink() or source_path.stat().st_size > _SNAPSHOT_ARCHIVE_MAX_BYTES:
+            raise ValueError
         payload = json.loads(source_path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
         raise ValueError("snapshot archive invalid") from None
-    required = {"schema_version", "session", "source", "source_timestamp", "warnings", "frame"}
+    required = {"schema_version", "session", "source", "source_timestamp", "warnings", "quality", "frame"}
     if not isinstance(payload, dict) or set(payload) != required:
         raise ValueError("snapshot archive invalid")
     if payload["schema_version"] != _SNAPSHOT_ARCHIVE_SCHEMA_VERSION:
@@ -210,7 +216,15 @@ def read_a_share_snapshot_archive(
         raise ValueError("snapshot archive invalid")
     if not isinstance(payload["warnings"], list) or not all(isinstance(item, str) for item in payload["warnings"]):
         raise ValueError("snapshot archive invalid")
-    if not isinstance(payload["frame"], list):
+    if not isinstance(payload["quality"], dict) or any(
+        key not in {"provider_row_count", "quarantined_row_count", "screening_complete_count"}
+        or not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        for key, value in payload["quality"].items()
+    ):
+        raise ValueError("snapshot archive invalid")
+    if not isinstance(payload["frame"], list) or not all(isinstance(row, dict) for row in payload["frame"]):
         raise ValueError("snapshot archive invalid")
     try:
         source_timestamp = pd.Timestamp(payload["source_timestamp"])
@@ -223,9 +237,10 @@ def read_a_share_snapshot_archive(
     if source_local.date() != expected_session or source_local.time() < _XSHG_CLOSE:
         raise ValueError("snapshot archive session invalid")
     frame = normalize_a_share_snapshot(pd.DataFrame(payload["frame"]))
-    if frame.empty or frame["code"].duplicated().any():
+    if frame.empty or len(frame) != len(payload["frame"]) or frame["code"].duplicated().any():
         raise ValueError("snapshot archive frame invalid")
     complete = frame.loc[:, _SNAPSHOT_COLUMNS[:-1]].notna().all(axis=1)
+    frame.attrs.update(payload["quality"])
     frame.attrs["screening_complete_count"] = int(complete.sum())
     return MarketDataset(
         frame,

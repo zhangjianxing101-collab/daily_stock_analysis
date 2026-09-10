@@ -2529,13 +2529,18 @@ def run_report(
     snapshot: MarketDataset | None
     snapshot_source_is_authoritative = False
     market_source_timestamp = "unavailable"
+    snapshot_fetch_warnings: tuple[str, ...] = ()
     try:
         if normalized_mode is ReportMode.PREMARKET and prior_market_snapshot is not None:
-            snapshot = read_a_share_snapshot_archive(
-                prior_market_snapshot,
-                expected_session=expected_session,
-                observed_at=active.clock(),
-            )
+            try:
+                snapshot = read_a_share_snapshot_archive(
+                    prior_market_snapshot,
+                    expected_session=expected_session,
+                    observed_at=active.clock(),
+                )
+            except Exception:
+                snapshot_fetch_warnings = ("prior_market_snapshot_unavailable",)
+                snapshot = active.gateway.get_a_share_snapshot()
         else:
             snapshot = active.gateway.get_a_share_snapshot()
     except Exception as exc:
@@ -2561,7 +2566,7 @@ def run_report(
             )
             if snapshot_source_is_authoritative and snapshot.source_timestamp is not None:
                 market_source_timestamp = snapshot.source_timestamp.isoformat()
-            market_warnings = snapshot.warnings
+            market_warnings = (*snapshot.warnings, *snapshot_fetch_warnings)
             market_payload = _market_payload(
                 snapshot,
                 authoritative=snapshot_source_is_authoritative,
