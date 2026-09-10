@@ -23,7 +23,12 @@ from .ai_bridge import enrich_codes
 from .backtest import backtest_breakout, backtest_swing
 from .gold import analyze_gold
 from .mailer import DeliveryInDoubtError, DeliveryNotAcceptedError, send_with_retry
-from .market_data import MarketDataGateway, MarketDataset
+from .market_data import (
+    MarketDataGateway,
+    MarketDataset,
+    read_a_share_snapshot_archive,
+    write_a_share_snapshot_archive,
+)
 from .models import Candidate, ModuleResult, Position, ReportMode
 from .news_intel import fetch_market_news
 from .report import RenderedReport, render_report
@@ -2379,6 +2384,8 @@ def run_report(
     already_sent: bool = False,
     prior_report: Path | str | None = None,
     prior_sector_report: Path | str | None = None,
+    prior_market_snapshot: Path | str | None = None,
+    market_snapshot_output: Path | str | None = None,
     output_dir: Path | str = "reports/collaborative",
 ) -> RunResult:
     """Run one report without leaking third-party exception text to its result."""
@@ -2523,7 +2530,14 @@ def run_report(
     snapshot_source_is_authoritative = False
     market_source_timestamp = "unavailable"
     try:
-        snapshot = active.gateway.get_a_share_snapshot()
+        if normalized_mode is ReportMode.PREMARKET and prior_market_snapshot is not None:
+            snapshot = read_a_share_snapshot_archive(
+                prior_market_snapshot,
+                expected_session=expected_session,
+                observed_at=active.clock(),
+            )
+        else:
+            snapshot = active.gateway.get_a_share_snapshot()
     except Exception as exc:
         snapshot = None
         modules["market"] = _data_unavailable(
@@ -2604,6 +2618,26 @@ def run_report(
                 market_payload,
                 tuple(dict.fromkeys(market_warnings)),
             )
+            if (
+                normalized_mode is ReportMode.POSTMARKET
+                and snapshot_source_is_authoritative
+                and market_snapshot_output is not None
+            ):
+                try:
+                    write_a_share_snapshot_archive(
+                        market_snapshot_output,
+                        snapshot,
+                        expected_session=expected_session,
+                    )
+                except Exception:
+                    market = modules["market"]
+                    modules["market"] = ModuleResult(
+                        market.name,
+                        "partial",
+                        market.observed_at,
+                        market.payload,
+                        tuple(dict.fromkeys((*market.warnings, "market_snapshot_archive_failed"))),
+                    )
         except Exception as exc:
             snapshot = None
             modules["market"] = _data_unavailable(

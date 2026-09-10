@@ -67,6 +67,8 @@ def test_cli_passes_all_task_9_arguments_and_returns_success(tmp_path, capsys) -
         already_sent=True,
         prior_report=prior,
         prior_sector_report=prior_sector,
+        prior_market_snapshot=None,
+        market_snapshot_output=None,
         output_dir=tmp_path,
     )
     output = capsys.readouterr().out

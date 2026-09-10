@@ -686,11 +686,14 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
         "Upload in-doubt marker",
         "Upload production delivery claim",
         "Upload safe provider quality counts",
+        "Upload completed-session market snapshot",
     }
     assert by_name["Upload private report"]["with"]["name"] == "${{ steps.runner.outputs.report_artifact_name }}"
     assert by_name["Upload diagnostic manifest"]["with"]["name"] == "diagnostic-${{ steps.context.outputs.report_key }}"
     assert by_name["Upload sent marker"]["with"]["name"] == "sent-${{ steps.context.outputs.report_key }}"
     assert by_name["Upload production delivery claim"]["with"]["name"] == "claim-${{ steps.context.outputs.report_key }}"
+    assert by_name["Upload completed-session market snapshot"]["with"]["name"] == "${{ steps.data_session.outputs.artifact }}"
+    assert by_name["Upload completed-session market snapshot"]["with"]["path"] == ".workflow-artifacts/market-snapshot.json"
     assert all(step["with"]["retention-days"] == ("3" if step["name"] == "Upload safe provider quality counts" else "7")
                for step in uploads)
     probe = _step(workflow, "Probe provider quality for previews")
