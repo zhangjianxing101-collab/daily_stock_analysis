@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime, time, timedelta, timezone
+import json
 import logging
+import os
+from pathlib import Path
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -96,6 +99,8 @@ _SYMBOL_CALENDARS = {
 _THS_SOURCE = "ths.fuyao"
 _XSHG_OPEN = time(9, 30)
 _XSHG_CLOSE = time(15, 0)
+_SNAPSHOT_ARCHIVE_SCHEMA_VERSION = 1
+_SNAPSHOT_ARCHIVE_MAX_BYTES = 16 * 1024 * 1024
 logger = logging.getLogger(__name__)
 _THS_FAILURE_CODES = {
     ThsAuthenticationError: "ths_authentication_failed",
@@ -137,6 +142,113 @@ class MarketDataset:
             self.source_timestamp.tzinfo is None or self.source_timestamp.utcoffset() is None
         ):
             raise ValueError("source_timestamp must be timezone-aware")
+
+
+def write_a_share_snapshot_archive(
+    path: Path | str,
+    dataset: MarketDataset,
+    *,
+    expected_session: date,
+) -> None:
+    """Persist a validated completed-session snapshot for the next premarket run."""
+
+    source_timestamp = dataset.source_timestamp
+    if source_timestamp is None:
+        raise ValueError("snapshot archive source timestamp unavailable")
+    source_local = source_timestamp.astimezone(ZoneInfo("Asia/Shanghai"))
+    if source_local.date() != expected_session or source_local.time() < _XSHG_CLOSE:
+        raise ValueError("snapshot archive session invalid")
+    frame = normalize_a_share_snapshot(dataset.frame)
+    if frame.empty or frame["code"].duplicated().any():
+        raise ValueError("snapshot archive frame invalid")
+    quality = {}
+    for key in ("provider_row_count", "quarantined_row_count", "screening_complete_count"):
+        value = dataset.frame.attrs.get(key)
+        if isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)) and int(value) >= 0:
+            quality[key] = int(value)
+    payload = {
+        "schema_version": _SNAPSHOT_ARCHIVE_SCHEMA_VERSION,
+        "session": expected_session.isoformat(),
+        "source": dataset.source,
+        "source_timestamp": source_timestamp.isoformat(),
+        "warnings": list(dataset.warnings),
+        "quality": quality,
+        "frame": json.loads(frame.to_json(orient="records", force_ascii=False)),
+    }
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{os.getpid()}.tmp")
+    try:
+        temporary.write_text(
+            json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n",
+            encoding="utf-8",
+        )
+        temporary.replace(target)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def read_a_share_snapshot_archive(
+    path: Path | str,
+    *,
+    expected_session: date,
+    observed_at: datetime,
+) -> MarketDataset:
+    """Load only an exact-session, post-close snapshot archive."""
+
+    if observed_at.tzinfo is None or observed_at.utcoffset() is None:
+        raise ValueError("observed_at must be timezone-aware")
+    try:
+        source_path = Path(path)
+        if source_path.is_symlink() or source_path.stat().st_size > _SNAPSHOT_ARCHIVE_MAX_BYTES:
+            raise ValueError
+        payload = json.loads(source_path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError):
+        raise ValueError("snapshot archive invalid") from None
+    required = {"schema_version", "session", "source", "source_timestamp", "warnings", "quality", "frame"}
+    if not isinstance(payload, dict) or set(payload) != required:
+        raise ValueError("snapshot archive invalid")
+    if payload["schema_version"] != _SNAPSHOT_ARCHIVE_SCHEMA_VERSION:
+        raise ValueError("snapshot archive invalid")
+    if payload["session"] != expected_session.isoformat():
+        raise ValueError("snapshot archive session invalid")
+    if not isinstance(payload["source"], str) or not payload["source"].strip():
+        raise ValueError("snapshot archive invalid")
+    if not isinstance(payload["warnings"], list) or not all(isinstance(item, str) for item in payload["warnings"]):
+        raise ValueError("snapshot archive invalid")
+    if not isinstance(payload["quality"], dict) or any(
+        key not in {"provider_row_count", "quarantined_row_count", "screening_complete_count"}
+        or not isinstance(value, int)
+        or isinstance(value, bool)
+        or value < 0
+        for key, value in payload["quality"].items()
+    ):
+        raise ValueError("snapshot archive invalid")
+    if not isinstance(payload["frame"], list) or not all(isinstance(row, dict) for row in payload["frame"]):
+        raise ValueError("snapshot archive invalid")
+    try:
+        source_timestamp = pd.Timestamp(payload["source_timestamp"])
+        if pd.isna(source_timestamp) or source_timestamp.tzinfo is None:
+            raise ValueError
+        source_timestamp = source_timestamp.to_pydatetime()
+    except (TypeError, ValueError):
+        raise ValueError("snapshot archive source timestamp invalid") from None
+    source_local = source_timestamp.astimezone(ZoneInfo("Asia/Shanghai"))
+    if source_local.date() != expected_session or source_local.time() < _XSHG_CLOSE:
+        raise ValueError("snapshot archive session invalid")
+    frame = normalize_a_share_snapshot(pd.DataFrame(payload["frame"]))
+    if frame.empty or len(frame) != len(payload["frame"]) or frame["code"].duplicated().any():
+        raise ValueError("snapshot archive frame invalid")
+    complete = frame.loc[:, _SNAPSHOT_COLUMNS[:-1]].notna().all(axis=1)
+    frame.attrs.update(payload["quality"])
+    frame.attrs["screening_complete_count"] = int(complete.sum())
+    return MarketDataset(
+        frame,
+        f"archive:{payload['source']}",
+        observed_at,
+        tuple(payload["warnings"]),
+        source_timestamp,
+    )
 
 
 def _snapshot_source_timestamp(raw: pd.DataFrame) -> tuple[datetime | None, tuple[str, ...]]:

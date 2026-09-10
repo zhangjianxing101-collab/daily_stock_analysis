@@ -16,7 +16,11 @@ import pytest
 from src.collaborative_report.ai_bridge import enrich_codes
 from src.collaborative_report.backtest import backtest_breakout, backtest_swing
 from src.collaborative_report.gold import analyze_gold
-from src.collaborative_report.market_data import MarketDataGateway, MarketDataset
+from src.collaborative_report.market_data import (
+    MarketDataGateway,
+    MarketDataset,
+    write_a_share_snapshot_archive,
+)
 from src.collaborative_report.models import Candidate, ModuleResult, Position, ReportMode
 from src.collaborative_report.report import RenderedReport, render_report
 from src.collaborative_report.risk import evaluate_position, suggested_board_lots
@@ -564,6 +568,69 @@ def test_empty_portfolio_keeps_full_capital_available_for_sizing(tmp_path, deps,
         available_cash=20_000,
         risk_fraction=0.02,
     )
+
+
+def test_premarket_restores_exact_previous_close_snapshot_archive(tmp_path, deps) -> None:
+    archive = tmp_path / "prior-market-snapshot.json"
+    gateway = FakeGateway()
+    write_a_share_snapshot_archive(
+        archive,
+        gateway.snapshot,
+        expected_session=date(2026, 8, 19),
+    )
+    gateway.get_a_share_snapshot = Mock(side_effect=AssertionError("live snapshot must not be used"))
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        prior_market_snapshot=archive,
+        output_dir=tmp_path / "reports",
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert result.modules["market"].status == "ok"
+    assert result.modules["market"].payload["股票数量"] == 2
+    gateway.get_a_share_snapshot.assert_not_called()
+
+
+def test_premarket_invalid_archive_falls_back_to_live_snapshot(tmp_path, deps) -> None:
+    archive = tmp_path / "prior-market-snapshot.json"
+    archive.write_text("invalid", encoding="utf-8")
+    gateway = FakeGateway()
+    live_snapshot = Mock(return_value=gateway.snapshot)
+    gateway.get_a_share_snapshot = live_snapshot
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        prior_market_snapshot=archive,
+        output_dir=tmp_path / "reports",
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert result.modules["market"].status == "partial"
+    assert "prior_market_snapshot_unavailable" in result.modules["market"].warnings
+    live_snapshot.assert_called_once_with()
+
+
+def test_postmarket_writes_completed_session_snapshot_archive(tmp_path, deps) -> None:
+    archive = tmp_path / "market-snapshot.json"
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=deps,
+        force=True,
+        preview_only=True,
+        market_snapshot_output=archive,
+        output_dir=tmp_path / "reports",
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert archive.is_file()
 
 
 def test_force_does_not_accept_stale_snapshot_or_create_action_levels(tmp_path, deps) -> None:

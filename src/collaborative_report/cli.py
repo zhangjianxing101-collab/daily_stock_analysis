@@ -34,6 +34,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--already-sent", action="store_true", help="Skip a completed production report identity")
     parser.add_argument("--prior-report", type=Path)
     parser.add_argument("--prior-sector-report", type=Path)
+    parser.add_argument("--prior-market-snapshot", type=Path)
+    parser.add_argument("--market-snapshot-output", type=Path)
     parser.add_argument("--output-dir", type=Path)
     actions = parser.add_mutually_exclusive_group()
     actions.add_argument("--ledger-status", metavar="REPORT_KEY")
@@ -157,6 +159,8 @@ def main(
             or args.already_sent
             or args.prior_report
             or args.prior_sector_report
+            or args.prior_market_snapshot
+            or args.market_snapshot_output
         ):
             parser.error("ledger operator actions cannot be combined with report-run arguments")
         ledger = LocalDeliveryLedger(args.output_dir)
@@ -211,6 +215,10 @@ def main(
         parser.error("--prior-report is valid only for postmarket mode")
     if mode is ReportMode.PREMARKET and args.prior_sector_report is not None:
         parser.error("--prior-sector-report is valid only for postmarket mode")
+    if mode is ReportMode.POSTMARKET and args.prior_market_snapshot is not None:
+        parser.error("--prior-market-snapshot is valid only for premarket mode")
+    if mode is ReportMode.PREMARKET and args.market_snapshot_output is not None:
+        parser.error("--market-snapshot-output is valid only for postmarket mode")
     result = runner(
         mode,
         force=args.force,
@@ -219,6 +227,8 @@ def main(
         already_sent=args.already_sent,
         prior_report=args.prior_report,
         prior_sector_report=args.prior_sector_report,
+        prior_market_snapshot=args.prior_market_snapshot,
+        market_snapshot_output=args.market_snapshot_output,
         output_dir=args.output_dir,
     )
     print(json.dumps(result.to_public_dict(), ensure_ascii=False, sort_keys=True))

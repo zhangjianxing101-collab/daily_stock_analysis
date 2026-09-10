@@ -14,7 +14,9 @@ from src.collaborative_report.market_data import (
     MarketDataset,
     normalize_a_share_snapshot,
     normalize_a_share_thscode,
+    read_a_share_snapshot_archive,
     validate_daily_bars,
+    write_a_share_snapshot_archive,
 )
 from src.collaborative_report.ths_market_data import ThsApiResponse, ThsNetworkError, ThsResponseError
 
@@ -72,6 +74,71 @@ def ths_bar_items(rows: int = 60) -> list[dict[str, object]]:
         }
         for row in frame.itertuples(index=False)
     ]
+
+
+def test_completed_session_snapshot_archive_round_trip(tmp_path) -> None:
+    source_timestamp = datetime(2026, 8, 19, 15, 1, tzinfo=ZoneInfo("Asia/Shanghai"))
+    frame = normalize_a_share_snapshot(pd.DataFrame([{
+        "代码": "600000", "名称": "浦发银行", "最新价": 10.0, "涨跌幅": 1.2,
+        "量比": 1.1, "换手率": 2.0, "成交额": 100_000_000,
+        "成交量": 10_000_000, "总市值": 300_000_000_000,
+    }]))
+    frame.attrs.update(provider_row_count=2, quarantined_row_count=1, screening_complete_count=1)
+    path = tmp_path / "market-snapshot.json"
+    write_a_share_snapshot_archive(
+        path,
+        MarketDataset(frame, "fixture", OBSERVED_AT, (), source_timestamp),
+        expected_session=SESSION,
+    )
+
+    loaded = read_a_share_snapshot_archive(
+        path,
+        expected_session=SESSION,
+        observed_at=OBSERVED_AT + timedelta(hours=1),
+    )
+
+    assert loaded.source == "archive:fixture"
+    assert loaded.source_timestamp == source_timestamp
+    assert loaded.frame.to_dict(orient="records") == frame.to_dict(orient="records")
+    assert loaded.frame.attrs["screening_complete_count"] == 1
+    assert loaded.frame.attrs["provider_row_count"] == 2
+    assert loaded.frame.attrs["quarantined_row_count"] == 1
+
+
+def test_snapshot_archive_rejects_wrong_session(tmp_path) -> None:
+    path = tmp_path / "market-snapshot.json"
+    frame = normalize_a_share_snapshot(pd.DataFrame([{"代码": "600000", "最新价": 10.0}]))
+    write_a_share_snapshot_archive(
+        path,
+        MarketDataset(
+            frame,
+            "fixture",
+            OBSERVED_AT,
+            (),
+            datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
+        ),
+        expected_session=SESSION,
+    )
+
+    with pytest.raises(ValueError, match="snapshot archive session invalid"):
+        read_a_share_snapshot_archive(
+            path,
+            expected_session=date(2026, 8, 18),
+            observed_at=OBSERVED_AT,
+        )
+
+
+def test_snapshot_archive_rejects_rows_lost_during_normalization(tmp_path) -> None:
+    path = tmp_path / "market-snapshot.json"
+    path.write_text(
+        '{"schema_version":1,"session":"2026-08-19","source":"fixture",'
+        '"source_timestamp":"2026-08-19T15:00:00+08:00","warnings":[],"quality":{},'
+        '"frame":[{"code":"unsafe","price":10.0}]}\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="snapshot archive frame invalid"):
+        read_a_share_snapshot_archive(path, expected_session=SESSION, observed_at=OBSERVED_AT)
 
 
 @pytest.mark.parametrize(

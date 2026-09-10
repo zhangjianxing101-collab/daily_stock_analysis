@@ -63,6 +63,16 @@ prefixes do not block enrichment for the supported universe. Partial coverage ma
 freshness checks, the combined dataset uses the oldest accepted source timestamp;
 one expired source can therefore invalidate the combined snapshot.
 
+After an authoritative postmarket run, the workflow stores the normalized completed-session
+A-share snapshot as a private `market-snapshot-YYYY-MM-DD` artifact for seven days. The next
+premarket run requests the exact prior data-session artifact, validates its schema, session,
+post-close source timestamp, row identities, and size before using it. This keeps a delayed
+09:00 job or a manual premarket rerun from substituting current intraday quotes for the prior
+close. Invalid or unavailable archives fall back to the normal live-source path, whose existing
+timestamp checks still fail closed when it cannot prove the requested completed session. The
+archive contains public normalized quote fields and quality counts, never portfolio, mailbox,
+credential, or AI-response data.
+
 Preview runs additionally produce bounded `provider-quality` diagnostics containing
 only counts and parsed dates. Raw responses, stderr and credentials are not uploaded.
 
