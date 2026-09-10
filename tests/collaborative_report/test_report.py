@@ -6,6 +6,7 @@ import pytest
 
 from src.collaborative_report.models import Candidate, ModuleResult, ReportMode
 from src.collaborative_report.report import (
+    _featured_candidates,
     build_subject,
     evaluate_candidate_actionability,
     render_report,
@@ -29,17 +30,20 @@ def candidate(
     concept_sectors: tuple[str, ...] = (),
     sector_rotation: str = "",
     sector_persistence: str = "",
+    code: str = "600001",
+    score: float = 85.0,
+    matched_rules: tuple[str, ...] = ("ma5>ma10>ma20", "volume_expansion"),
 ) -> Candidate:
     return Candidate(
-        code="600001",
+        code=code,
         name=name,
         horizon="1-5个交易日",
-        score=85.0,
+        score=score,
         close=10.5,
         trigger="放量突破10.60",
         stop_price=9.8,
         target_price=12.0,
-        matched_rules=("ma5>ma10>ma20", "volume_expansion"),
+        matched_rules=matched_rules,
         observed_at=observed_at,
         source="synthetic",
         warning=warning,
@@ -48,6 +52,31 @@ def candidate(
         sector_rotation=sector_rotation,
         sector_persistence=sector_persistence,
     )
+
+
+def test_featured_candidates_require_sector_evidence_deduplicate_and_cap_at_five() -> None:
+    plain = candidate(code="600000", score=99)
+    duplicate_lower = candidate(
+        code="600001", score=80, industry_sector="有色金属",
+    )
+    candidates = tuple(
+        candidate(
+            code=f"60000{index}",
+            score=90 - index,
+            industry_sector="有色金属",
+        )
+        for index in range(1, 7)
+    )
+
+    result = _featured_candidates(
+        (plain, duplicate_lower, *candidates),
+        (candidate(code="600001", score=95, concept_sectors=("黄金概念",)),),
+    )
+
+    assert len(result) == 5
+    assert [item.code for item in result].count("600001") == 1
+    assert result[0].code == "600001"
+    assert all(item.code != "600000" for item in result)
 
 
 def test_premarket_report_contains_required_sections_levels_warnings_and_disclaimer() -> None:
@@ -92,12 +121,15 @@ def test_postmarket_report_contains_required_sections_and_optional_morning_statu
             "backtests": module("backtests", {"短线胜率": "55%", "最大回撤": "8%"}, "样本有限"),
         },
         morning_candidates=({"code": "600001", "name": "示例股份", "status": "继续观察"},),
-        short_term_candidates=(candidate(),),
+        short_term_candidates=(candidate(industry_sector="有色金属", sector_rotation="accelerating"),),
         swing_candidates=(candidate(name="波段股份"),),
     )
 
     assert rendered.subject == "A股收盘日报 2026-08-19"
-    for expected in ("市场宽度", "早盘候选跟踪", "继续观察", "下一交易日短线池", "回测摘要", "样本有限"):
+    for expected in (
+        "市场宽度", "早盘候选跟踪", "继续观察", "板块龙头精选观察（最多5只）",
+        "有色金属", "下一交易日短线池", "回测摘要", "样本有限",
+    ):
         assert expected in rendered.html
         assert expected in rendered.text
 
@@ -580,3 +612,65 @@ def test_candidate_sector_context_is_preserved_in_html_and_text() -> None:
     for output in (rendered.html, rendered.text):
         for value in ("行业：有色金属", "概念：黄金概念、稀缺资源", "轮动：加速", "持续性：高"):
             assert value in output
+
+
+def test_report_formats_market_backtest_gold_global_screening_and_ai_details() -> None:
+    backtest = {
+        "start_date": "2025-01-02", "end_date": "2026-09-09", "trade_count": 12,
+        "win_rate": 0.5, "total_return": 0.125, "max_drawdown": 0.0875,
+        "consecutive_losses": 2, "final_equity": 22500.0,
+    }
+    rendered = render_report(
+        ReportMode.POSTMARKET,
+        date(2026, 9, 9),
+        modules={
+            "market": module("market", {"上涨占比": 32.3243, "成交额": 1_873_081_985_919.3}),
+            "backtests": module("backtests", {
+                "600001": {"name": "示例股份", "short": backtest, "swing": backtest},
+            }),
+            "gold": module("gold", {
+                "direction": "neutral", "signal": "hold", "risk_level": "high",
+                "watch_only": True, "latest_close": 4393.9, "fast_ma": 4468.76,
+                "slow_ma": 4245.29, "china_reference_cny_per_gram": 1017.25,
+                "data_source": "yfinance:GC=F", "backtest": backtest,
+                "risk_checks": {
+                    "single_trade_risk_limit": 0.02, "stop_loss": 0.03,
+                    "drawdown_pause": 0.10, "consecutive_loss_pause": 3,
+                    "minimum_trade_sample": 10,
+                },
+            }),
+            "global": module("global", {
+                "data_source": "yfinance",
+                "^GSPC": {"close": 7673.52, "change_pct": -0.584, "as_of_date": "2026-09-08"},
+                "CNY=X": {"close": 7.2, "change_pct": 0.1, "as_of_date": "2026-09-08"},
+            }),
+            "screening": module("screening", {
+                "短线候选数": 1, "波段候选数": 0,
+                "短线候选": [{
+                    "code": "600001", "name": "示例股份", "close": 10.5,
+                    "score": 88.0, "industry_sector": "有色金属",
+                    "matched_rules": ["ma5>ma10>ma20", "volume_expansion"],
+                }],
+                "波段候选": [],
+            }),
+            "ai": module("ai", {
+                "600001": {
+                    "name": "示例股份", "conclusion": "趋势偏强",
+                    "operation_advice": "等待回踩确认", "confidence_level": "中",
+                    "risk_warning": "波动较高",
+                },
+            }),
+        },
+    )
+
+    for output in (rendered.html, rendered.text):
+        for expected in (
+            "32.32%", "18,730.82 亿元", "600001 示例股份｜短线",
+            "胜率 50.00%", "最大回撤 8.75%", "Gold Quantitative Background",
+            "China reference (CNY/gram)", "1,017.25", "Backtest trades",
+            "Risk check: drawdown pause", "Global Markets and Gold Background",
+            "USD/CNY", "短线1", "行业 有色金属", "趋势偏强", "等待回踩确认",
+        ):
+            assert expected in output
+    assert "S&amp;P 500" in rendered.html
+    assert "S&P 500" in rendered.text

@@ -249,10 +249,11 @@ def enrich_codes(
             warnings=tuple(warnings),
         )
     except Exception as exc:
+        failure = str(exc) if isinstance(exc, IsolatedPipelineError) else type(exc).__name__
         return ModuleResult(
             name="ai",
             status="unavailable",
             observed_at=timestamp,
             payload=_EMPTY_PAYLOAD,
-            warnings=(f"AI分析暂不可用（{type(exc).__name__}）",),
+            warnings=(f"AI分析暂不可用（{failure}）",),
         )

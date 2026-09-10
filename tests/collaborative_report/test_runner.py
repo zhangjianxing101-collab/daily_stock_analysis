@@ -5,9 +5,9 @@ import subprocess
 import threading
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
-from datetime import date, datetime, timedelta, tzinfo
+from datetime import date, datetime, time, timedelta, tzinfo
 from pathlib import Path
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 from zoneinfo import ZoneInfo
 
 import pandas as pd
@@ -38,12 +38,17 @@ from src.collaborative_report.runner import (
 from src.collaborative_report.runner import (
     _PRIOR_SECTOR_MANIFEST_MAX_BYTES,
     _decision_summary,
+    _gold_cny_per_gram,
+    _report_delivery_blockers,
     _load_prior_sector_state,
     _market_payload,
     _production_mail_sender,
+    _prior_sector_recap_modules,
     _redacted_manifest,
     _rerank_sector_ties,
     _sector_state,
+    _select_ai_codes,
+    _trusted_sector_snapshot_timestamp,
 )
 from src.collaborative_report.sector_analysis import SectorAnalysis, SectorRow, analyze_sectors
 from src.collaborative_report.screener import ScreeningResult, screen_aggressive
@@ -54,6 +59,28 @@ from src.collaborative_report.ths_market_data import ThsApiResponse, ThsMarketDa
 
 SHANGHAI = ZoneInfo("Asia/Shanghai")
 NOW = datetime(2026, 8, 19, 16, 30, tzinfo=SHANGHAI)
+
+
+def test_sector_source_may_follow_report_start_when_received_later() -> None:
+    report_start = datetime(2026, 8, 19, 15, 2, tzinfo=SHANGHAI)
+    source = datetime(2026, 8, 19, 15, 5, tzinfo=SHANGHAI)
+    received = datetime(2026, 8, 19, 15, 6, tzinfo=SHANGHAI)
+
+    assert _trusted_sector_snapshot_timestamp(source, received, report_start) == source
+
+
+def test_gold_cny_per_gram_uses_verified_global_fx_snapshot() -> None:
+    modules = {
+        "global": ModuleResult(
+            "global", "ok", NOW,
+            {"CNY=X": {"close": 7.2, "as_of_date": "2026-08-18"}}, (),
+        ),
+    }
+
+    assert _gold_cny_per_gram(modules, 3_000.0) == pytest.approx(694.4562, rel=1e-5)
+    assert _gold_cny_per_gram({}, 3_000.0) is None
+
+
 PORTFOLIO_CODE = "600000"
 CANDIDATE_CODE = "600001"
 SECTOR_STATE_KEYS = (
@@ -84,6 +111,31 @@ def candidate(code: str = CANDIDATE_CODE, *, observed_at: datetime = NOW) -> Can
         observed_at=observed_at,
         source="fixture",
     )
+
+
+def test_ai_selection_prefers_at_most_five_sector_backed_candidates() -> None:
+    sector_candidates = tuple(
+        replace(
+            candidate(f"60000{index}"),
+            score=90 - index,
+            industry_sector="有色金属",
+        )
+        for index in range(1, 7)
+    )
+    plain = candidate("000001")
+
+    selected = _select_ai_codes(
+        (*sector_candidates, plain),
+        (PORTFOLIO_CODE,),
+        {"600002"},
+    )
+
+    assert selected == ("600001", "600003", "600004", "600005", "600006")
+    assert PORTFOLIO_CODE not in selected
+
+
+def test_ai_selection_uses_portfolio_only_without_sector_candidates() -> None:
+    assert _select_ai_codes((candidate(),), (PORTFOLIO_CODE,), set()) == (PORTFOLIO_CODE,)
 
 
 def bars(*, high: float = 10.4, low: float = 10.0, close: float = 10.2) -> pd.DataFrame:
@@ -191,7 +243,17 @@ class FakeGateway:
         return self.sector_snapshots[sector_type]
 
     def get_global_snapshot(self):
-        return dataset(pd.DataFrame([{"symbol": "^GSPC", "change_pct": 0.5}]))
+        return dataset(pd.DataFrame([
+            {"symbol": "^GSPC", "close": 6_000.0, "previous_close": 5_970.0, "change_pct": 0.5, "as_of_date": date(2026, 8, 18)},
+            {"symbol": "GC=F", "close": 3_000.0, "previous_close": 2_990.0, "change_pct": 0.33, "as_of_date": date(2026, 8, 18)},
+            {"symbol": "CNY=X", "close": 7.2, "previous_close": 7.19, "change_pct": 0.14, "as_of_date": date(2026, 8, 18)},
+        ]))
+
+    def get_limit_counts(self, expected_session):
+        return replace(
+            dataset(pd.DataFrame([{"limit_up_count": 42, "limit_down_count": 7}]), "fixture.limit-pools"),
+            source_timestamp=datetime.combine(expected_session, time(15, 0), tzinfo=SHANGHAI),
+        )
 
     def get_gold_bars(self):
         return dataset(bars())
@@ -206,6 +268,7 @@ def settings() -> CollaborativeSettings:
         short_limit=5,
         swing_limit=5,
         screen_prefilter=20,
+        position_sizing=True,
     )
 
 
@@ -231,10 +294,22 @@ def deps(settings) -> RunnerDependencies:
         gateway=gateway,
         screener=lambda *args, **kwargs: ScreeningResult((candidate(),), ()),
         risk_evaluator=lambda position, price, capital: {"状态": "正常"},
-        short_backtest=lambda frame, **kwargs: {"strategy": "short", "trade_count": 3},
-        swing_backtest=lambda frame, **kwargs: {"strategy": "swing", "trade_count": 4},
-        gold_analyzer=lambda frame, **kwargs: {"direction": "neutral"},
-        ai_enricher=lambda codes, **kwargs: ModuleResult("ai", "ok", NOW, {"count": len(tuple(codes))}),
+        short_backtest=lambda frame, **kwargs: {
+            "strategy": "short", "trade_count": 3, "max_drawdown": 0.05,
+        },
+        swing_backtest=lambda frame, **kwargs: {
+            "strategy": "swing", "trade_count": 4, "max_drawdown": 0.08,
+        },
+        gold_analyzer=lambda frame, **kwargs: {
+            "direction": "neutral", "signal": "hold", "risk_level": "low", "watch_only": False,
+            "latest_close": 3_000.0, "fast_ma": 2_980.0, "slow_ma": 2_900.0,
+            "backtest": {"trade_count": 12, "max_drawdown": 0.08, "win_rate": 0.5},
+            "risk_checks": {"single_trade_risk_limit": 0.02, "drawdown_pause": 0.10},
+        },
+        ai_enricher=lambda codes, **kwargs: ModuleResult(
+            "ai", "ok", NOW,
+            {code: {"conclusion": "fixture analysis"} for code in tuple(codes)},
+        ),
         renderer=renderer,
         mail_sender=mailer,
         data_session_resolver=lambda mode, report_date, generated_at: report_date,
@@ -329,6 +404,31 @@ def test_incomplete_supplement_marks_market_and_screening_partial(tmp_path, deps
     deps.mail_sender.assert_not_called()
 
 
+def test_news_module_is_included_without_affecting_trade_scoring(tmp_path, deps) -> None:
+    news_loader = Mock(
+        return_value=ModuleResult(
+            "news",
+            "partial",
+            NOW,
+            {"财经线索数": 2},
+            ("聚合新闻仅作事件线索，关键事实需核验",),
+        )
+    )
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, news_loader=news_loader),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.modules["news"].payload == {"财经线索数": 2}
+    news_loader.assert_called_once_with(observed_at=NOW)
+    assert result.short_term_candidates[0].score == candidate().score
+    deps.mail_sender.assert_not_called()
+
+
 def test_force_bypasses_only_window_gate(tmp_path, deps) -> None:
     session_builder = Mock(side_effect=deps.session_builder)
     stale_gateway = FakeGateway()
@@ -341,7 +441,8 @@ def test_force_bypasses_only_window_gate(tmp_path, deps) -> None:
         output_dir=tmp_path,
     )
 
-    assert result.exit_code == EXIT_SUCCESS
+    assert result.exit_code == EXIT_FAILURE
+    assert result.error_code == "report_content_incomplete"
     session_builder.assert_called_once_with(ReportMode.PREMARKET, NOW, scheduled=False)
     assert result.modules["screening"].status == "unavailable"
     assert "provider secret" not in json.dumps(result.to_public_dict(), ensure_ascii=False)
@@ -371,6 +472,26 @@ def test_force_still_applies_risk_and_board_lot_sizing(tmp_path, deps) -> None:
         available_cash=18_980,
         risk_fraction=0.02,
     )
+
+
+def test_position_sizing_is_skipped_when_report_scope_disables_it(tmp_path, deps, settings) -> None:
+    sizing_evaluator = Mock(return_value=100)
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(
+            deps,
+            settings_loader=lambda: replace(settings, position_sizing=False),
+            sizing_evaluator=sizing_evaluator,
+        ),
+        force=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.exit_code == EXIT_SUCCESS
+    assert result.modules["sizing"].status == "skipped"
+    assert result.modules["sizing"].payload == {"状态": "已按当前报告范围关闭，不依据持仓分配资金"}
+    sizing_evaluator.assert_not_called()
 
 
 def test_quarantined_held_snapshot_row_suppresses_all_new_position_sizing(tmp_path, deps) -> None:
@@ -500,13 +621,13 @@ def test_material_snapshot_history_conflict_forces_watch_and_suppresses_risk_and
     assert SNAPSHOT_DAILY_CLOSE_TOLERANCE == 0.01
     assert "snapshot_daily_close_conflict" in result.modules["market"].warnings
     assert result.modules["market"].status == "partial"
-    assert result.short_term_candidates[0].warning == "价格来源冲突，仅供观望"
     assert deps.renderer.call_args.kwargs["short_term_candidates"][0].warning == "价格来源冲突，仅供观望"
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert "snapshot_daily_close_conflict" in manifest["warning_codes"]
     risk_evaluator.assert_not_called()
     sizing_evaluator.assert_not_called()
     assert CANDIDATE_CODE not in ai_enricher.call_args.args[0]
+    deps.mail_sender.assert_not_called()
 
 
 def test_snapshot_history_price_within_tolerance_remains_actionable(tmp_path, deps) -> None:
@@ -546,11 +667,12 @@ def test_postmarket_early_intraday_source_timestamp_is_untrusted_and_suppressed(
     )
 
     assert "snapshot_timestamp_untrusted" in result.modules["market"].warnings
-    assert result.short_term_candidates[0].warning == "快照权威性不足，仅供观望"
+    assert deps.renderer.call_args.kwargs["short_term_candidates"][0].warning == "快照权威性不足，仅供观望"
     assert CANDIDATE_CODE not in ai_enricher.call_args.args[0]
     sizing_evaluator.assert_not_called()
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert manifest["source_timestamps"]["market"] == "unavailable"
+    deps.mail_sender.assert_not_called()
 
 
 def test_postmarket_stale_prior_session_source_timestamp_is_untrusted(tmp_path, deps) -> None:
@@ -608,11 +730,12 @@ def test_akshare_shape_without_timestamp_attrs_never_uses_snapshot_features_acti
 
     assert result.modules["market"].status == "partial"
     assert "快照来源时间不可用，所有建议仅供观察" in result.modules["market"].warnings
-    assert result.short_term_candidates[0].warning == "快照权威性不足，仅供观望"
+    assert deps.renderer.call_args.kwargs["short_term_candidates"][0].warning == "快照权威性不足，仅供观望"
     assert CANDIDATE_CODE not in ai_enricher.call_args.args[0]
     risk_evaluator.assert_not_called()
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert manifest["source_timestamps"]["market"] == "unavailable"
+    deps.mail_sender.assert_not_called()
 
 
 def test_inconsistent_session_identity_fails_closed(tmp_path, deps) -> None:
@@ -651,7 +774,7 @@ def test_external_duplicate_marker_skips_production_before_data(tmp_path, deps) 
     deps.mail_sender.assert_not_called()
 
 
-def test_ai_gold_and_screening_failures_degrade_and_still_send(tmp_path, deps) -> None:
+def test_ai_gold_and_screening_failures_block_incomplete_delivery(tmp_path, deps) -> None:
     def fail(*args, **kwargs):
         raise RuntimeError("smtp_password=do-not-leak")
 
@@ -661,14 +784,15 @@ def test_ai_gold_and_screening_failures_degrade_and_still_send(tmp_path, deps) -
         output_dir=tmp_path,
     )
 
-    assert result.exit_code == EXIT_SUCCESS
-    assert result.final_state is FinalState.SENT
+    assert result.exit_code == EXIT_FAILURE
+    assert result.final_state is FinalState.HARD_FAILURE
+    assert result.error_code == "report_content_incomplete"
     assert result.modules["screening"].status == "unavailable"
     assert result.modules["gold"].status == "unavailable"
     assert result.modules["ai"].status == "unavailable"
     assert "AI分析暂不可用" in result.modules["ai"].warnings
     assert not result.short_term_candidates
-    deps.mail_sender.assert_called_once()
+    deps.mail_sender.assert_not_called()
 
 
 def test_screening_failure_analyzes_only_portfolio_codes(tmp_path, deps) -> None:
@@ -805,12 +929,14 @@ def test_data_failure_warns_watch_only_and_never_fabricates_success(tmp_path, de
         output_dir=tmp_path,
     )
 
-    assert result.exit_code == EXIT_SUCCESS
+    assert result.exit_code == EXIT_FAILURE
+    assert result.error_code == "report_content_incomplete"
     assert result.modules["market"].status == "unavailable"
     assert "数据不足，建议观望" in result.modules["market"].warnings
     assert result.modules["portfolio"].status == "unavailable"
     assert not result.short_term_candidates
     assert "secret" not in json.dumps(result.to_public_dict(), ensure_ascii=False)
+    deps.mail_sender.assert_not_called()
 
 
 def test_renderer_receives_session_generation_time(tmp_path, deps) -> None:
@@ -873,7 +999,7 @@ def test_snapshot_receipt_time_and_authority_age_guards_reject_future_data() -> 
     )
 
     close_snapshot = replace(gateway.snapshot, source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI))
-    boundary = datetime(2026, 8, 19, 19, 0, tzinfo=SHANGHAI)
+    boundary = datetime(2026, 8, 19, 23, 0, tzinfo=SHANGHAI)
     assert _snapshot_source_is_authoritative(
         close_snapshot, session, expected_session=NOW.date(), checked_at=boundary
     )
@@ -930,7 +1056,8 @@ def test_future_snapshot_source_is_never_promoted_after_its_receipt_time(tmp_pat
     manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
     assert result.modules["market"].status == "partial"
     assert manifest["source_timestamps"]["market"] == "unavailable"
-    deps.mail_sender.assert_called_once()
+    assert result.error_code == "report_content_incomplete"
+    deps.mail_sender.assert_not_called()
 
 
 @pytest.mark.parametrize("clock_values", [
@@ -953,7 +1080,7 @@ def test_invalid_advancing_clock_stops_before_delivery_claim(tmp_path, deps, clo
 
 
 def test_authoritative_snapshot_expiry_stops_before_delivery_claim(tmp_path, deps) -> None:
-    start = datetime(2026, 8, 19, 18, 50, tzinfo=SHANGHAI)
+    start = datetime(2026, 8, 19, 22, 50, tzinfo=SHANGHAI)
     gateway = FakeGateway()
     gateway.snapshot = replace(
         gateway.snapshot,
@@ -964,7 +1091,7 @@ def test_authoritative_snapshot_expiry_stops_before_delivery_claim(tmp_path, dep
         start,
         start,
         start,
-        datetime(2026, 8, 19, 19, 0, 1, tzinfo=SHANGHAI),
+        datetime(2026, 8, 19, 23, 0, 1, tzinfo=SHANGHAI),
     ))
     session_builder = lambda mode, current_time, scheduled: ReportSession(
         mode,
@@ -988,7 +1115,7 @@ def test_authoritative_snapshot_expiry_stops_before_delivery_claim(tmp_path, dep
 
 
 def test_authoritative_snapshot_expiry_stops_before_rendering(tmp_path, deps) -> None:
-    start = datetime(2026, 8, 19, 18, 50, tzinfo=SHANGHAI)
+    start = datetime(2026, 8, 19, 22, 50, tzinfo=SHANGHAI)
     gateway = FakeGateway()
     gateway.snapshot = replace(
         gateway.snapshot,
@@ -998,7 +1125,7 @@ def test_authoritative_snapshot_expiry_stops_before_rendering(tmp_path, deps) ->
     clock = Mock(side_effect=(
         start,
         start,
-        datetime(2026, 8, 19, 19, 0, 1, tzinfo=SHANGHAI),
+        datetime(2026, 8, 19, 23, 0, 1, tzinfo=SHANGHAI),
     ))
     session_builder = lambda mode, current_time, scheduled: ReportSession(
         mode,
@@ -1736,6 +1863,106 @@ def test_test_email_prefix_does_not_change_report_identity(tmp_path, deps) -> No
     assert sent_report.subject.startswith("测试 ")
 
 
+def test_incomplete_test_report_is_written_but_never_emailed(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.snapshot = replace(gateway.snapshot, source_timestamp=None)
+    gateway.get_daily_bars = Mock(side_effect=ValueError("daily bars stale"))
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        test_email=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.final_state is FinalState.HARD_FAILURE
+    assert result.error_code == "report_content_incomplete"
+    assert result.manifest_path is not None and result.manifest_path.exists()
+    assert result.modules["delivery_readiness"].payload["reason_codes"] == (
+        "market_breadth_unavailable",
+        "market_source_untrusted",
+        "screening_unavailable",
+    )
+    manifest = json.loads(result.manifest_path.read_text(encoding="utf-8"))
+    assert manifest["final_state"] == "hard_failure"
+    assert manifest["module_statuses"]["delivery_readiness"] == "unavailable"
+    deps.mail_sender.assert_not_called()
+
+
+def test_incomplete_preview_remains_available_for_diagnostics(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.snapshot = replace(gateway.snapshot, source_timestamp=None)
+    gateway.get_daily_bars = Mock(side_effect=ValueError("daily bars stale"))
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.final_state is FinalState.PREVIEWED
+    assert result.html_path is not None and result.html_path.exists()
+    assert result.modules["delivery_readiness"].status == "unavailable"
+    assert "delivery_readiness" in deps.renderer.call_args.kwargs["modules"]
+    deps.mail_sender.assert_not_called()
+
+
+def test_postmarket_delivery_requires_both_sector_rankings() -> None:
+    modules = {
+        "market": ModuleResult("market", "ok", NOW, {
+            "上涨占比": 60.0, "成交额": 100_000_000.0,
+            "涨停家数": 1, "跌停家数": 0, "市场风格": "均衡",
+        }),
+        "screening": ModuleResult("screening", "ok", NOW, {
+            "短线候选数": 1, "波段候选数": 0,
+            "短线候选": [{"code": "600001", "name": "示例股份"}], "波段候选": [],
+        }),
+        "industry_sectors": ModuleResult("industry_sectors", "ok", NOW, {"strongest": [{}]}),
+        "concept_sectors": ModuleResult("concept_sectors", "unavailable", NOW, {}),
+        "global": ModuleResult("global", "ok", NOW, {"^GSPC": {"close": 6_000.0}}),
+        "gold": ModuleResult("gold", "ok", NOW, {
+            "latest_close": 3_000.0, "china_reference_cny_per_gram": 694.45,
+            "backtest": {"trade_count": 12}, "risk_checks": {"drawdown_pause": 0.10},
+        }),
+        "backtests": ModuleResult("backtests", "ok", NOW, {
+            "600001": {
+                "name": "示例股份",
+                "short": {"trade_count": 3, "max_drawdown": 0.05},
+            },
+        }),
+        "ai": ModuleResult("ai", "ok", NOW, {"600001": {"conclusion": "趋势偏强"}}),
+    }
+
+    assert _report_delivery_blockers(ReportMode.POSTMARKET, modules) == (
+        "concept_sectors_unavailable",
+    )
+
+
+def test_postmarket_delivery_blocks_every_empty_analysis_section() -> None:
+    modules = {
+        "market": ModuleResult("market", "ok", NOW, {"上涨占比": 60.0}),
+        "screening": ModuleResult("screening", "ok", NOW, {"短线候选数": 0, "波段候选数": 0}),
+        "industry_sectors": ModuleResult("industry_sectors", "ok", NOW, {"strongest": [{}]}),
+        "concept_sectors": ModuleResult("concept_sectors", "ok", NOW, {"strongest": [{}]}),
+        "global": ModuleResult("global", "unavailable", NOW, {}),
+        "gold": ModuleResult("gold", "ok", NOW, {"latest_close": 3_000.0}),
+        "backtests": ModuleResult("backtests", "unavailable", NOW, {}),
+        "ai": ModuleResult("ai", "skipped", NOW, {}),
+    }
+
+    assert _report_delivery_blockers(ReportMode.POSTMARKET, modules) == (
+        "market_overview_incomplete",
+        "global_context_unavailable",
+        "gold_analysis_incomplete",
+        "backtests_unavailable",
+        "screening_candidates_unavailable",
+        "ai_analysis_unavailable",
+    )
+
+
 def test_smtp_failure_is_fatal_with_sanitized_result(tmp_path, deps) -> None:
     mail_sender = Mock(side_effect=RuntimeError("receiver@example.com password=hunter2"))
 
@@ -1875,6 +2102,37 @@ def prior_sector_manifest(*, state: list[dict[str, object]], **overrides: object
     }
     payload.update(overrides)
     return payload
+
+
+def test_premarket_uses_verified_prior_close_sector_recap(tmp_path, deps) -> None:
+    prior = tmp_path / "prior-sector.json"
+    prior.write_text(
+        json.dumps(prior_sector_manifest(state=[
+            *sector_state_rows("industry", 2),
+            *sector_state_rows("concept", 2),
+        ])),
+        encoding="utf-8",
+    )
+
+    result = run_report(
+        ReportMode.PREMARKET,
+        deps=replace(deps, renderer=render_report),
+        force=True,
+        preview_only=True,
+        prior_sector_report=prior,
+        output_dir=tmp_path / "report",
+    )
+
+    assert result.modules["industry_sectors"].status == "partial"
+    assert result.modules["concept_sectors"].payload["strongest"][0]["name"] == "concept-01"
+    report = result.html_path.read_text(encoding="utf-8")
+    assert "行业板块" in report
+    assert "概念板块" in report
+    assert "盘前沿用最近一次已验证收盘板块状态" in report
+
+
+def test_prior_sector_recap_rejects_no_types() -> None:
+    assert _prior_sector_recap_modules(()) == {}
 
 
 def serialized_sector_state() -> list[dict[str, object]]:
@@ -2481,6 +2739,25 @@ def test_postmarket_runs_independent_sector_modules_and_persists_safe_state(tmp_
     deps.mail_sender.assert_not_called()
 
 
+def test_postmarket_builds_sector_snapshots_before_leading_membership_map(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    calls = Mock()
+    calls.attach_mock(Mock(wraps=gateway.get_sector_snapshot), "sector")
+    calls.attach_mock(Mock(wraps=gateway.get_leading_sector_codes), "leading")
+    gateway.get_sector_snapshot = calls.sector
+    gateway.get_leading_sector_codes = calls.leading
+
+    run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    assert calls.mock_calls.index(call.sector("concept")) < calls.mock_calls.index(call.leading())
+
+
 def test_postmarket_sector_source_failure_does_not_suppress_other_module(tmp_path, deps) -> None:
     gateway = FakeGateway()
     gateway.get_sector_snapshot = Mock(side_effect=lambda kind: (
@@ -2543,6 +2820,67 @@ def test_market_overview_has_safe_breadth_semantics_and_decision_summary(tmp_pat
     }
     assert "人工确认" in summary.payload["操作建议"]
     assert deps.mail_sender.assert_not_called() is None
+
+
+def test_report_modules_preserve_names_and_complete_analysis_details(tmp_path, deps) -> None:
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=deps,
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    screening = result.modules["screening"].payload
+    assert screening["短线候选"][0]["name"] == "示例股份"
+    assert screening["短线候选"][0]["industry_sector"] == "示例板块"
+    assert result.modules["backtests"].payload[CANDIDATE_CODE]["name"] == "示例股份"
+    assert result.modules["backtests"].payload[CANDIDATE_CODE]["short"]["max_drawdown"] == 0.05
+    assert result.modules["gold"].payload["china_reference_cny_per_gram"] == pytest.approx(694.4562, rel=1e-5)
+    assert result.modules["gold"].payload["backtest"]["trade_count"] == 12
+    assert result.modules["ai"].payload[CANDIDATE_CODE]["name"] == "示例股份"
+    assert result.modules["ai"].payload[CANDIDATE_CODE]["conclusion"] == "fixture analysis"
+
+
+def test_market_overview_includes_verified_limit_pool_counts(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.get_limit_counts = Mock(return_value=replace(
+        dataset(pd.DataFrame([{"limit_up_count": 42, "limit_down_count": 7}]), "fixture.limit-pools"),
+        source_timestamp=datetime(2026, 8, 19, 15, 0, tzinfo=SHANGHAI),
+    ))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    market = result.modules["market"].payload
+    assert market["涨停家数"] == 42
+    assert market["跌停家数"] == 7
+    assert market["涨跌停数据源"] == "fixture.limit-pools"
+    gateway.get_limit_counts.assert_called_once_with(NOW.date())
+
+
+def test_limit_pool_failure_is_redacted_and_marks_market_partial(tmp_path, deps) -> None:
+    gateway = FakeGateway()
+    gateway.get_limit_counts = Mock(side_effect=RuntimeError("token=private"))
+
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, gateway=gateway),
+        force=True,
+        preview_only=True,
+        output_dir=tmp_path,
+    )
+
+    market = result.modules["market"]
+    assert market.status == "partial"
+    assert market.payload["涨停家数"] == "不可用"
+    assert "market_limit_counts_unavailable" in market.warnings
+    assert "private" not in json.dumps(market.payload, ensure_ascii=False)
 
 
 def test_untrusted_market_breadth_is_unavailable_and_forces_watch_summary(tmp_path, deps) -> None:
@@ -2923,6 +3261,7 @@ def test_complete_market_breadth_counts_are_internally_consistent() -> None:
     market = _market_payload(dataset(pd.DataFrame({
         "change_pct": [1.0, -1.0, 0.0, 2.0],
         "amount": [10.0, 20.0, 30.0, 40.0],
+        "total_mv": [10.0, 20.0, 30.0, 40.0],
     })), authoritative=True)
 
     assert market["股票数量"] == 4
@@ -2933,6 +3272,21 @@ def test_complete_market_breadth_counts_are_internally_consistent() -> None:
     assert market["上涨占比"] == 50.0
     assert market["市场温度"] == "中性"
     assert market["成交额"] == 100.0
+    assert market["市场风格"] == "大盘占优"
+    assert market["大盘组平均涨跌幅"] == 2.0
+    assert market["小盘组平均涨跌幅"] == 1.0
+
+
+def test_market_style_requires_complete_positive_market_cap_evidence() -> None:
+    market = _market_payload(dataset(pd.DataFrame({
+        "change_pct": [1.0, -1.0, 0.0, 2.0],
+        "amount": [10.0, 20.0, 30.0, 40.0],
+        "total_mv": [10.0, None, 30.0, 40.0],
+    })), authoritative=True)
+
+    assert market["市场风格"] == "不可用"
+    assert "大盘组平均涨跌幅" not in market
+    assert "小盘组平均涨跌幅" not in market
 
 
 def test_incomplete_authoritative_breadth_marks_market_partial_and_summary_watch(tmp_path, deps) -> None:

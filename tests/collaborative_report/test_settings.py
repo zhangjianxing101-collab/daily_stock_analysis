@@ -32,6 +32,17 @@ def test_from_env_parses_required_portfolio_and_defaults() -> None:
     assert settings.short_limit == 5
     assert settings.swing_limit == 5
     assert settings.screen_prefilter == 120
+    assert settings.position_sizing is False
+
+
+@pytest.mark.parametrize("value", ["1", "true", "yes", "on"])
+def test_position_sizing_can_be_enabled_explicitly(value: str) -> None:
+    assert load_settings(COLLAB_POSITION_SIZING=value).position_sizing is True
+
+
+def test_position_sizing_rejects_invalid_boolean() -> None:
+    with pytest.raises(ValueError, match="COLLAB_POSITION_SIZING must be a boolean"):
+        load_settings(COLLAB_POSITION_SIZING="sometimes")
 
 
 def test_capital_defaults_to_twenty_thousand() -> None:

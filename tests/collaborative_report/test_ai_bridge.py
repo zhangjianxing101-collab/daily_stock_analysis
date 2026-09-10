@@ -336,6 +336,21 @@ def test_isolated_child_crash_and_timeout_are_categorical(factory, timeout) -> N
     assert str(error.value) in {"ai_child_failed", "ai_child_timeout"}
 
 
+def test_isolated_timeout_is_reported_without_provider_details(monkeypatch) -> None:
+    import src.collaborative_report.ai_bridge as ai_bridge
+
+    monkeypatch.setattr(
+        ai_bridge,
+        "_run_isolated_pipeline",
+        Mock(side_effect=ai_bridge.IsolatedPipelineError("ai_child_timeout")),
+    )
+
+    output = ai_bridge.enrich_codes(["600519"], observed_at=OBSERVED_AT)
+
+    assert output.status == "unavailable"
+    assert output.warnings == ("AI分析暂不可用（ai_child_timeout）",)
+
+
 def test_empty_valid_codes_skip_with_immutable_payload_and_fixed_warning(monkeypatch) -> None:
     import src.collaborative_report.ai_bridge as ai_bridge
 

@@ -195,6 +195,37 @@ class TestFetcherSourceOptimization(unittest.TestCase):
             DataFetcherManager.reset_daily_source_health()
 
     @patch("src.config.get_config")
+    def test_daily_validator_rejects_stale_source_and_continues_fallback(self, mock_get_config):
+        mock_get_config.return_value = SimpleNamespace()
+        DataFetcherManager.reset_daily_source_health()
+        try:
+            stale = MagicMock(name="stale_fetcher")
+            stale.name = "EfinanceFetcher"
+            stale.priority = 0
+            stale.get_daily_data.return_value = _make_daily_df()
+
+            current = MagicMock(name="current_fetcher")
+            current.name = "AkshareFetcher"
+            current.priority = 1
+            current_frame = _make_daily_df().assign(date="2026-05-08")
+            current.get_daily_data.return_value = current_frame
+
+            def require_current(frame):
+                if frame.iloc[-1]["date"] != "2026-05-08":
+                    raise ValueError("stale")
+                return frame
+
+            manager = DataFetcherManager(fetchers=[stale, current])
+            frame, source = manager.get_daily_data("000001", validator=require_current)
+
+            self.assertEqual(source, "AkshareFetcher")
+            self.assertEqual(frame.iloc[-1]["date"], "2026-05-08")
+            stale.get_daily_data.assert_called_once()
+            current.get_daily_data.assert_called_once()
+        finally:
+            DataFetcherManager.reset_daily_source_health()
+
+    @patch("src.config.get_config")
     def test_manager_enables_longbridge_with_oauth_client_id(self, mock_get_config):
         mock_get_config.return_value = SimpleNamespace(
             tushare_token="",

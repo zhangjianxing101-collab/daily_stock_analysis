@@ -46,15 +46,18 @@ are also genuinely missing or zero. Malformed text, negative values, duplicate
 codes, or missing prices alongside trading activity still fail validation. The
 report discloses excluded-row and screening-field coverage counts.
 Snapshot pages with different source-session dates are rejected before aggregation.
-When any held position lacks a validated price, the report cannot determine available
-cash and suppresses all new-position sizing. An explicitly empty portfolio still
-uses the configured capital baseline.
+When optional position sizing is enabled, any held position without a validated
+price suppresses all new-position sizing. Position sizing is disabled by default
+for the current market-and-sector research scope.
 
 Production snapshots supplement THS names, volume ratios and turnover percentages
 from the project's public Tencent quote source before screening the full universe.
 THS traded amount is never interpreted as turnover percentage. Supplements require
-exact identities, independent same-session timestamps at or after 15:00, no future
-timestamps, finite metrics, and price agreement within CNY 0.01. Rejected fields
+exact identities, no future timestamps, finite metrics, and price agreement within
+CNY 0.01. A completed-session quote must be stamped at or after 15:00. On an XSHG
+trading day before 09:30, an exactly matching current-day quote may prove the prior
+session close; the report records that prior close as the data-session identity.
+Current-day quotes at or after 09:30 cannot be used to backfill a premarket report. Rejected fields
 remain unavailable. Codes outside the supplemental provider's supported exchange
 prefixes do not block enrichment for the supported universe. Partial coverage marks screening as partial. For conservative
 freshness checks, the combined dataset uses the oldest accepted source timestamp;
@@ -63,11 +66,26 @@ one expired source can therefore invalidate the combined snapshot.
 Preview runs additionally produce bounded `provider-quality` diagnostics containing
 only counts and parsed dates. Raw responses, stderr and credentials are not uploaded.
 
+The market overview derives style only when every quoted stock has a finite,
+positive total-market-cap value. It compares the equal-weight returns of the
+largest and smallest 30% of the verified snapshot and reports both group averages
+beside `大盘占优`, `小盘占优`, or `均衡`. A 0.5 percentage-point spread is required
+before declaring either size group dominant.
+
+Post-close limit-up and limit-down counts come from AKShare's documented
+Eastmoney daily pools (`stock_zt_pool_em` and `stock_zt_pool_dtgc_em`) for the
+report's exact completed session. The report records the source and session time.
+It does not infer these counts from percentage-change thresholds because board,
+ST, IPO, and price-rounding rules make that approximation unsafe. A provider
+failure, malformed response, or session before 15:00 leaves the counts unavailable
+and marks the market module partial.
+
 ## Industry and concept analysis
 
-The postmarket report reads industry and concept board snapshots independently from
-the AkShare Eastmoney adapters. A failure in one board family does not suppress the
-other. Each accepted row requires a unique non-empty board name and a finite daily
+The postmarket report reads industry and concept board snapshots independently,
+preferring the configured THS catalog and index quote APIs and using the AkShare
+Eastmoney adapters only as a recoverable fallback. A failure in one board family
+does not suppress the other. Each accepted row requires a unique non-empty board name and a finite daily
 change. Breadth is calculated from advancing and declining constituent counts, and
 activity is the percentile rank of turnover rate within the same board family.
 Leader identity and leader change are supporting evidence. Missing optional evidence
@@ -115,6 +133,12 @@ already equal technical/THS score. It cannot create a candidate, change a score,
 override data-quality suppression, alter entry/stop/target levels, size a position, or
 remove the requirement for manual confirmation.
 
+The report also shows a deduplicated featured watchlist of at most five candidates.
+Only candidates carrying explicit sector-leader or sector-membership evidence are
+eligible. If fewer than three qualify, the report shows the smaller verified set
+instead of filling the list with unsupported names. The full short-term and swing
+pools remain visible as the audit trail.
+
 ## Gold history completeness
 
 Empty or stale gold responses, or recognized connection/time-out failures, allow
@@ -154,7 +178,21 @@ or diagnostic manifest.
 
 ## Repository variables
 
-Set non-secret Repository variables for the delivery policy and model choices. Set `COLLAB_CAPITAL_CNY` to `20000` for a CNY 20,000 baseline, `COLLAB_RISK_FRACTION` to `0.02`, `COLLAB_SHORT_LIMIT` and `COLLAB_SWING_LIMIT` to `5`, and `COLLAB_SCREEN_PREFILTER` to `120`. Model names are repository variables; the workflow has safe defaults when a model variable is omitted.
+Set non-secret Repository variables for the delivery policy and model choices.
+`COLLAB_SHORT_LIMIT` and `COLLAB_SWING_LIMIT` default to `5`, and
+`COLLAB_SCREEN_PREFILTER` defaults to `120`. `COLLAB_POSITION_SIZING` defaults to
+`false`; leave it disabled when the report should analyze only the market, sectors,
+and candidates. `COLLAB_CAPITAL_CNY` and `COLLAB_RISK_FRACTION` apply only when
+position sizing is explicitly enabled; the default reference capital is CNY 20,000.
+Model names are repository variables; the
+workflow has safe defaults when a model variable is omitted.
+
+The report's market-news section uses enabled ORZ/NewsNow China-market templates
+as discovery-only clues. It diversifies financial sources, keeps Baidu items in a
+separate macro-attention count, rejects stale, undated, or future-dated items, and
+does not add these clues to technical scores. Aggregator timestamps and repeated
+landing-page links are not treated as proof; material facts must be checked against
+the original publisher or an official disclosure before any manual decision.
 
 ## Manual operation
 

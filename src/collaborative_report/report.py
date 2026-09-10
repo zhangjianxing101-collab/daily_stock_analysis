@@ -27,17 +27,21 @@ _DISCLAIMER_LINES = (
     "盘前参考价不代表成交价。",
 )
 _NO_MORNING_STATUS = "暂无早盘候选记录，状态不可用"
+_FEATURED_TITLE = "板块龙头精选观察（最多5只）"
 _MODULE_TITLES = {
-    "global": "全球与黄金背景",
-    "gold": "黄金量化背景",
+    "global": "Global Markets and Gold Background / 全球与黄金背景",
+    "gold": "Gold Quantitative Background / 黄金量化背景",
     "portfolio": "持仓状态",
     "market": "市场宽度",
     "backtests": "回测摘要",
     "ai": "AI分析",
     "screening": "筛选状态",
+    "sizing": "资金分配",
     "ths_market_evidence": "同花顺市场证据",
     "ths_financial_evidence": "同花顺基本面证据",
     "decision_summary": "决策摘要",
+    "delivery_readiness": "报告完整性检查",
+    "news": "市场新闻与事件线索",
 }
 _SECTOR_TITLES = {
     "industry_sectors": "行业板块",
@@ -158,10 +162,154 @@ def _display_value(value: Any) -> str:
     return str(value)
 
 
+def _fraction_percent(value: Any, digits: int = 2) -> str:
+    normalized = _finite_number(value)
+    return "不可用" if normalized is None else f"{normalized * 100:.{digits}f}%"
+
+
+def _module_rows(name: str, payload: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+    if name == "market":
+        rows: list[tuple[str, str]] = []
+        for key, value in payload.items():
+            if key == "上涨占比" and _finite_number(value) is not None:
+                rendered = f"{float(value):.2f}%"
+            elif key == "成交额" and _finite_number(value) is not None:
+                rendered = f"{float(value) / 100_000_000:,.2f} 亿元"
+            elif key in {"大盘组平均涨跌幅", "小盘组平均涨跌幅"} and _finite_number(value) is not None:
+                rendered = f"{float(value):.2f}%"
+            else:
+                rendered = _display_value(value)
+            rows.append((str(key), rendered))
+        return tuple(rows)
+    if name == "global":
+        labels = {
+            "^GSPC": "S&P 500", "^IXIC": "NASDAQ Composite", "^DJI": "Dow Jones",
+            "GC=F": "Gold Futures (USD/oz)", "HG=F": "Copper Futures (USD/lb)",
+            "CL=F": "WTI Crude Oil (USD/bbl)", "CNY=X": "USD/CNY",
+        }
+        rows = []
+        source = payload.get("data_source")
+        if source is not None:
+            rows.append(("Data source", _display_value(source)))
+        for symbol, label in labels.items():
+            item = payload.get(symbol)
+            if not isinstance(item, Mapping):
+                continue
+            close = _finite_number(item.get("close"))
+            change = _finite_number(item.get("change_pct"))
+            as_of = item.get("as_of_date")
+            value = "不可用" if close is None or change is None else f"{close:,.2f} | {change:+.2f}% | {as_of}"
+            rows.append((label, value))
+        known = {"data_source", *labels}
+        rows.extend(
+            (str(key), _display_value(value))
+            for key, value in payload.items()
+            if key not in known
+        )
+        return tuple(rows)
+    if name == "backtests":
+        rows = []
+        for code, strategies in payload.items():
+            if not isinstance(strategies, Mapping):
+                continue
+            stock_name = str(strategies.get("name") or "名称不可用")
+            for strategy_key, strategy_label in (("short", "短线"), ("swing", "波段")):
+                result = strategies.get(strategy_key)
+                if not isinstance(result, Mapping):
+                    continue
+                rows.append((
+                    f"{code} {stock_name}｜{strategy_label}",
+                    "；".join((
+                        f"区间 {result.get('start_date', '不可用')} 至 {result.get('end_date', '不可用')}",
+                        f"交易 {result.get('trade_count', '不可用')} 次",
+                        f"胜率 {_fraction_percent(result.get('win_rate'))}",
+                        f"累计收益 {_fraction_percent(result.get('total_return'))}",
+                        f"最大回撤 {_fraction_percent(result.get('max_drawdown'))}",
+                        f"最大连续亏损 {result.get('consecutive_losses', '不可用')} 次",
+                        f"期末权益 ¥{float(result['final_equity']):,.2f}" if _finite_number(result.get('final_equity')) is not None else "期末权益 不可用",
+                    )),
+                ))
+        return tuple(rows)
+    if name == "gold":
+        rows = []
+        labels = (
+            ("Direction", "direction"), ("Signal", "signal"), ("Risk level", "risk_level"),
+            ("Watch only", "watch_only"), ("Gold futures close (USD/oz)", "latest_close"),
+            ("MA20 (USD/oz)", "fast_ma"), ("MA50 (USD/oz)", "slow_ma"),
+            ("China reference (CNY/gram)", "china_reference_cny_per_gram"),
+            ("Data source", "data_source"),
+        )
+        for label, key in labels:
+            value = payload.get(key)
+            if key in {"latest_close", "fast_ma", "slow_ma", "china_reference_cny_per_gram"} and _finite_number(value) is not None:
+                rendered = f"{float(value):,.2f}"
+            else:
+                rendered = _display_value(value)
+            rows.append((label, rendered))
+        backtest = payload.get("backtest")
+        if isinstance(backtest, Mapping):
+            rows.extend((
+                ("Backtest period", f"{backtest.get('start_date', 'unavailable')} to {backtest.get('end_date', 'unavailable')}"),
+                ("Backtest trades", f"{backtest.get('trade_count', 'unavailable')}"),
+                ("Backtest win rate", _fraction_percent(backtest.get("win_rate"))),
+                ("Backtest total return", _fraction_percent(backtest.get("total_return"))),
+                ("Backtest maximum drawdown", _fraction_percent(backtest.get("max_drawdown"))),
+                ("Backtest consecutive losses", f"{backtest.get('consecutive_losses', 'unavailable')}"),
+            ))
+        checks = payload.get("risk_checks")
+        if isinstance(checks, Mapping):
+            rows.extend((
+                ("Risk check: max risk per trade", _fraction_percent(checks.get("single_trade_risk_limit"))),
+                ("Risk check: stop loss", _fraction_percent(checks.get("stop_loss"))),
+                ("Risk check: drawdown pause", _fraction_percent(checks.get("drawdown_pause"))),
+                ("Risk check: consecutive-loss pause", f"{checks.get('consecutive_loss_pause', 'unavailable')} losses"),
+                ("Risk check: minimum sample", f"{checks.get('minimum_trade_sample', 'unavailable')} trades"),
+            ))
+        return tuple(rows)
+    if name == "screening":
+        rows = [
+            (str(key), _display_value(value))
+            for key, value in payload.items()
+            if key not in {"短线候选", "波段候选"}
+        ]
+        for key, label in (("短线候选", "短线"), ("波段候选", "波段")):
+            candidates = payload.get(key)
+            if not isinstance(candidates, (tuple, list)):
+                continue
+            for index, item in enumerate(candidates, 1):
+                if not isinstance(item, Mapping):
+                    continue
+                sector = item.get("industry_sector") or "板块待补充"
+                rules = item.get("matched_rules") or ()
+                rows.append((
+                    f"{label}{index}",
+                    f"{item.get('code', '')} {item.get('name', '名称不可用')}；收盘 {item.get('close', '不可用')}；"
+                    f"评分 {item.get('score', '不可用')}；行业 {sector}；规则 {_display_value(rules)}",
+                ))
+        return tuple(rows)
+    if name == "ai":
+        if not all(isinstance(code, str) and len(code) == 6 and code.isdigit() for code in payload):
+            return tuple((str(key), _display_value(value)) for key, value in payload.items())
+        rows = []
+        for code, item in payload.items():
+            if not isinstance(item, Mapping):
+                continue
+            name_value = str(item.get("name") or "名称不可用")
+            fields = (
+                ("结论", item.get("conclusion")), ("建议", item.get("operation_advice") or item.get("action_label") or item.get("action")),
+                ("置信度", item.get("confidence_level")), ("风险", item.get("risk_warning")),
+                ("新闻", item.get("news_summary")), ("基本面", item.get("fundamental_analysis")),
+            )
+            detail = "；".join(f"{label}: {_display_value(value)}" for label, value in fields if value not in (None, "", (), []))
+            rows.append((f"{code} {name_value}", detail or "AI返回成功但无可展示字段"))
+        return tuple(rows)
+    return tuple((str(key), _display_value(value)) for key, value in payload.items())
+
+
 def _module_view(title: str, result: ModuleResult | None) -> _ModuleView:
     if result is None:
         return _ModuleView(title, "unavailable", "暂无", (), ("数据暂不可用",))
-    rows = tuple((str(key), _display_value(value)) for key, value in result.payload.items())
+    rows = _module_rows(result.name, result.payload)
     warnings = tuple(dict.fromkeys(str(warning) for warning in result.warnings))
     return _ModuleView(title, result.status, _format_timestamp(result.observed_at), rows, warnings)
 
@@ -401,6 +549,44 @@ def _morning_rows(items: Sequence[Mapping[str, Any]]) -> tuple[tuple[str, str, s
     )
 
 
+def _featured_candidates(
+    short_term: Sequence[Candidate],
+    swing: Sequence[Candidate],
+    *,
+    limit: int = 5,
+) -> tuple[Candidate, ...]:
+    """Select a deduplicated watchlist backed by explicit sector evidence."""
+
+    eligible = [
+        item
+        for item in (*short_term, *swing)
+        if (
+            item.industry_sector.strip()
+            or item.concept_sectors
+            or "leading_sector" in item.matched_rules
+        )
+    ]
+    eligible.sort(
+        key=lambda item: (
+            bool(item.warning),
+            -(bool(item.industry_sector.strip()) + len(item.concept_sectors)),
+            -item.score,
+            item.code,
+            item.horizon,
+        )
+    )
+    selected: list[Candidate] = []
+    seen: set[str] = set()
+    for item in eligible:
+        if item.code in seen:
+            continue
+        seen.add(item.code)
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return tuple(selected)
+
+
 def _plain_text(
     mode: ReportMode,
     report_date: date,
@@ -411,6 +597,7 @@ def _plain_text(
     short_candidates: Sequence[_CandidateView],
     swing_title: str,
     swing_candidates: Sequence[_CandidateView],
+    featured_candidates: Sequence[_CandidateView],
     morning_rows: Sequence[tuple[str, str, str]],
 ) -> str:
     lines = [build_subject(mode, report_date), ""]
@@ -464,6 +651,18 @@ def _plain_text(
         else:
             lines.append(_NO_MORNING_STATUS)
         lines.append("")
+    lines.append(_FEATURED_TITLE)
+    if not featured_candidates:
+        lines.append("暂无具备完整板块证据的精选标的")
+    for item in featured_candidates:
+        lines.append(f"{item.code} {item.name}（{item.horizon}，评分 {item.score}）")
+        lines.append(f"状态：{'等待人工确认' if item.actionable else '仅供观察'}")
+        lines.append(f"触发条件：{item.trigger}；止损：{item.stop}；目标：{item.target}")
+        if item.sector_context:
+            lines.append("；".join(item.sector_context))
+        if item.warning:
+            lines.append(f"警告：{item.warning}")
+    lines.append("")
     for title, candidates in ((short_title, short_candidates), (swing_title, swing_candidates)):
         lines.append(title)
         if not candidates:
@@ -503,8 +702,12 @@ def render_report(
             raise
         target_session = None
     if normalized_mode is ReportMode.PREMARKET:
-        leading_sections = _module_sections(modules, ("global", "gold", "portfolio"))
-        sector_sections: tuple[_SectorModuleView, ...] = ()
+        leading_sections = _module_sections(
+            modules,
+            ("global", "gold", "portfolio"),
+            excluded_keys=("industry_sectors", "concept_sectors"),
+        )
+        sector_sections = _sector_module_views(modules)
         trailing_sections: tuple[_ModuleView, ...] = ()
         short_title, swing_title = "短线候选池", "波段候选池"
     else:
@@ -531,6 +734,10 @@ def render_report(
         _candidate_view(item, target_session, generated_at)
         for item in swing_candidates
     )
+    featured_views = tuple(
+        _candidate_view(item, target_session, generated_at)
+        for item in _featured_candidates(short_term_candidates, swing_candidates)
+    )
     morning_rows = _morning_rows(morning_candidates)
     subject = build_subject(normalized_mode, report_date, prefix=subject_prefix)
     template = _ENVIRONMENT.get_template("collaborative_report.html.j2")
@@ -545,6 +752,8 @@ def render_report(
         swing_title=swing_title,
         short_candidates=short_views,
         swing_candidates=swing_views,
+        featured_title=_FEATURED_TITLE,
+        featured_candidates=featured_views,
         morning_rows=morning_rows,
         no_morning_status=_NO_MORNING_STATUS,
         disclaimer_lines=_DISCLAIMER_LINES,
@@ -559,6 +768,7 @@ def render_report(
         short_views,
         swing_title,
         swing_views,
+        featured_views,
         morning_rows,
     )
     return RenderedReport(subject=subject, html=html, text=text)

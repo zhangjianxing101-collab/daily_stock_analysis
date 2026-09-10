@@ -27,9 +27,10 @@ def test_snapshot_probe_outputs_counts_not_source_text():
     assert result["invalid_prices"] == 2
     assert result["invalid_prices_zero_activity"] == 1
     assert result["invalid_codes"] == 1
+    assert result["schema_fields"] == ["last_price", "name", "ticker", "turnover", "volume"]
     assert "secret" not in json.dumps(result)
     assert "private-token" not in json.dumps(result)
-    assert all(type(value) is int for value in result.values())
+    assert all(type(value) is int for key, value in result.items() if key != "schema_fields")
 
 
 def test_bar_probe_only_exposes_parsed_dates():

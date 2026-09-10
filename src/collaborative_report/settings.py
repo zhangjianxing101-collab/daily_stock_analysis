@@ -127,6 +127,7 @@ class CollaborativeSettings:
     short_limit: int
     swing_limit: int
     screen_prefilter: int
+    position_sizing: bool = False
 
     @classmethod
     def from_env(cls) -> "CollaborativeSettings":
@@ -157,4 +158,5 @@ class CollaborativeSettings:
             short_limit=short_limit,
             swing_limit=swing_limit,
             screen_prefilter=screen_prefilter,
+            position_sizing=_env_bool("COLLAB_POSITION_SIZING", False),
         )

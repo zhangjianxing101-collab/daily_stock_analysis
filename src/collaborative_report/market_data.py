@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import date, datetime, timedelta, timezone
+from datetime import date, datetime, time, timedelta, timezone
 import logging
 from typing import Any, Callable, Mapping, Sequence
+from zoneinfo import ZoneInfo
 
 import exchange_calendars
 import numpy as np
@@ -71,6 +72,7 @@ _SECTOR_SNAPSHOT_ALIASES = {
     "leader_change_pct": ("领涨股票-涨跌幅", "领涨股涨跌幅", "leader_change_pct"),
 }
 _SECTOR_POSTMARKET_FRESHNESS = timedelta(hours=4)
+_THS_SECTOR_BATCH_SIZE = 100
 _BAR_ALIASES = {
     "date": ("date", "Date", "日期", "时间"),
     "open": ("open", "Open", "开盘"),
@@ -80,6 +82,8 @@ _BAR_ALIASES = {
     "volume": ("volume", "Volume", "成交量"),
 }
 _GLOBAL_SYMBOLS = ("^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F")
+_OPTIONAL_GLOBAL_SYMBOLS = ("CNY=X",)
+_GLOBAL_DOWNLOAD_SYMBOLS = (*_GLOBAL_SYMBOLS, *_OPTIONAL_GLOBAL_SYMBOLS)
 _SYMBOL_CALENDARS = {
     "^GSPC": "XNYS",
     "^IXIC": "XNYS",
@@ -87,8 +91,11 @@ _SYMBOL_CALENDARS = {
     "GC=F": "CMES",
     "HG=F": "CMES",
     "CL=F": "CMES",
+    "CNY=X": "XNYS",
 }
 _THS_SOURCE = "ths.fuyao"
+_XSHG_OPEN = time(9, 30)
+_XSHG_CLOSE = time(15, 0)
 logger = logging.getLogger(__name__)
 _THS_FAILURE_CODES = {
     ThsAuthenticationError: "ths_authentication_failed",
@@ -225,6 +232,28 @@ def _ths_timestamp(timestamp_ms: int | None, observed_at: datetime) -> tuple[dat
     if timestamp > observed_at:
         raise ValueError("THS source timestamp is in the future")
     return timestamp, ()
+
+
+def _supplement_session_identity(
+    timestamp: pd.Timestamp,
+    observed_at: datetime,
+    expected_session: date,
+) -> datetime | None:
+    """Resolve a Tencent quote to the completed session it can prove."""
+
+    local = timestamp.tz_convert("Asia/Shanghai")
+    if local.date() == expected_session and local.time() >= _XSHG_CLOSE:
+        return local.to_pydatetime()
+
+    observed_local = observed_at.astimezone(ZoneInfo("Asia/Shanghai"))
+    if local.date() != observed_local.date() or observed_local.time() >= _XSHG_OPEN:
+        return None
+    try:
+        if not exchange_calendars.get_calendar("XSHG").is_session(pd.Timestamp(observed_local.date())):
+            return None
+    except Exception:
+        return None
+    return datetime.combine(expected_session, _XSHG_CLOSE, tzinfo=ZoneInfo("Asia/Shanghai"))
 
 
 def _ths_items_frame(items: Sequence[Mapping[str, Any]]) -> pd.DataFrame:
@@ -511,6 +540,8 @@ class MarketDataGateway:
         daily_fetcher: Callable[..., tuple[pd.DataFrame, str]] | None = None,
         sector_names_fetcher: Callable[[], pd.DataFrame] | None = None,
         sector_members_fetcher: Callable[[str], pd.DataFrame] | None = None,
+        limit_up_fetcher: Callable[..., pd.DataFrame] | None = None,
+        limit_down_fetcher: Callable[..., pd.DataFrame] | None = None,
         industry_sector_fetcher: Callable[[], pd.DataFrame] | None = None,
         concept_sector_fetcher: Callable[[], pd.DataFrame] | None = None,
         yfinance_download: Callable[..., pd.DataFrame] | None = None,
@@ -522,12 +553,17 @@ class MarketDataGateway:
         self._daily_fetcher = daily_fetcher
         self._sector_names_fetcher = sector_names_fetcher
         self._sector_members_fetcher = sector_members_fetcher
+        self._limit_up_fetcher = limit_up_fetcher
+        self._limit_down_fetcher = limit_down_fetcher
         self._industry_sector_fetcher = industry_sector_fetcher
         self._concept_sector_fetcher = concept_sector_fetcher
         self._yfinance_download = yfinance_download
         self._ths_client = ths_client
         self._snapshot_supplement_fetcher = snapshot_supplement_fetcher
         self._clock = clock or (lambda: datetime.now(timezone.utc))
+        self._latest_full_snapshot: pd.DataFrame | None = None
+        self._latest_full_snapshot_timestamp: datetime | None = None
+        self._latest_leading_industry_codes: dict[str, str] = {}
 
     def _observed_at(self) -> datetime:
         return self._clock()
@@ -563,20 +599,22 @@ class MarketDataGateway:
             warnings = (*warnings, *supplement_warnings)
             if frame.attrs.get("screening_complete_count", 0):
                 source += "+tencent"
-        return MarketDataset(
+        dataset = MarketDataset(
             frame,
             source,
             observed_at,
             warnings,
             source_timestamp,
         )
+        if codes is None:
+            self._latest_full_snapshot = frame.copy(deep=True)
+            self._latest_full_snapshot_timestamp = source_timestamp
+        return dataset
 
     def _enrich_snapshot(self, frame, observed_at, source_timestamp):
         result = frame.copy(deep=True)
         result.attrs["screening_complete_count"] = 0
         warning = "snapshot_screening_fields_incomplete"
-        if source_timestamp is None:
-            return result, observed_at, source_timestamp, (warning,)
         supported_codes: list[str] = []
         for code in result["code"]:
             try:
@@ -599,9 +637,14 @@ class MarketDataGateway:
                 raise ValueError("supplement fields invalid")
         except Exception:
             return result, received_at, source_timestamp, (warning,)
-        # Session dates are always interpreted in the exchange's timezone.
-        exchange_tz = "Asia/Shanghai"
-        expected = pd.Timestamp(source_timestamp).tz_convert(exchange_tz).date()
+        # The THS snapshot timestamp is the response assembly time, not the
+        # quote's completed-session identity. Prove that identity independently.
+        from .session import latest_completed_xshg_session
+
+        try:
+            expected = latest_completed_xshg_session(observed_at)
+        except Exception:
+            return result, received_at, source_timestamp, (warning,)
         indexed = records.set_index("code")
         timestamps = []
         for index, row in result.iterrows():
@@ -613,8 +656,8 @@ class MarketDataGateway:
                 stamp = pd.Timestamp(other["source_timestamp"])
                 if pd.isna(stamp) or stamp.tzinfo is None:
                     continue
-                local = stamp.tz_convert(exchange_tz)
-                if local.date() != expected or local.hour < 15 or stamp > supplement.observed_at:
+                identity = _supplement_session_identity(stamp, observed_at, expected)
+                if identity is None or stamp > supplement.observed_at:
                     continue
                 name = other["name"]
                 price, ratio, turnover = (float(other[key]) for key in ("price", "volume_ratio", "turnover"))
@@ -624,12 +667,16 @@ class MarketDataGateway:
                         or abs(price - float(row["price"])) > 0.01 + 1e-9):
                     continue
                 result.loc[index, ["name", "volume_ratio", "turnover"]] = [name, ratio, turnover]
-                timestamps.append(stamp.to_pydatetime())
+                timestamps.append(identity)
             except (TypeError, ValueError, OverflowError):
                 continue
         result.attrs["screening_complete_count"] = len(timestamps)
         if timestamps:
-            source_timestamp = min(source_timestamp, *timestamps)
+            source_timestamp = (
+                min(timestamps)
+                if source_timestamp is None
+                else min(source_timestamp, *timestamps)
+            )
             result.attrs["supplement_source"] = "tencent"
             result.attrs["supplement_source_timestamp"] = min(timestamps).isoformat()
         warnings = (warning,) if len(timestamps) < len(result) else ()
@@ -703,13 +750,17 @@ class MarketDataGateway:
         if normalized.empty:
             raise ValueError("snapshot provider returned empty data")
         source_timestamp, warnings = _snapshot_source_timestamp(raw)
-        return MarketDataset(
+        dataset = MarketDataset(
             normalized,
             "akshare.stock_zh_a_spot_em",
             self._received_at(observed_at),
             fallback_warnings + warnings,
             source_timestamp,
         )
+        if codes is None:
+            self._latest_full_snapshot = normalized.copy(deep=True)
+            self._latest_full_snapshot_timestamp = source_timestamp
+        return dataset
 
     def _ths_daily_bars(self, code: str, expected_session: date, days: int, observed_at: datetime) -> MarketDataset:
         if type(days) is not int or days <= 0:
@@ -744,7 +795,11 @@ class MarketDataGateway:
             if self._daily_fetcher is None:
                 from data_provider.base import DataFetcherManager
 
-                raw, source = DataFetcherManager().get_daily_data(code, days=days)
+                raw, source = DataFetcherManager().get_daily_data(
+                    code,
+                    days=days,
+                    validator=lambda frame: validate_daily_bars(frame, expected_session),
+                )
             else:
                 raw, source = self._daily_fetcher(code, days=days)
         except Exception:
@@ -822,6 +877,17 @@ class MarketDataGateway:
         return MarketDataset(normalized, _THS_SOURCE + ".index_historical", observed_at, warnings, source_timestamp)
 
     def get_leading_sector_codes(self, limit: int = 10) -> MarketDataset:
+        if self._ths_client is not None and self._latest_leading_industry_codes:
+            allowed_sectors = tuple(dict.fromkeys(self._latest_leading_industry_codes.values()))[:max(limit, 0)]
+            frame = pd.DataFrame(
+                (
+                    {"code": code, "sector": sector}
+                    for code, sector in self._latest_leading_industry_codes.items()
+                    if sector in allowed_sectors
+                ),
+                columns=["code", "sector"],
+            )
+            return MarketDataset(frame, _THS_SOURCE + ".index_constituents", self._observed_at())
         try:
             if self._sector_names_fetcher is None or self._sector_members_fetcher is None:
                 import akshare
@@ -866,13 +932,58 @@ class MarketDataGateway:
         frame = pd.DataFrame(records, columns=["code", "sector"])
         return MarketDataset(frame, "akshare.industry_boards", self._observed_at(), tuple(warnings))
 
+    def get_limit_counts(self, expected_session: date) -> MarketDataset:
+        """Return exact Eastmoney limit-pool counts for one completed session."""
+
+        if not isinstance(expected_session, date) or isinstance(expected_session, datetime):
+            raise ValueError("expected_session must be a date")
+        requested_at = self._observed_at()
+        try:
+            if self._limit_up_fetcher is None or self._limit_down_fetcher is None:
+                import akshare
+
+                up_fetcher = self._limit_up_fetcher or akshare.stock_zt_pool_em
+                down_fetcher = self._limit_down_fetcher or akshare.stock_zt_pool_dtgc_em
+            else:
+                up_fetcher = self._limit_up_fetcher
+                down_fetcher = self._limit_down_fetcher
+            session_key = expected_session.strftime("%Y%m%d")
+            limit_up = up_fetcher(date=session_key)
+            limit_down = down_fetcher(date=session_key)
+        except Exception:
+            raise ValueError("limit pool provider unavailable") from None
+        if not isinstance(limit_up, pd.DataFrame) or not isinstance(limit_down, pd.DataFrame):
+            raise ValueError("limit pool provider returned invalid data")
+        received_at = self._received_at(requested_at)
+        source_timestamp = datetime.combine(expected_session, time(15), tzinfo=ZoneInfo("Asia/Shanghai"))
+        if source_timestamp > received_at:
+            raise ValueError("limit pool session incomplete")
+        frame = pd.DataFrame([{
+            "limit_up_count": len(limit_up),
+            "limit_down_count": len(limit_down),
+        }])
+        return MarketDataset(
+            frame,
+            "akshare.eastmoney_limit_pools",
+            received_at,
+            source_timestamp=source_timestamp,
+        )
+
     def get_sector_snapshot(self, sector_type: str) -> MarketDataset:
         if not isinstance(sector_type, str) or sector_type not in {"industry", "concept"}:
             raise ValueError("sector type invalid")
-        requested_at = self._observed_at()
-        fetcher = (
+        configured_fetcher = (
             self._industry_sector_fetcher if sector_type == "industry" else self._concept_sector_fetcher
         )
+        if configured_fetcher is None and self._ths_client is not None:
+            try:
+                return self._ths_sector_snapshot(sector_type)
+            except ThsResponseError:
+                raise ValueError(f"{sector_type} sector provider returned invalid data") from None
+            except _RECOVERABLE_THS_ERRORS:
+                logger.warning("%s sector primary source unavailable", sector_type)
+        requested_at = self._observed_at()
+        fetcher = configured_fetcher
         try:
             if fetcher is None:
                 import akshare
@@ -913,6 +1024,151 @@ class MarketDataGateway:
             source_timestamp,
         )
 
+    def _ths_sector_snapshot(self, sector_type: str) -> MarketDataset:
+        """Build a sector board from the documented THS catalog and quote APIs."""
+
+        requested_at = self._observed_at()
+        client = self._require_ths_client()
+        tag = ThsIndexTag.INDUSTRY if sector_type == "industry" else ThsIndexTag.CONCEPT
+        catalog = client.ths_index_catalog(tag)
+        received_at = self._received_at(requested_at)
+        catalog_timestamp, catalog_warnings = _ths_timestamp(catalog.timestamp_ms, received_at)
+
+        names: dict[str, str] = {}
+        for item in catalog.items:
+            thscode = item.get("thscode")
+            name = item.get("name")
+            if (
+                not isinstance(thscode, str)
+                or not thscode.strip()
+                or not isinstance(name, str)
+                or not name.strip()
+            ):
+                continue
+            normalized_code = thscode.strip().upper()
+            normalized_name = name.strip()
+            if normalized_code in names or normalized_name in names.values():
+                raise ThsResponseError("THS API returned duplicate sector catalog rows")
+            names[normalized_code] = normalized_name
+        if not names:
+            raise ThsDataUnavailableError(3002)
+
+        rows: list[dict[str, object]] = []
+        seen: set[str] = set()
+        snapshot_timestamps: list[datetime] = []
+        codes = tuple(names)
+        for start in range(0, len(codes), _THS_SECTOR_BATCH_SIZE):
+            response = client.index_snapshot(codes[start:start + _THS_SECTOR_BATCH_SIZE])
+            received_at = self._received_at(received_at)
+            response_timestamp, _ = _ths_timestamp(response.timestamp_ms, received_at)
+            if response_timestamp is not None:
+                snapshot_timestamps.append(response_timestamp)
+            for item in response.items:
+                thscode = item.get("thscode")
+                if not isinstance(thscode, str):
+                    continue
+                normalized_code = thscode.strip().upper()
+                if normalized_code not in names or normalized_code in seen:
+                    continue
+                seen.add(normalized_code)
+                rows.append({
+                    "thscode": normalized_code,
+                    "name": names[normalized_code],
+                    "change_pct": item.get("price_change_ratio_pct"),
+                    "amount": item.get("turnover"),
+                })
+        if not rows:
+            raise ThsDataUnavailableError(3002)
+
+        raw = pd.DataFrame(rows)
+        raw, received_at, constituent_warnings = self._enrich_ths_sector_rows(
+            raw,
+            client,
+            received_at,
+            sector_type=sector_type,
+        )
+        normalized, normalization_warnings = _normalize_sector_snapshot(raw, sector_type)
+        missing = len(names) - len(seen)
+        warnings = list(catalog_warnings)
+        warnings.extend(constituent_warnings)
+        warnings.extend(normalization_warnings)
+        if missing:
+            warnings.append(f"THS sector snapshot rows missing: {missing}")
+        evidence_timestamps = [*snapshot_timestamps]
+        if self._latest_full_snapshot_timestamp is not None:
+            evidence_timestamps.append(self._latest_full_snapshot_timestamp)
+        source_timestamp = min(evidence_timestamps) if evidence_timestamps else catalog_timestamp
+        return MarketDataset(
+            normalized,
+            _THS_SOURCE + ".index_snapshot",
+            received_at,
+            tuple(dict.fromkeys(warnings)),
+            source_timestamp,
+        )
+
+    def _enrich_ths_sector_rows(
+        self,
+        rows: pd.DataFrame,
+        client: ThsMarketDataClient,
+        received_at: datetime,
+        *,
+        sector_type: str,
+    ) -> tuple[pd.DataFrame, datetime, tuple[str, ...]]:
+        """Derive breadth and leaders for displayed sectors from the full stock snapshot."""
+
+        if sector_type == "industry":
+            self._latest_leading_industry_codes = {}
+        snapshot = self._latest_full_snapshot
+        if snapshot is None or snapshot.empty or "thscode" not in rows or "change_pct" not in rows:
+            return rows, received_at, ()
+        required = {"code", "name", "change_pct"}
+        if not required.issubset(snapshot.columns) or snapshot["code"].duplicated().any():
+            return rows, received_at, ("THS sector constituent evidence unavailable",)
+
+        ranked = rows.assign(_change=pd.to_numeric(rows["change_pct"], errors="coerce"))
+        ranked = ranked.dropna(subset=["_change"]).sort_values(
+            ["_change", "name"], ascending=[False, True], kind="stable",
+        )
+        selected = tuple(dict.fromkeys((*ranked.head(20).index, *ranked.tail(10).index)))
+        quotes = snapshot.set_index("code", drop=False)
+        enriched = rows.copy(deep=True)
+        failures = 0
+        for index in selected:
+            try:
+                response = client.ths_index_constituents(str(enriched.at[index, "thscode"]))
+                received_at = self._received_at(received_at)
+                member_codes = {
+                    code
+                    for item in response.items
+                    for code in (_optional_canonical_code(str(item.get("thscode", ""))[:6]),)
+                    if code is not None
+                }
+                if sector_type == "industry" and index in ranked.head(20).index:
+                    sector_name = str(enriched.at[index, "name"]).strip()
+                    for code in sorted(member_codes):
+                        self._latest_leading_industry_codes.setdefault(code, sector_name)
+                members = quotes.loc[quotes.index.intersection(member_codes)].copy()
+                changes = pd.to_numeric(members["change_pct"], errors="coerce")
+                valid = np.isfinite(changes)
+                members = members.loc[valid].copy()
+                changes = changes.loc[valid]
+                if members.empty:
+                    raise ValueError
+                enriched.at[index, "advance_count"] = int((changes > 0).sum())
+                enriched.at[index, "decline_count"] = int((changes < 0).sum())
+                leader_index = changes.sort_values(ascending=False, kind="stable").index[0]
+                leader = members.loc[leader_index]
+                leader_name = leader["name"]
+                if not isinstance(leader_name, str) or not leader_name.strip():
+                    raise ValueError
+                enriched.at[index, "leader_name"] = leader_name.strip()
+                enriched.at[index, "leader_code"] = str(leader["code"])
+                enriched.at[index, "leader_change_pct"] = float(changes.loc[leader_index])
+            except Exception:
+                failures += 1
+        warnings = (f"THS sector constituent evidence unavailable: {failures}",) if failures else ()
+        return enriched, received_at, warnings
+
     def _download(self, *args, **kwargs) -> pd.DataFrame:
         if self._yfinance_download is None:
             import yfinance
@@ -928,14 +1184,15 @@ class MarketDataGateway:
                     return raw.xs("Close", axis=1, level=level, drop_level=True).copy()
             raise ValueError("global provider returned invalid data")
         if all(symbol in raw.columns for symbol in _GLOBAL_SYMBOLS):
-            return raw.loc[:, _GLOBAL_SYMBOLS].copy()
+            available = [symbol for symbol in _GLOBAL_DOWNLOAD_SYMBOLS if symbol in raw.columns]
+            return raw.loc[:, available].copy()
         raise ValueError("global provider returned invalid data")
 
     def get_global_snapshot(self) -> MarketDataset:
         observed_at = self._observed_at()
         try:
             raw = self._download(
-                list(_GLOBAL_SYMBOLS),
+                list(_GLOBAL_DOWNLOAD_SYMBOLS),
                 period="5d",
                 interval="1d",
                 auto_adjust=False,
@@ -949,9 +1206,10 @@ class MarketDataGateway:
         closes = self._global_closes(raw)
         records: list[dict[str, object]] = []
         warnings: list[str] = []
-        for symbol in _GLOBAL_SYMBOLS:
+        for symbol in _GLOBAL_DOWNLOAD_SYMBOLS:
             if symbol not in closes.columns:
-                warnings.append(f"global close unavailable: {symbol}")
+                if symbol in _GLOBAL_SYMBOLS:
+                    warnings.append(f"global close unavailable: {symbol}")
                 continue
             values = pd.to_numeric(closes[symbol], errors="coerce").replace([np.inf, -np.inf], np.nan).dropna()
             latest_completed = _latest_completed_session_date(symbol, observed_at)
@@ -959,12 +1217,14 @@ class MarketDataGateway:
             values = values.loc[completed]
             values = values.sort_index()
             if len(values) < 2:
-                warnings.append(f"global close unavailable: {symbol}")
+                if symbol in _GLOBAL_SYMBOLS:
+                    warnings.append(f"global close unavailable: {symbol}")
                 continue
             previous_close = float(values.iloc[-2])
             close = float(values.iloc[-1])
             if previous_close <= 0 or close <= 0:
-                warnings.append(f"global close unavailable: {symbol}")
+                if symbol in _GLOBAL_SYMBOLS:
+                    warnings.append(f"global close unavailable: {symbol}")
                 continue
             records.append(
                 {

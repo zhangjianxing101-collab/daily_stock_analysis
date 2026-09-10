@@ -185,6 +185,107 @@ def test_ths_supplement_requires_independent_time_identity_and_price_agreement(f
         assert data.frame.attrs["screening_complete_count"] == 0
 
 
+def test_premarket_supplement_uses_last_completed_session_not_ths_response_time() -> None:
+    observed = datetime(2026, 8, 20, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    prior_close = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    client = Mock()
+    client.a_share_snapshot.return_value = ThsApiResponse(
+        {
+            "timestamp": int(observed.timestamp() * 1000),
+            "item": [ths_snapshot_item()],
+        },
+        None,
+    )
+    supplement = Mock(return_value=SimpleNamespace(
+        frame=pd.DataFrame([{
+            "code": "600000",
+            "name": "Stock",
+            "price": 10.0,
+            "volume_ratio": 1.2,
+            "turnover": 2.3,
+            "source_timestamp": prior_close,
+        }]),
+        observed_at=observed,
+    ))
+
+    result = MarketDataGateway(
+        ths_client=client,
+        snapshot_supplement_fetcher=supplement,
+        clock=lambda: observed,
+    ).get_a_share_snapshot(["600000"])
+
+    assert result.source_timestamp == prior_close
+    assert result.frame.attrs["screening_complete_count"] == 1
+    assert result.source.endswith("+tencent")
+
+
+def test_premarket_current_day_quote_proves_prior_close_before_xshg_open() -> None:
+    observed = datetime(2026, 8, 20, 9, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    prior_close = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    client = Mock()
+    client.a_share_snapshot.return_value = ThsApiResponse(
+        {
+            "timestamp": int(observed.timestamp() * 1000),
+            "item": [ths_snapshot_item()],
+        },
+        None,
+    )
+    supplement = Mock(return_value=SimpleNamespace(
+        frame=pd.DataFrame([{
+            "code": "600000",
+            "name": "Stock",
+            "price": 10.0,
+            "volume_ratio": 1.2,
+            "turnover": 2.3,
+            "source_timestamp": observed,
+        }]),
+        observed_at=observed,
+    ))
+
+    result = MarketDataGateway(
+        ths_client=client,
+        snapshot_supplement_fetcher=supplement,
+        clock=lambda: observed,
+    ).get_a_share_snapshot(["600000"])
+
+    assert result.source_timestamp == prior_close
+    assert result.frame.attrs["screening_complete_count"] == 1
+    assert result.source.endswith("+tencent")
+
+
+def test_current_day_supplement_is_rejected_after_xshg_open() -> None:
+    observed = datetime(2026, 8, 20, 9, 30, tzinfo=ZoneInfo("Asia/Shanghai"))
+    client = Mock()
+    client.a_share_snapshot.return_value = ThsApiResponse(
+        {
+            "timestamp": int(observed.timestamp() * 1000),
+            "item": [ths_snapshot_item()],
+        },
+        None,
+    )
+    supplement = Mock(return_value=SimpleNamespace(
+        frame=pd.DataFrame([{
+            "code": "600000",
+            "name": "Stock",
+            "price": 10.0,
+            "volume_ratio": 1.2,
+            "turnover": 2.3,
+            "source_timestamp": observed,
+        }]),
+        observed_at=observed,
+    ))
+
+    result = MarketDataGateway(
+        ths_client=client,
+        snapshot_supplement_fetcher=supplement,
+        clock=lambda: observed,
+    ).get_a_share_snapshot(["600000"])
+
+    assert result.frame.attrs["screening_complete_count"] == 0
+    assert not result.source.endswith("+tencent")
+    assert "snapshot_screening_fields_incomplete" in result.warnings
+
+
 def test_ths_supplement_skips_unsupported_code_without_losing_supported_coverage() -> None:
     stamp = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
     fetcher = Mock(return_value=SimpleNamespace(
@@ -736,6 +837,36 @@ def test_get_leading_sector_codes_wraps_sector_list_failure() -> None:
     assert "https://feed.invalid" not in formatted_traceback(caught)
 
 
+def test_get_limit_counts_uses_completed_session_pools() -> None:
+    up = Mock(return_value=pd.DataFrame({"代码": ["600000", "000001"]}))
+    down = Mock(return_value=pd.DataFrame({"代码": ["300001"]}))
+    gateway = MarketDataGateway(
+        limit_up_fetcher=up,
+        limit_down_fetcher=down,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    result = gateway.get_limit_counts(SESSION)
+
+    up.assert_called_once_with(date="20260819")
+    down.assert_called_once_with(date="20260819")
+    assert result.frame.to_dict("records") == [{"limit_up_count": 2, "limit_down_count": 1}]
+    assert result.source == "akshare.eastmoney_limit_pools"
+    assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+def test_get_limit_counts_rejects_incomplete_session() -> None:
+    before_close = datetime(2026, 8, 19, 14, 59, tzinfo=ZoneInfo("Asia/Shanghai"))
+    gateway = MarketDataGateway(
+        limit_up_fetcher=lambda **kwargs: pd.DataFrame(),
+        limit_down_fetcher=lambda **kwargs: pd.DataFrame(),
+        clock=lambda: before_close,
+    )
+
+    with pytest.raises(ValueError, match="^limit pool session incomplete$"):
+        gateway.get_limit_counts(SESSION)
+
+
 def test_get_sector_snapshot_normalizes_industry_fields_and_preserves_raw_input() -> None:
     raw = pd.DataFrame(
         {
@@ -848,6 +979,131 @@ def test_get_sector_snapshot_uses_correct_default_akshare_fetchers(monkeypatch) 
     assert gateway.get_sector_snapshot("concept").frame.loc[0, "name"] == "Concept"
     industry.assert_called_once_with()
     concept.assert_called_once_with()
+
+
+@pytest.mark.parametrize(
+    ("sector_type", "tag"),
+    [("industry", "industry"), ("concept", "cn_concept")],
+)
+def test_get_sector_snapshot_uses_ths_catalog_and_batched_index_quotes(sector_type, tag) -> None:
+    catalog_rows = [
+        {"thscode": f"88{index:04d}.TI", "name": f"Sector {index}"}
+        for index in range(205)
+    ]
+    client = Mock()
+    client.ths_index_catalog.return_value = ths_response(catalog_rows)
+
+    def snapshot(codes):
+        return ths_response([
+            {
+                "thscode": code,
+                "price_change_ratio_pct": index / 10,
+                "turnover": 1_000 + index,
+            }
+            for index, code in enumerate(codes)
+        ])
+
+    client.index_snapshot.side_effect = snapshot
+    result = MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_sector_snapshot(sector_type)
+
+    assert client.ths_index_catalog.call_args.args[0].value == tag
+    assert [len(item.args[0]) for item in client.index_snapshot.call_args_list] == [100, 100, 5]
+    assert len(result.frame) == 205
+    assert result.frame["sector_type"].unique().tolist() == [sector_type]
+    assert result.frame.loc[0, "name"] == "Sector 0"
+    assert result.frame.loc[0, "change_pct"] == 0
+    assert result.frame.loc[0, "amount"] == 1_000
+    assert result.source == "ths.fuyao.index_snapshot"
+    assert result.source_timestamp == datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+
+
+def test_ths_sector_snapshot_derives_breadth_and_leader_from_cached_full_snapshot() -> None:
+    stamp = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
+    client = Mock()
+    client.a_share_snapshot.return_value = ThsApiResponse(
+        {
+            "timestamp": int(stamp.timestamp() * 1000),
+            "total": 2,
+            "item": [
+                ths_snapshot_item("600000"),
+                {**ths_snapshot_item("600001"), "price_change_ratio_pct": -2.0},
+            ],
+        },
+        None,
+    )
+    client.ths_index_catalog.return_value = ths_response([
+        {"thscode": "881001.TI", "name": "Industry A"},
+    ])
+    client.index_snapshot.return_value = ths_response([
+        {"thscode": "881001.TI", "price_change_ratio_pct": 1.2, "turnover": 10_000},
+    ])
+    client.ths_index_constituents.return_value = ths_response([
+        {"thscode": "600000.SH"}, {"thscode": "600001.SH"},
+    ])
+    supplement = Mock(return_value=SimpleNamespace(
+        frame=pd.DataFrame([
+            {
+                "code": "600000", "name": "Leader", "price": 10.0,
+                "volume_ratio": 1.2, "turnover": 2.3, "source_timestamp": stamp,
+            },
+            {
+                "code": "600001", "name": "Decliner", "price": 10.0,
+                "volume_ratio": 1.1, "turnover": 2.0, "source_timestamp": stamp,
+            },
+        ]),
+        observed_at=OBSERVED_AT,
+    ))
+    gateway = MarketDataGateway(
+        ths_client=client,
+        snapshot_supplement_fetcher=supplement,
+        clock=lambda: OBSERVED_AT,
+    )
+
+    gateway.get_a_share_snapshot()
+    result = gateway.get_sector_snapshot("industry")
+
+    row = result.frame.iloc[0]
+    assert row["advance_count"] == 1
+    assert row["decline_count"] == 1
+    assert row["leader_name"] == "Leader"
+    assert row["leader_code"] == "600000"
+    assert row["leader_change_pct"] == 1.2
+    leading = gateway.get_leading_sector_codes()
+    assert leading.source == "ths.fuyao.index_constituents"
+    assert leading.frame.to_dict("records") == [
+        {"code": "600000", "sector": "Industry A"},
+        {"code": "600001", "sector": "Industry A"},
+    ]
+    client.ths_index_constituents.assert_called_once_with("881001.TI")
+
+
+def test_get_sector_snapshot_marks_partial_ths_catalog_coverage() -> None:
+    client = Mock()
+    client.ths_index_catalog.return_value = ths_response([
+        {"thscode": "881001.TI", "name": "Industry A"},
+        {"thscode": "881002.TI", "name": "Industry B"},
+    ])
+    client.index_snapshot.return_value = ths_response([
+        {"thscode": "881001.TI", "price_change_ratio_pct": 1.2, "turnover": 10_000},
+    ])
+
+    result = MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.frame["name"].tolist() == ["Industry A"]
+    assert result.warnings == ("THS sector snapshot rows missing: 1",)
+
+
+def test_get_sector_snapshot_falls_back_to_akshare_when_ths_is_unavailable(monkeypatch) -> None:
+    client = Mock()
+    client.ths_index_catalog.side_effect = ThsNetworkError()
+    industry = Mock(return_value=pd.DataFrame({"name": ["Industry"], "change_pct": [1]}))
+    monkeypatch.setitem(sys.modules, "akshare", SimpleNamespace(stock_board_industry_name_em=industry))
+
+    result = MarketDataGateway(ths_client=client, clock=lambda: OBSERVED_AT).get_sector_snapshot("industry")
+
+    assert result.source == "akshare.eastmoney_industry_boards"
+    assert result.frame["name"].tolist() == ["Industry"]
+    industry.assert_called_once_with()
 
 
 def test_get_sector_snapshot_rejects_invalid_type_and_isolates_provider_failures() -> None:
@@ -1033,7 +1289,7 @@ def test_get_global_snapshot_supports_simple_and_multiindex_closes(multi_index: 
     result = gateway.get_global_snapshot()
 
     download.assert_called_once_with(
-        ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F"],
+        ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F", "CNY=X"],
         period="5d",
         interval="1d",
         auto_adjust=False,
@@ -1043,6 +1299,19 @@ def test_get_global_snapshot_supports_simple_and_multiindex_closes(multi_index: 
     assert result.frame["symbol"].tolist() == ["^GSPC", "^IXIC", "^DJI", "GC=F", "HG=F", "CL=F"]
     assert result.frame["change_pct"].tolist() == pytest.approx([2.0] * 6)
     assert result.observed_at == OBSERVED_AT
+
+
+def test_get_global_snapshot_includes_optional_usd_cny_when_available() -> None:
+    raw = global_download_frame(multi_index=False)
+    raw["CNY=X"] = [7.10, 7.20]
+
+    result = MarketDataGateway(
+        yfinance_download=Mock(return_value=raw), clock=lambda: OBSERVED_AT,
+    ).get_global_snapshot()
+
+    fx = result.frame.loc[result.frame["symbol"] == "CNY=X"].iloc[0]
+    assert fx["close"] == pytest.approx(7.20)
+    assert fx["change_pct"] == pytest.approx((7.20 / 7.10 - 1) * 100)
 
 
 def test_get_global_snapshot_rejects_empty_provider_response() -> None:

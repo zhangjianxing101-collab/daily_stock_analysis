@@ -25,6 +25,7 @@ from .gold import analyze_gold
 from .mailer import DeliveryInDoubtError, DeliveryNotAcceptedError, send_with_retry
 from .market_data import MarketDataGateway, MarketDataset
 from .models import Candidate, ModuleResult, Position, ReportMode
+from .news_intel import fetch_market_news
 from .report import RenderedReport, render_report
 from .risk import evaluate_position, suggested_board_lots
 from .screener import ScreeningResult, prefilter_universe, rank_with_ths_evidence, screen_aggressive
@@ -61,13 +62,18 @@ _SECTOR_LEVELS = frozenset(("high", "medium", "low", "unavailable"))
 _PRIOR_SECTOR_MANIFEST_MAX_BYTES = 1024 * 1024
 _SECTOR_STATE_MAX_ROWS = 40
 _SECTOR_STATE_MAX_ROWS_PER_TYPE = 20
+_AI_FEATURED_LIMIT = 5
 _SECTOR_HISTORY_UNAVAILABLE_WARNING = "板块历史状态不可用，按首次观察处理"
 _SECTOR_SOURCE_TIMESTAMP_WARNING = "板块来源时间不可用，未持久化状态"
 _SECTOR_DATA_PARTIAL_WARNING = "板块数据覆盖不完整，仅供参考"
+_SECTOR_ACTIVITY_AMOUNT_WARNING = "板块活跃度按成交额分位计算"
 _SECTOR_UNAVAILABLE_WARNING = "板块数据暂不可用，仅供参考"
 _SECTOR_UNAVAILABLE_CODE = "sector_module_unavailable"
 _SECTOR_STATE_WARNING = "板块状态持久化不可用，未保留历史"
-_POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=4)
+# A completed-session quote remains valid for a late same-day postmarket rerun.
+# The checks below still require the exact report trading date and a post-close
+# timestamp, while this bound rejects unexpectedly old intraday observations.
+_POSTMARKET_MAX_SOURCE_AGE = timedelta(hours=8)
 _PREMARKET_MAX_SOURCE_AGE = timedelta(days=4)
 _DATA_FAILURE_CODES = {
     "stale snapshot": "snapshot_acquisition_time_invalid",
@@ -444,6 +450,7 @@ class RunnerDependencies:
     artifact_writer: Callable[..., ArtifactPaths] | None = None
     artifact_finalizer: Callable[..., ArtifactPaths] | None = None
     artifact_publisher: Callable[..., None] | None = None
+    news_loader: Callable[..., ModuleResult] | None = None
 
 
 def _production_mail_sender(rendered: RenderedReport, *, test_email: bool = False) -> Any:
@@ -491,6 +498,7 @@ def default_dependencies(*, clock: Callable[[], datetime] | None = None) -> Runn
         renderer=render_report,
         mail_sender=_production_mail_sender,
         sizing_evaluator=suggested_board_lots,
+        news_loader=fetch_market_news,
     )
 
 
@@ -545,7 +553,26 @@ def _global_payload(dataset: MarketDataset) -> Mapping[str, Any]:
     if dataset.frame.empty:
         return {}
     rows = dataset.frame.to_dict(orient="records")
-    return {str(row.get("symbol", index)): _as_payload(row) for index, row in enumerate(rows)}
+    return {
+        "data_source": dataset.source,
+        **{str(row.get("symbol", index)): _as_payload(row) for index, row in enumerate(rows)},
+    }
+
+
+def _gold_cny_per_gram(modules: Mapping[str, ModuleResult], gold_usd_per_ounce: Any) -> float | None:
+    if not isinstance(gold_usd_per_ounce, (int, float)) or isinstance(gold_usd_per_ounce, bool):
+        return None
+    global_result = modules.get("global")
+    payload = global_result.payload if global_result is not None else {}
+    fx = payload.get("CNY=X") if isinstance(payload, Mapping) else None
+    usd_cny = fx.get("close") if isinstance(fx, Mapping) else None
+    if not isinstance(usd_cny, (int, float)) or isinstance(usd_cny, bool):
+        return None
+    if not math.isfinite(float(gold_usd_per_ounce)) or not math.isfinite(float(usd_cny)):
+        return None
+    if float(gold_usd_per_ounce) <= 0 or float(usd_cny) <= 0:
+        return None
+    return float(gold_usd_per_ounce) * float(usd_cny) / 31.1034768
 
 
 def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[str, Any]:
@@ -605,6 +632,30 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
     flat_count = sum(value == 0 for value in changes)
     up_ratio = up_count / len(changes) * 100
     temperature = "偏热" if up_ratio >= 60 else ("偏冷" if up_ratio <= 40 else "中性")
+    style: str = "不可用"
+    style_evidence: dict[str, float] = {}
+    if len(frame) >= 2 and "total_mv" in frame:
+        raw_market_values = frame["total_mv"]
+        try:
+            market_values = tuple(float(value) for value in pd.to_numeric(raw_market_values, errors="coerce"))
+            market_values_complete = (
+                len(market_values) == len(frame)
+                and not any(isinstance(value, (bool, np.bool_)) for value in raw_market_values.tolist())
+                and all(math.isfinite(value) and value > 0 for value in market_values)
+            )
+            if market_values_complete:
+                group_size = max(len(frame) * 3 // 10, 1)
+                ranked = sorted(zip(market_values, changes), key=lambda item: item[0])
+                small_return = math.fsum(item[1] for item in ranked[:group_size]) / group_size
+                large_return = math.fsum(item[1] for item in ranked[-group_size:]) / group_size
+                spread = large_return - small_return
+                style = "大盘占优" if spread >= 0.5 else ("小盘占优" if spread <= -0.5 else "均衡")
+                style_evidence = {
+                    "大盘组平均涨跌幅": large_return,
+                    "小盘组平均涨跌幅": small_return,
+                }
+        except (TypeError, ValueError, OverflowError):
+            pass
     return {
         **base,
         "上涨家数": up_count,
@@ -612,6 +663,8 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
         "平盘家数": flat_count,
         "上涨占比": up_ratio,
         "市场温度": temperature,
+        "市场风格": style,
+        **style_evidence,
     }
 
 
@@ -680,14 +733,10 @@ def _run_sector_module(
         if display.valid_count <= 0 or complete.valid_count <= 0:
             raise ValueError("sector snapshot invalid")
         warnings: list[str] = []
-        evidence_columns = ("leader_name", "leader_code", "leader_change_pct")
-        evidence_incomplete = (
-            any(column not in snapshot.frame for column in evidence_columns)
-            or any(
-                frame[column].isna().any()
-                for column in evidence_columns
-                if column in frame
-            )
+        displayed_rows = (*display.strongest, *display.weakest)
+        evidence_incomplete = any(
+            row.leader_name is None or row.leader_code is None or row.leader_change_pct is None
+            for row in displayed_rows
         )
         excluded_rows = any(
             frame.attrs.get(key, 0)
@@ -695,6 +744,13 @@ def _run_sector_module(
         )
         if history_unavailable:
             warnings.append(_SECTOR_HISTORY_UNAVAILABLE_WARNING)
+        if (
+            "amount" in frame
+            and "turnover_rate" in frame
+            and frame["turnover_rate"].isna().all()
+            and frame["amount"].notna().any()
+        ):
+            warnings.append(_SECTOR_ACTIVITY_AMOUNT_WARNING)
         if (
             snapshot.warnings or display.warnings or complete.warnings
             or display.valid_count != len(frame) or evidence_incomplete or excluded_rows
@@ -971,6 +1027,159 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
             },
             ("决策摘要数据不足",),
         )
+
+
+def _report_delivery_blockers(
+    mode: ReportMode,
+    modules: Mapping[str, ModuleResult],
+) -> tuple[str, ...]:
+    """Return stable reason codes when a report is too incomplete to deliver."""
+
+    blockers: list[str] = []
+    market = modules.get("market")
+    market_payload = market.payload if market is not None and isinstance(market.payload, Mapping) else {}
+    breadth = market_payload.get("上涨占比")
+    if (
+        market is None
+        or market.status == "unavailable"
+        or not isinstance(breadth, (int, float))
+        or isinstance(breadth, bool)
+        or not math.isfinite(float(breadth))
+    ):
+        blockers.append("market_breadth_unavailable")
+    if market is None or _SNAPSHOT_AUTHORITY_WARNING_CODE in market.warnings:
+        blockers.append("market_source_untrusted")
+
+    screening = modules.get("screening")
+    if screening is None or screening.status == "unavailable":
+        blockers.append("screening_unavailable")
+
+    if mode is ReportMode.POSTMARKET:
+        if (
+            not _finite_nonnegative(market_payload.get("成交额"))
+            or not _nonnegative_count(market_payload.get("涨停家数"))
+            or not _nonnegative_count(market_payload.get("跌停家数"))
+            or market_payload.get("市场风格") in (None, "", "不可用")
+        ):
+            blockers.append("market_overview_incomplete")
+        for name in ("industry_sectors", "concept_sectors"):
+            module = modules.get(name)
+            payload = module.payload if module is not None and isinstance(module.payload, Mapping) else {}
+            strongest = payload.get("strongest")
+            if (
+                module is None
+                or module.status == "unavailable"
+                or not isinstance(strongest, (tuple, list))
+                or not strongest
+            ):
+                blockers.append(f"{name}_unavailable")
+        global_result = modules.get("global")
+        global_payload = global_result.payload if global_result is not None else {}
+        global_rows = (
+            [value for key, value in global_payload.items() if key != "data_source"]
+            if isinstance(global_payload, Mapping) else []
+        )
+        if (
+            global_result is None
+            or global_result.status == "unavailable"
+            or not any(isinstance(value, Mapping) and _finite_close(value.get("close")) for value in global_rows)
+        ):
+            blockers.append("global_context_unavailable")
+
+        gold = modules.get("gold")
+        gold_payload = gold.payload if gold is not None and isinstance(gold.payload, Mapping) else {}
+        gold_backtest = gold_payload.get("backtest")
+        gold_risk_checks = gold_payload.get("risk_checks")
+        if (
+            gold is None
+            or gold.status == "unavailable"
+            or not _finite_close(gold_payload.get("latest_close"))
+            or not _finite_close(gold_payload.get("china_reference_cny_per_gram"))
+            or not isinstance(gold_backtest, Mapping)
+            or not gold_backtest
+            or not isinstance(gold_risk_checks, Mapping)
+            or not gold_risk_checks
+        ):
+            blockers.append("gold_analysis_incomplete")
+
+        backtests = modules.get("backtests")
+        backtest_payload = backtests.payload if backtests is not None and isinstance(backtests.payload, Mapping) else {}
+        has_backtest_metrics = any(
+            isinstance(strategies, Mapping)
+            and bool(strategies.get("name"))
+            and any(
+                isinstance(result, Mapping)
+                and isinstance(result.get("trade_count"), (int, float))
+                and isinstance(result.get("max_drawdown"), (int, float))
+                for result in (strategies.get("short"), strategies.get("swing"))
+            )
+            for strategies in backtest_payload.values()
+        )
+        if (
+            backtests is None
+            or backtests.status == "unavailable"
+            or not has_backtest_metrics
+        ):
+            blockers.append("backtests_unavailable")
+
+        screening_payload = screening.payload if screening is not None and isinstance(screening.payload, Mapping) else {}
+        candidate_groups = (
+            screening_payload.get("短线候选"), screening_payload.get("波段候选"),
+        )
+        candidates = tuple(
+            candidate
+            for group in candidate_groups
+            if isinstance(group, (tuple, list))
+            for candidate in group
+        )
+        if not any(
+            isinstance(candidate, Mapping)
+            and isinstance(candidate.get("code"), str)
+            and len(candidate["code"]) == 6
+            and candidate["code"].isdigit()
+            and bool(candidate.get("name"))
+            for candidate in candidates
+        ):
+            blockers.append("screening_candidates_unavailable")
+
+        ai = modules.get("ai")
+        ai_payload = ai.payload if ai is not None and isinstance(ai.payload, Mapping) else {}
+        if (
+            ai is None
+            or ai.status in {"unavailable", "skipped"}
+            or not any(
+                isinstance(code, str) and len(code) == 6 and code.isdigit() and isinstance(value, Mapping)
+                and any(value.get(key) not in (None, "", (), []) for key in (
+                    "conclusion", "operation_advice", "action_label", "action",
+                    "risk_warning", "news_summary", "fundamental_analysis",
+                ))
+                for code, value in ai_payload.items()
+            )
+        ):
+            blockers.append("ai_analysis_unavailable")
+    return tuple(blockers)
+
+
+def _finite_close(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) > 0
+    )
+
+
+def _finite_nonnegative(value: Any) -> bool:
+    return (
+        isinstance(value, (int, float))
+        and not isinstance(value, bool)
+        and math.isfinite(float(value))
+        and float(value) >= 0
+    )
+
+
+def _nonnegative_count(value: Any) -> bool:
+    return isinstance(value, (int, np.integer)) and not isinstance(value, (bool, np.bool_)) and int(value) >= 0
 
 
 def _dataset_source_payload(dataset: MarketDataset) -> Mapping[str, Any]:
@@ -1289,6 +1498,50 @@ def _suppress_unactionable_candidates(
     return tuple(projected)
 
 
+def _select_ai_codes(
+    candidates: Sequence[Candidate],
+    portfolio_codes: Sequence[str],
+    suppressed_codes: set[str],
+    *,
+    limit: int = _AI_FEATURED_LIMIT,
+) -> tuple[str, ...]:
+    """Bound AI work to actionable, sector-backed report candidates."""
+
+    eligible = sorted(
+        (
+            item
+            for item in candidates
+            if item.code not in suppressed_codes
+            and not item.warning.strip()
+            and (
+                item.industry_sector.strip()
+                or item.concept_sectors
+                or "leading_sector" in item.matched_rules
+            )
+        ),
+        key=lambda item: (
+            -(bool(item.industry_sector.strip()) + len(item.concept_sectors)),
+            -item.score,
+            item.code,
+            item.horizon,
+        ),
+    )
+    selected: list[str] = []
+    for item in eligible:
+        if item.code in selected:
+            continue
+        selected.append(item.code)
+        if len(selected) >= limit:
+            break
+    if selected:
+        return tuple(selected)
+    return tuple(
+        code
+        for code in dict.fromkeys(portfolio_codes)
+        if code not in suppressed_codes
+    )[:limit]
+
+
 def _last_session_bar(dataset: MarketDataset, expected_session: date) -> pd.Series | None:
     frame = dataset.frame
     if not isinstance(frame, pd.DataFrame) or frame.empty or "date" not in frame:
@@ -1436,7 +1689,7 @@ def _trusted_sector_snapshot_timestamp(
     try:
         source_date = source.astimezone(SHANGHAI_TIMEZONE).date()
         session_date = session_observed.astimezone(SHANGHAI_TIMEZONE).date()
-        if source > dataset_observed or source > session_observed or source_date != session_date:
+        if source > dataset_observed or source_date != session_date:
             return None
     except Exception:
         return None
@@ -1610,6 +1863,55 @@ def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple
         RuntimeError,
     ):
         raise _sector_state_error("prior sector state unavailable") from None
+
+
+def _prior_sector_recap_modules(
+    rows: Sequence[Mapping[str, Any]],
+) -> dict[str, ModuleResult]:
+    """Project the last verified close's sector state into a premarket recap."""
+
+    modules: dict[str, ModuleResult] = {}
+    for sector_type in ("industry", "concept"):
+        selected = sorted(
+            (row for row in rows if row.get("sector_type") == sector_type),
+            key=lambda row: (int(row["rank"]), str(row["name"])),
+        )
+        if not selected:
+            continue
+        source_timestamp = _sector_state_timestamp(selected[0]["source_timestamp"])
+
+        def report_row(row: Mapping[str, Any]) -> dict[str, Any]:
+            return {
+                key: row[key]
+                for key in (
+                    "sector_type", "rank", "name", "change_pct", "breadth_pct",
+                    "activity_percentile", "rotation", "persistence", "crowding_risk",
+                )
+            } | {
+                "leader_name": None,
+                "leader_code": None,
+                "leader_change_pct": None,
+            }
+
+        strongest = [report_row(row) for row in selected[:10]]
+        watch = [
+            report_row(row)
+            for row in selected[:10]
+            if row.get("persistence") in {"high", "medium"}
+        ]
+        modules[f"{sector_type}_sectors"] = ModuleResult(
+            f"{sector_type}_sectors",
+            "partial",
+            source_timestamp,
+            {
+                "valid_count": int(selected[0]["universe_size"]),
+                "strongest": strongest,
+                "weakest": [],
+                "watch": watch,
+            },
+            ("盘前沿用最近一次已验证收盘板块状态",),
+        )
+    return modules
 
 
 def _sector_state(
@@ -2182,11 +2484,14 @@ def run_report(
             modules["morning_candidates"] = _unavailable(
                 "morning_candidates", session.now_shanghai, "早盘候选状态不可用"
             )
-        try:
-            prior_sector_rows = _load_prior_sector_state(
-                Path(prior_sector_report) if prior_sector_report is not None else None,
-                session,
-            )
+    try:
+        prior_sector_rows = _load_prior_sector_state(
+            Path(prior_sector_report) if prior_sector_report is not None else None,
+            session,
+        )
+        if normalized_mode is ReportMode.PREMARKET:
+            modules.update(_prior_sector_recap_modules(prior_sector_rows))
+        else:
             prior_sector_previous = {
                 (str(row["sector_type"]), str(row["name"])): {
                     key: row[key]
@@ -2195,10 +2500,10 @@ def run_report(
                 for row in prior_sector_rows
             }
             prior_sector_types = {str(row["sector_type"]) for row in prior_sector_rows}
-        except Exception:
-            prior_sector_previous = {}
-            prior_sector_types = set()
-            sector_history_artifact_unavailable = True
+    except Exception:
+        prior_sector_previous = {}
+        prior_sector_types = set()
+        sector_history_artifact_unavailable = True
 
     try:
         global_data = active.gateway.get_global_snapshot()
@@ -2207,6 +2512,12 @@ def run_report(
         )
     except Exception:
         modules["global"] = _unavailable("global", session.now_shanghai, "全球市场数据暂不可用")
+
+    if active.news_loader is not None:
+        try:
+            modules["news"] = active.news_loader(observed_at=session.now_shanghai)
+        except Exception:
+            modules["news"] = _unavailable("news", session.now_shanghai, "市场新闻线索暂不可用")
 
     snapshot: MarketDataset | None
     snapshot_source_is_authoritative = False
@@ -2241,6 +2552,37 @@ def run_report(
                 snapshot,
                 authoritative=snapshot_source_is_authoritative,
             )
+            limit_loader = getattr(active.gateway, "get_limit_counts", None)
+            if snapshot_source_is_authoritative and callable(limit_loader):
+                try:
+                    limit_counts = limit_loader(expected_session)
+                    limit_frame = limit_counts.frame
+                    if len(limit_frame) != 1 or not {
+                        "limit_up_count", "limit_down_count",
+                    }.issubset(limit_frame.columns):
+                        raise ValueError("limit counts invalid")
+                    up = limit_frame.iloc[0]["limit_up_count"]
+                    down = limit_frame.iloc[0]["limit_down_count"]
+                    if (
+                        not isinstance(up, (int, np.integer))
+                        or isinstance(up, (bool, np.bool_))
+                        or not isinstance(down, (int, np.integer))
+                        or isinstance(down, (bool, np.bool_))
+                        or int(up) < 0
+                        or int(down) < 0
+                        or limit_counts.source_timestamp is None
+                        or limit_counts.source_timestamp.date() != expected_session
+                    ):
+                        raise ValueError("limit counts invalid")
+                    market_payload = {
+                        **market_payload,
+                        "涨停家数": int(up),
+                        "跌停家数": int(down),
+                        "涨跌停数据源": limit_counts.source,
+                        "涨跌停数据时间": limit_counts.source_timestamp.isoformat(),
+                    }
+                except Exception:
+                    market_warnings = (*market_warnings, "market_limit_counts_unavailable")
             breadth_incomplete = (
                 snapshot_source_is_authoritative
                 and market_payload["上涨占比"] == "不可用"
@@ -2255,7 +2597,7 @@ def run_report(
                 "market",
                 (
                     "ok"
-                    if snapshot_source_is_authoritative and not snapshot.warnings and not breadth_incomplete
+                    if snapshot_source_is_authoritative and not market_warnings and not breadth_incomplete
                     else "partial"
                 ),
                 snapshot.source_timestamp or snapshot.observed_at,
@@ -2324,17 +2666,6 @@ def run_report(
         )
         prices = {code: price for code, price in prices.items() if code not in untrusted_codes}
 
-    leading: dict[str, str] = {}
-    try:
-        sectors = active.gateway.get_leading_sector_codes()
-        if {"code", "sector"}.issubset(sectors.frame.columns):
-            leading = {
-                str(row["code"]): str(row["sector"])
-                for _, row in sectors.frame.iterrows()
-            }
-    except Exception:
-        pass
-
     sector_analyses: dict[str, SectorAnalysis] = {}
     sector_source_timestamps: dict[str, datetime | None] = {}
     sector_manifest_timestamps: dict[str, str] = {}
@@ -2378,6 +2709,17 @@ def run_report(
                         tuple(dict.fromkeys((*module.warnings, _SECTOR_STATE_WARNING))),
                     )
 
+    leading: dict[str, str] = {}
+    try:
+        sectors = active.gateway.get_leading_sector_codes()
+        if {"code", "sector"}.issubset(sectors.frame.columns):
+            leading = {
+                str(row["code"]): str(row["sector"])
+                for _, row in sectors.frame.iterrows()
+            }
+    except Exception:
+        pass
+
     screening = ScreeningResult((), ())
     if snapshot is None or not histories:
         modules["screening"] = _unavailable("screening", session.now_shanghai, "数据不足，建议观望")
@@ -2407,7 +2749,12 @@ def run_report(
                 "screening",
                 status,
                 session.now_shanghai,
-                {"短线候选数": len(screening.short_term), "波段候选数": len(screening.swing)},
+                {
+                    "短线候选数": len(screening.short_term),
+                    "波段候选数": len(screening.swing),
+                    "短线候选": [_as_payload(item) for item in screening.short_term],
+                    "波段候选": [_as_payload(item) for item in screening.swing],
+                },
                 screening.warnings,
             )
         except Exception:
@@ -2450,6 +2797,21 @@ def run_report(
             screening.warnings,
         )
 
+    screening_module = modules.get("screening")
+    if screening_module is not None and screening_module.status != "unavailable":
+        modules["screening"] = ModuleResult(
+            screening_module.name,
+            screening_module.status,
+            screening_module.observed_at,
+            {
+                "短线候选数": len(screening.short_term),
+                "波段候选数": len(screening.swing),
+                "短线候选": [_as_payload(item) for item in screening.short_term],
+                "波段候选": [_as_payload(item) for item in screening.swing],
+            },
+            screening_module.warnings,
+        )
+
     backtest_codes = tuple(
         dict.fromkeys(candidate.code for candidate in (*screening.short_term, *screening.swing))
     )
@@ -2457,6 +2819,9 @@ def run_report(
         backtest_codes = tuple(portfolio_codes)
     backtest_payload: dict[str, Any] = {}
     backtest_warnings: list[str] = []
+    candidate_names = {
+        candidate.code: candidate.name for candidate in (*screening.short_term, *screening.swing)
+    }
     for code in backtest_codes:
         history = histories.get(code)
         if history is None:
@@ -2464,6 +2829,7 @@ def run_report(
             continue
         try:
             backtest_payload[code] = {
+                "name": candidate_names.get(code, "名称不可用"),
                 "short": _as_payload(active.short_backtest(history.frame, capital=settings.capital_cny)),
                 "swing": _as_payload(active.swing_backtest(history.frame, capital=settings.capital_cny)),
             }
@@ -2482,29 +2848,40 @@ def run_report(
         gold_data = active.gateway.get_gold_bars()
         gold_failure_stage = "gold_analysis_failed"
         gold = active.gold_analyzer(gold_data.frame, capital=settings.capital_cny)
-        modules["gold"] = _module("gold", gold_data.observed_at, _as_payload(gold), *gold_data.warnings)
+        projected_gold = _as_payload(gold)
+        if not isinstance(projected_gold, Mapping):
+            raise ValueError("gold analysis invalid")
+        gold_latest_close = projected_gold.get("latest_close")
+        gold_payload = {
+            **projected_gold,
+            "data_source": gold_data.source,
+            "china_reference_cny_per_gram": _gold_cny_per_gram(modules, gold_latest_close),
+        }
+        gold_warnings = gold_data.warnings
+        if gold_payload["china_reference_cny_per_gram"] is None:
+            gold_warnings = (*gold_warnings, "USD/CNY unavailable; CNY/gram reference unavailable")
+        modules["gold"] = _module("gold", gold_data.observed_at, gold_payload, *gold_warnings)
     except Exception as exc:
         modules["gold"] = _data_unavailable(
             "gold", session.now_shanghai, "黄金模块暂不可用", exc, gold_failure_stage,
         )
 
-    ai_codes = tuple(
-        code
-        for code in dict.fromkeys(
-            (*portfolio_codes, *(item.code for item in screening.short_term), *(item.code for item in screening.swing))
-        )
-        if code not in suppressed_codes
-        and not next(
-            (
-                item.warning.strip()
-                for item in (*screening.short_term, *screening.swing)
-                if item.code == code
-            ),
-            "",
-        )
+    ai_codes = _select_ai_codes(
+        (*screening.short_term, *screening.swing),
+        tuple(portfolio_codes),
+        suppressed_codes,
     )
     try:
-        modules["ai"] = active.ai_enricher(ai_codes, observed_at=session.now_shanghai)
+        ai_result = active.ai_enricher(ai_codes, observed_at=session.now_shanghai)
+        if isinstance(ai_result.payload, Mapping):
+            ai_payload = {
+                code: ({"name": candidate_names.get(code, "名称不可用"), **dict(value)} if isinstance(value, Mapping) else value)
+                for code, value in ai_result.payload.items()
+            }
+            ai_result = ModuleResult(
+                ai_result.name, ai_result.status, ai_result.observed_at, ai_payload, ai_result.warnings,
+            )
+        modules["ai"] = ai_result
     except Exception:
         modules["ai"] = _unavailable("ai", session.now_shanghai, "AI分析暂不可用")
 
@@ -2542,38 +2919,47 @@ def run_report(
             tuple(dict.fromkeys(portfolio_warnings)) or (() if portfolio_payload else ("数据不足，建议观望",)),
         )
 
-    portfolio_valuations_complete = all(position.code in prices for position in settings.positions)
-    available_cash: float | None = None
-    if portfolio_valuations_complete:
-        current_market_value = sum(prices[position.code] * position.quantity for position in settings.positions)
-        available_cash = max(settings.capital_cny - current_market_value, 0.0)
-    sizing_payload: dict[str, int] = {}
-    sizing_warnings: list[str] = []
-    if not portfolio_valuations_complete:
-        sizing_warnings.append("持仓估值不可用，未提供仓位建议")
-    for item in (*screening.short_term, *screening.swing):
+    if not settings.position_sizing:
+        modules["sizing"] = ModuleResult(
+            "sizing",
+            "skipped",
+            session.now_shanghai,
+            {"状态": "已按当前报告范围关闭，不依据持仓分配资金"},
+            (),
+        )
+    else:
+        portfolio_valuations_complete = all(position.code in prices for position in settings.positions)
+        available_cash: float | None = None
+        if portfolio_valuations_complete:
+            current_market_value = sum(prices[position.code] * position.quantity for position in settings.positions)
+            available_cash = max(settings.capital_cny - current_market_value, 0.0)
+        sizing_payload: dict[str, int] = {}
+        sizing_warnings: list[str] = []
         if not portfolio_valuations_complete:
-            continue
-        if item.warning.strip():
-            sizing_warnings.append("候选不可操作，未提供仓位建议")
-            continue
-        try:
-            sizing_payload[item.code] = active.sizing_evaluator(
-                item.close,
-                item.stop_price,
-                capital=settings.capital_cny,
-                available_cash=available_cash,
-                risk_fraction=settings.risk_fraction,
-            )
-        except Exception:
-            sizing_warnings.append("候选仓位计算不可用")
-    modules["sizing"] = ModuleResult(
-        "sizing",
-        "ok" if sizing_payload and not sizing_warnings else ("partial" if sizing_payload else "unavailable"),
-        session.now_shanghai,
-        sizing_payload,
-        tuple(dict.fromkeys(sizing_warnings)) or (() if sizing_payload else ("暂无可计算候选",)),
-    )
+            sizing_warnings.append("持仓估值不可用，未提供仓位建议")
+        for item in (*screening.short_term, *screening.swing):
+            if not portfolio_valuations_complete:
+                continue
+            if item.warning.strip():
+                sizing_warnings.append("候选不可操作，未提供仓位建议")
+                continue
+            try:
+                sizing_payload[item.code] = active.sizing_evaluator(
+                    item.close,
+                    item.stop_price,
+                    capital=settings.capital_cny,
+                    available_cash=available_cash,
+                    risk_fraction=settings.risk_fraction,
+                )
+            except Exception:
+                sizing_warnings.append("候选仓位计算不可用")
+        modules["sizing"] = ModuleResult(
+            "sizing",
+            "ok" if sizing_payload and not sizing_warnings else ("partial" if sizing_payload else "unavailable"),
+            session.now_shanghai,
+            sizing_payload,
+            tuple(dict.fromkeys(sizing_warnings)) or (() if sizing_payload else ("暂无可计算候选",)),
+        )
 
     morning_candidates: tuple[Mapping[str, Any], ...] = ()
     if normalized_mode is ReportMode.POSTMARKET and prior_candidates:
@@ -2602,6 +2988,15 @@ def run_report(
         checked_at=generated_at,
     ):
         return _failure("snapshot_source_expired", report_key=session.report_key, modules=modules)
+    delivery_blockers = _report_delivery_blockers(normalized_mode, modules)
+    if delivery_blockers:
+        modules["delivery_readiness"] = ModuleResult(
+            "delivery_readiness",
+            "unavailable",
+            generated_at,
+            {"status": "blocked", "reason_codes": delivery_blockers},
+            ("报告核心内容不完整，已阻止邮件发送",),
+        )
     try:
         rendered = active.renderer(
             normalized_mode,
@@ -2682,6 +3077,30 @@ def run_report(
             EXIT_SUCCESS, final_state, session.report_key, modules,
             final_paths.html_path, final_paths.text_path, final_paths.manifest_path,
             screening.short_term, screening.swing, morning_candidates,
+        )
+
+    if delivery_blockers:
+        blocked_manifest = dict(
+            manifest,
+            final_state=FinalState.HARD_FAILURE.value,
+            module_statuses={name: result.status for name, result in modules.items()},
+            warning_codes=_warning_codes(modules),
+        )
+        try:
+            blocked_paths = artifact_finalizer(
+                output_dir,
+                report_key=session.report_key,
+                rendered=rendered,
+                manifest=blocked_manifest,
+                test_email=test_email,
+            )
+        except Exception:
+            blocked_paths = paths
+        return _failure(
+            "report_content_incomplete",
+            report_key=session.report_key,
+            modules=modules,
+            paths=blocked_paths,
         )
 
     claim_id: str | None = None

@@ -35,17 +35,17 @@ NEWS_INTEL_RETENTION_DAYS=30
 NEWS_INTEL_FETCH_TIMEOUT_SEC=8
 NEWS_INTEL_MAX_ITEMS_PER_SOURCE=50
 NEWS_INTEL_AUTO_FETCH_ENABLED=false
-NEWSNOW_BASE_URL=https://newsnow.busiyi.world
+NEWSNOW_BASE_URL=https://news.orz.ai/api/v1/dailynews
 ```
 
-`NEWSNOW_BASE_URL` 用于拼出 `GET {NEWSNOW_BASE_URL}/api/s?id=<source_id>`。
+`NEWSNOW_BASE_URL` 默认用于拼出 `GET {NEWSNOW_BASE_URL}/?platform=<platform>`。解析器仍兼容旧版 `GET <base>/api/s?id=<source_id>` 协议。
 
-`NEWS_INTEL_AUTO_FETCH_ENABLED` 默认关闭。设为 `true` 后，个股分析、Agent 分析和大盘复盘在读取本地资讯池前会先执行一次 fail-open 自动刷新：缺少内置资讯源时自动创建并启用默认源，已有但禁用的内置默认源会重新启用，然后拉取全部启用源并写入 `intelligence_items`。为避免每只股票重复请求外部站点，运行进程内有 60 分钟冷却；冷却内复用本地库数据。
+`NEWS_INTEL_AUTO_FETCH_ENABLED` 在本地和通用部署中默认关闭。仓库随带的每日分析工作流已经显式开启；个股分析、Agent 分析和大盘复盘在读取本地资讯池前会执行一次 fail-open 自动刷新：缺少内置资讯源时自动创建并启用默认源，已有但禁用的内置默认源会重新启用，然后拉取全部启用源并写入 `intelligence_items`。为避免每只股票重复请求外部站点，运行进程内有 60 分钟冷却；冷却内复用本地库数据。
 
 **外部依赖兼容性说明：**
 
-- **官方项目与部署指南**：https://github.com/qqhann/newsnow
-- **当前默认值** `https://newsnow.busiyi.world` 是公开示例实例，**非官方部署**，存在以下风险：
+- **ORZ 项目与接口说明**：https://github.com/orz-ai/hot_news
+- **当前默认值** `https://news.orz.ai/api/v1/dailynews` 是公开聚合实例，存在以下风险：
   - 可能因官方维护、限流或停止服务而不可用
   - 不保证稳定性、可靠性或数据准确性，仅用于演示和测试
   - 每个用户都指向同一公开实例，可能遭遇限流
@@ -55,7 +55,7 @@ NEWSNOW_BASE_URL=https://newsnow.busiyi.world
 
 - 验证基础可达性和返回格式：
   ```bash
-  curl -sS "${NEWSNOW_BASE_URL}/api/s?id=cls-hot" | python -c "import sys, json; data=json.load(sys.stdin); assert isinstance(data, dict) and isinstance(data.get('items'), list); print('OK')"
+  curl -sS "${NEWSNOW_BASE_URL}/?platform=cls" | python -c "import sys, json; data=json.load(sys.stdin); assert isinstance(data, dict) and isinstance(data.get('data'), list); print('OK')"
   ```
 - 详细字段兼容性可参考自动化测试：`test_newsnow_source_fetches_json_items`，涵盖 `status`、`id`、`items[].title`、`items[].url`/`mobileUrl`、`items[].pubDate`/`items[].extra.date` 等字段
 - **部署实例不在自动化上线保障范围内**；如果依赖公开示例实例，部署前务必在实际生产环境执行上述验证
@@ -82,23 +82,23 @@ NEWS_INTEL_AUTO_FETCH_ENABLED=true
 
 该开关代表用户明确同意运行时访问已配置的外部 RSS/Atom/NewsNow HTTP 源；默认关闭是为了避免未确认的外部请求、公开 NewsNow 示例实例压力和分析 prompt 输入变化。
 
-> 说明：该开关只有在实际执行进程环境变量中可见时才会生效。仓库默认随带的 `00-daily-analysis.yml` 为 `env` 采用 allowlist 映射策略，未显式列入映射时，即便在仓库 Variables/Secrets 中设置同名变量也不会注入运行环境，因此默认 workflow 中不会自动接收该开关。若要在仓库自带每日分析任务里开启该能力，请在 workflow 中显式添加该变量透传，或改为本地/Docker 直接配置环境变量运行。
+> 说明：该开关只有在实际执行进程环境变量中可见时才会生效。仓库随带的 `00-daily-analysis.yml` 已显式透传该变量，其他自定义工作流仍需自行加入环境变量映射。
 
 ## NewsNow 默认源
 
 NewsNow 不是 RSS，而是一个聚合热点平台。DSA 直接按 HTTP API 读取它的 JSON 返回，不需要 MCP：
 
 ```text
-GET {NEWSNOW_BASE_URL}/api/s?id=cls-hot
+GET {NEWSNOW_BASE_URL}/?platform=cls
 ```
 
 本 PR 先接入以下财经相关默认源，保证流程能从“源配置 -> 拉取 -> 落库 -> 分析读取”跑通：
 
-- `cls-hot`：财联社热门，偏 A 股和题材热点。
-- `xueqiu-hotstock`：雪球热门股票，偏个股关注度。
-- `wallstreetcn-quick`：华尔街见闻快讯，偏宏观、商品和市场事件。
-- `jin10`：金十数据，偏全球宏观和外盘事件。
-- `gelonghui`：格隆汇事件，偏港股和中概股上下文。
+- `cls`：财联社热榜，偏 A 股和题材热点。
+- `xueqiu`：雪球热榜，偏个股关注度。
+- `sina_finance`：新浪财经，补充市场与宏观线索。
+- `eastmoney`：东方财富，补充板块和个股热度。
+- `baidu`：百度热榜，仅用于宏观舆情辅助。
 
 如果需要更多国内平台，可以继续通过 `POST /sources` 手动添加 NewsNow 源，`source_type=newsnow`，`url` 填 `https://<your-newsnow>/api/s?id=<source_id>`。如果更偏好 RSS，也可以用 RSSHub 等合规 RSS 源继续按 `source_type=rss` 接入。
 

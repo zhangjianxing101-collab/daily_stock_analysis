@@ -212,12 +212,15 @@ def _validate_frame(frame: pd.DataFrame) -> list[dict[str, object]]:
         turnover_rate = _optional_number(record.get("turnover_rate"), "turnover_rate")
         if turnover_rate is not None and turnover_rate < 0:
             raise ValueError("turnover_rate must be non-negative")
+        amount = _optional_number(record.get("amount"), "amount")
+        if amount is not None and amount < 0:
+            raise ValueError("amount must be non-negative")
         rows.append({
             "sector_type": sector_type,
             "name": normalized_name,
             "change_pct": change_pct,
             "breadth_pct": breadth_pct,
-            "turnover_rate": turnover_rate,
+            "turnover_rate": turnover_rate if turnover_rate is not None else amount,
             "leader_name": _optional_text(record.get("leader_name"), "leader_name"),
             "leader_code": _optional_text(record.get("leader_code"), "leader_code"),
             "leader_change_pct": _optional_number(record.get("leader_change_pct"), "leader_change_pct"),

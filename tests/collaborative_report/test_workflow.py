@@ -328,6 +328,7 @@ def test_workflow_selects_latest_earlier_completed_postmarket_artifact() -> None
     assert "-postmarket" in step["run"]
     assert "[:5]" in step["run"]
     assert runner["env"]["PRIOR_SECTOR_STATE_PATH"] == "${{ steps.prior_sector.outputs.prior_sector_state_path }}"
+    assert 'if [ "$MODE" = "postmarket" ] && [ -n "$PRIOR_SECTOR_STATE_PATH" ]; then' in runner["run"]
     assert 'args+=(--prior-sector-report "$PRIOR_SECTOR_STATE_PATH")' in runner["run"]
 
 
