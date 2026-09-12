@@ -1,6 +1,6 @@
 # Collaborative A-share Report Delivery
 
-This workflow delivers a private A-share report at 09:00 and 16:30 China Standard Time on weekdays. The `premarket` run prepares the morning candidates; the `postmarket` run reviews the same-date morning candidate state when its private report artifact is available and adds independently validated industry and concept analysis.
+This workflow delivers one private A-share postmarket report at 16:30 China Standard Time on weekdays, with a conditional outlook for the next trading session and independently validated industry and concept analysis. The separate daily-analysis workflow remains available manually but no longer runs on its former 18:00 schedule, avoiding a second scheduled email.
 
 ## QQ SMTP setup
 
@@ -64,14 +64,10 @@ freshness checks, the combined dataset uses the oldest accepted source timestamp
 one expired source can therefore invalidate the combined snapshot.
 
 After an authoritative postmarket run, the workflow stores the normalized completed-session
-A-share snapshot as a private `market-snapshot-YYYY-MM-DD` artifact for seven days. The next
-premarket run requests the exact prior data-session artifact, validates its schema, session,
-post-close source timestamp, row identities, and size before using it. This keeps a delayed
-09:00 job or a manual premarket rerun from substituting current intraday quotes for the prior
-close. Invalid or unavailable archives fall back to the normal live-source path, whose existing
-timestamp checks still fail closed when it cannot prove the requested completed session. The
+A-share snapshot as a private `market-snapshot-YYYY-MM-DD` artifact for seven days. The
 archive contains public normalized quote fields and quality counts, never portfolio, mailbox,
-credential, or AI-response data.
+credential, or AI-response data. Historical premarket archive loading remains available in
+the local runner for compatibility but is not part of scheduled delivery.
 
 Preview runs additionally produce bounded `provider-quality` diagnostics containing
 only counts and parsed dates. Raw responses, stderr and credentials are not uploaded.
@@ -206,7 +202,7 @@ the original publisher or an official disclosure before any manual decision.
 
 ## Manual operation
 
-Use **Run workflow** for a manual `premarket` or `postmarket` report. The workflow serializes a scheduled and manual run of the same mode, while preserving `cancel-in-progress: false`. For a manual test email, select `premarket`, set `force` to true when outside its normal window, and set `test_email` to true. A test email is marked as a test and never creates a production delivery marker.
+Use **Run workflow** for a manual `postmarket` report. The workflow serializes scheduled and manual runs while preserving `cancel-in-progress: false`. For a manual test email, set `force` to true when outside its normal window and set `test_email` to true. A test email is marked as a test and never creates a production delivery marker.
 
 Use a production manual run only after verifying the secrets and variables. A normal sent report creates `sent-<report-key>`; a later fresh GitHub job uses that durable marker as the cross-run duplicate guard and passes `--already-sent` to the runner as an external completed identity. Before any production runner call, the workflow queries unexpired `sent-<report-key>`, `in-doubt-<report-key>`, and `claim-<report-key>` artifacts in that order. A sent marker wins; otherwise an in-doubt marker or unresolved claim fails closed before mail delivery and writes only the redacted diagnostic artifact. Test email bypasses all production marker lookup and never creates a production marker. Within a single run or a locally durable output directory, the runner's local delivery ledger is the delivery state machine and a second barrier; it is ephemeral on GitHub-hosted runners and is not cross-run state.
 
@@ -218,6 +214,6 @@ For an unresolved claim, check QQ mailbox delivery and relevant delivery logs fi
 
 ## Privacy and retention
 
-The private production report artifact is named `report-<report-key>` and can contain portfolio analysis; a test email uses the separate `test-report-<report-key>` name and cannot obscure production prior-report lookup. Both are available only to repository users with Actions artifact access. Postmarket checks production artifacts newest-first, validates the redacted same-date premarket candidate state, and skips invalid candidates until it finds a valid one; otherwise it records `prior_premarket_report_unavailable`. Earlier postmarket sector lookup is separately bounded and writes only the validated sector-state subset to the runner. The diagnostic artifact is redacted and contains only report state, module statuses, source timestamps, and warning codes. Workflow logs and the concise summary do not print the report HTML, report text, mailbox values, portfolio values, credentials, remote errors, or raw model responses. All artifacts expire after seven days.
+The private production report artifact is named `report-<report-key>` and can contain portfolio analysis; a test email uses the separate `test-report-<report-key>` name. Both are available only to repository users with Actions artifact access. Earlier postmarket sector lookup is bounded and writes only the validated sector-state subset to the runner. The diagnostic artifact is redacted and contains only report state, module statuses, source timestamps, and warning codes. Workflow logs and the concise summary do not print the report HTML, report text, mailbox values, portfolio values, credentials, remote errors, or raw model responses. All artifacts expire after seven days.
 
 If an authorization code, mailbox, portfolio value, or AI key leaks, revoke or rotate it immediately in its provider, replace the encrypted GitHub Secret, audit workflow runs and repository history, and then send a new manual test email. Never reuse a QQ login password as an SMTP authorization code.

@@ -224,13 +224,13 @@ def test_workflow_trigger_permissions_concurrency_and_toolchain_contract() -> No
     workflow = _workflow()
     trigger = workflow["on"]
 
-    assert [item["cron"] for item in trigger["schedule"]] == ["0 1 * * 1-5", "30 8 * * 1-5"]
+    assert [item["cron"] for item in trigger["schedule"]] == ["30 8 * * 1-5"]
     inputs = trigger["workflow_dispatch"]["inputs"]
     assert inputs["mode"] == {
         "description": "Report mode",
         "type": "choice",
-        "options": ["premarket", "postmarket"],
-        "default": "premarket",
+        "options": ["postmarket"],
+        "default": "postmarket",
         "required": "false",
     }
     assert inputs["force"]["type"] == "boolean"
@@ -241,7 +241,7 @@ def test_workflow_trigger_permissions_concurrency_and_toolchain_contract() -> No
     assert inputs["reconcile_sent"]["default"] == "false"
     assert workflow["permissions"] == {"contents": "read", "actions": "read"}
     assert workflow["concurrency"] == {
-        "group": "collaborative-report-${{ github.event_name == 'schedule' && (github.event.schedule == '0 1 * * 1-5' && 'premarket' || github.event.schedule == '30 8 * * 1-5' && 'postmarket' || 'invalid-schedule') || inputs.mode }}",
+        "group": "collaborative-report-postmarket",
         "cancel-in-progress": "false",
     }
 
@@ -269,9 +269,9 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
         "PREVIEW_ONLY_INPUT": "${{ inputs.preview_only }}",
         "RECONCILE_SENT_INPUT": "${{ inputs.reconcile_sent }}",
     }
-    assert '"0 1 * * 1-5") mode="premarket"' in context["run"]
     assert '"30 8 * * 1-5") mode="postmarket"' in context["run"]
-    assert "premarket|postmarket" in context["run"]
+    assert 'postmarket) mode="$MANUAL_MODE"' in context["run"]
+    assert "premarket) mode=" not in context["run"]
     assert 'if [ "$EVENT_NAME" = "schedule" ]; then' in context["run"]
     assert 'force="true"' in context["run"]
     assert context["run"].index('force="true"') < context["run"].index('case "${FORCE_INPUT:-false}"')
@@ -292,49 +292,41 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
     assert "github.event." not in all_run_content
 
 
-def test_workflow_preserves_non_trading_day_skip_and_transfers_exact_session_snapshot() -> None:
+def test_workflow_preserves_non_trading_day_skip_and_saves_close_snapshot() -> None:
     workflow = _workflow()
     data_session = _step(workflow, "Resolve report data session")
-    prior_market = _step(workflow, "Extract prior market snapshot")
     runner = _step(workflow, "Run collaborative report")
 
     assert 'str(exc) != "report date is not an XSHG session"' in data_session["run"]
     assert "session = trading_date" in data_session["run"]
-    assert prior_market["env"]["EXPECTED_SESSION"] == "${{ steps.data_session.outputs.date }}"
-    assert prior_market["env"]["EXPECTED_BRANCH"] == "${{ github.event.repository.default_branch }}"
-    assert "read_a_share_snapshot_archive" in prior_market["run"]
-    assert 'run.get("head_branch") == expected_branch' in prior_market["run"]
-    assert "[:5]" in prior_market["run"]
-    assert runner["env"]["PRIOR_MARKET_SNAPSHOT_PATH"] == "${{ steps.prior_market.outputs.path }}"
-    assert 'args+=(--prior-market-snapshot "$PRIOR_MARKET_SNAPSHOT_PATH")' in runner["run"]
+    assert all(step.get("name") != "Extract prior market snapshot" for step in _steps(workflow))
+    assert "PRIOR_MARKET_SNAPSHOT_PATH" not in runner["env"]
     assert 'args+=(--market-snapshot-output ".workflow-artifacts/market-snapshot.json")' in runner["run"]
 
 
-def test_workflow_uses_external_duplicate_check_and_redacted_postmarket_prior_state() -> None:
+def test_workflow_uses_external_duplicate_check_without_premarket_dependency() -> None:
     workflow = _workflow()
     duplicate_check = _step(workflow, "Check external sent marker")
-    prior_extract = _step(workflow, "Extract prior candidate state")
     runner = _step(workflow, "Run collaborative report")
 
     assert "gh api" in duplicate_check["run"]
     assert "/actions/artifacts?name=sent-$REPORT_KEY" in duplicate_check["run"]
-    assert "--paginate --slurp" in duplicate_check["run"]
-    assert "created_at" in duplicate_check["run"]
-    assert "prior-artifact-candidates.tsv" in duplicate_check["run"]
+    assert "gh api --paginate" in duplicate_check["run"]
     assert "--already-sent" in runner["run"]
     assert duplicate_check["env"]["GH_TOKEN"] == "${{ github.token }}"
-    assert "gh run download" in prior_extract["run"]
-    assert "--name \"$PRIOR_REPORT_KEY\"" in prior_extract["run"]
-    assert "--repo \"$GITHUB_REPOSITORY\"" in prior_extract["run"]
-    assert prior_extract["env"]["GH_TOKEN"] == "${{ github.token }}"
-    assert "continue" in prior_extract["run"]
-    assert "^[0-9]+$" in prior_extract["run"]
-    assert "candidate_state" in prior_extract["run"]
-    assert "manifest.json" in prior_extract["run"]
-    assert ".prior-report.json" in prior_extract["run"]
-    assert "prior_report_warning=prior_premarket_report_unavailable" in prior_extract["run"]
-    assert "--prior-report" in runner["run"]
+    assert all(step.get("name") != "Extract prior candidate state" for step in _steps(workflow))
+    assert "--prior-report" not in runner["run"]
+    assert "premarket" not in duplicate_check["run"]
     assert "curl " not in all_run_content(workflow)
+
+
+def test_secondary_daily_email_workflow_has_no_schedule() -> None:
+    secondary = yaml.load(
+        (REPO_ROOT / ".github/workflows/00-daily-analysis.yml").read_text(encoding="utf-8"),
+        Loader=yaml.BaseLoader,
+    )
+    assert "schedule" not in secondary["on"]
+    assert "workflow_dispatch" in secondary["on"]
 
 
 def test_workflow_selects_latest_earlier_completed_postmarket_artifact() -> None:
@@ -625,12 +617,11 @@ def test_invalid_newest_production_artifact_falls_back_to_older_valid_prior_repo
     assert _select_valid_prior_artifact(artifacts, manifests, report_key) == 98
 
 
-def test_unavailable_or_invalid_prior_candidates_leave_the_fixed_warning_path() -> None:
+def test_unavailable_or_invalid_prior_candidates_remain_rejected_by_legacy_validator() -> None:
     report_key = "2026-08-20-premarket"
     artifacts = [{"id": 99, "name": f"report-{report_key}", "expired": False, "created_at": "2026-08-20T02:00:00Z", "workflow_run": {"id": 999}}]
 
     assert _select_valid_prior_artifact(artifacts, {99: {}}, report_key) is None
-    assert "prior_premarket_report_unavailable" in _step(_workflow(), "Extract prior candidate state")["run"]
 
 
 def all_run_content(workflow: dict) -> str:

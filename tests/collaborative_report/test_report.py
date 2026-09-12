@@ -200,7 +200,7 @@ def test_non_ok_module_status_is_explicit_without_duplicating_warning() -> None:
         assert output.count("AI固定警告") == 1
 
 
-def test_postmarket_without_morning_rows_renders_unavailable_status() -> None:
+def test_postmarket_without_morning_rows_omits_old_premarket_section() -> None:
     rendered = render_report(
         ReportMode.POSTMARKET,
         date(2026, 8, 19),
@@ -209,8 +209,28 @@ def test_postmarket_without_morning_rows_renders_unavailable_status() -> None:
     )
 
     for output in (rendered.html, rendered.text):
-        assert "早盘候选跟踪" in output
-        assert "暂无早盘候选记录，状态不可用" in output
+        assert "早盘候选跟踪" not in output
+        assert "暂无早盘候选记录，状态不可用" not in output
+
+
+def test_postmarket_renders_next_trading_session_outlook_in_html_and_text() -> None:
+    rendered = render_report(
+        ReportMode.POSTMARKET,
+        date(2026, 8, 21),
+        modules={
+            "decision_summary": module(
+                "decision_summary",
+                {
+                    "今日方向判断": "偏强",
+                    "下一交易日展望": "若广度与板块同步延续，关注下个交易日；转弱则失效。",
+                },
+            ),
+        },
+    )
+
+    for output in (rendered.html, rendered.text):
+        assert "下一交易日展望" in output
+        assert "转弱则失效" in output
 
 
 def test_report_autoescapes_user_supplied_values() -> None:
