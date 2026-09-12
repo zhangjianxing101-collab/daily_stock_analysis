@@ -2,15 +2,14 @@ name: Collaborative A-share report
 
 on:
   schedule:
-    - cron: '0 1 * * 1-5'
     - cron: '30 8 * * 1-5'
   workflow_dispatch:
     inputs:
       mode:
         description: Report mode
         type: choice
-        options: [premarket, postmarket]
-        default: premarket
+        options: [postmarket]
+        default: postmarket
         required: false
       force:
         description: Bypass only the delivery-window check
@@ -38,7 +37,7 @@ permissions:
   actions: read
 
 concurrency:
-  group: collaborative-report-${{ github.event_name == 'schedule' && (github.event.schedule == '0 1 * * 1-5' && 'premarket' || github.event.schedule == '30 8 * * 1-5' && 'postmarket' || 'invalid-schedule') || inputs.mode }}
+  group: collaborative-report-postmarket
   cancel-in-progress: false
 
 jobs:
@@ -75,7 +74,6 @@ jobs:
 
           if [ "$EVENT_NAME" = "schedule" ]; then
             case "$SCHEDULE" in
-              "0 1 * * 1-5") mode="premarket" ;;
               "30 8 * * 1-5") mode="postmarket" ;;
               *) exit 1 ;;
             esac
@@ -85,7 +83,7 @@ jobs:
             force="true"
           else
             case "$MANUAL_MODE" in
-              premarket|postmarket) mode="$MANUAL_MODE" ;;
+              postmarket) mode="$MANUAL_MODE" ;;
               *) exit 1 ;;
             esac
             case "${FORCE_INPUT:-false}" in
@@ -122,7 +120,6 @@ jobs:
           printf 'reconcile_sent=%s\n' "$reconcile_sent" >> "$GITHUB_OUTPUT"
           printf 'trading_date=%s\n' "$trading_date" >> "$GITHUB_OUTPUT"
           printf 'report_key=%s\n' "$report_key" >> "$GITHUB_OUTPUT"
-          printf 'prior_report_artifact=%s\n' "report-$trading_date-premarket" >> "$GITHUB_OUTPUT"
 
       - name: Resolve report data session
         id: data_session
@@ -159,7 +156,6 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           MODE: ${{ steps.context.outputs.mode }}
-          PRIOR_REPORT_ARTIFACT: ${{ steps.context.outputs.prior_report_artifact }}
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           TEST_EMAIL: ${{ steps.context.outputs.test_email }}
           PREVIEW_ONLY: ${{ steps.context.outputs.preview_only }}
@@ -253,39 +249,6 @@ jobs:
           )
           PY
           fi
-          if [ "$delivery_action" = "deliver" ] && [ "$MODE" = "postmarket" ]; then
-            if gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$PRIOR_REPORT_ARTIFACT&per_page=100" > .workflow-artifacts/prior-artifact-metadata.json 2>/dev/null; then
-              PRIOR_REPORT_ARTIFACT="$PRIOR_REPORT_ARTIFACT" python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          metadata_path = Path(".workflow-artifacts/prior-artifact-metadata.json")
-          candidates_path = Path(".workflow-artifacts/prior-artifact-candidates.tsv")
-          try:
-              pages = json.loads(metadata_path.read_text(encoding="utf-8"))
-          except (OSError, UnicodeError, json.JSONDecodeError):
-              pages = []
-          expected_name = os.environ["PRIOR_REPORT_ARTIFACT"]
-          candidates = []
-          for page in pages if isinstance(pages, list) else []:
-              for artifact in page.get("artifacts", ()) if isinstance(page, dict) else ():
-                  if not isinstance(artifact, dict) or artifact.get("name") != expected_name or artifact.get("expired") is not False:
-                      continue
-                  artifact_id = str(artifact.get("id", ""))
-                  workflow_run = artifact.get("workflow_run")
-                  run_id = str(workflow_run.get("id", "")) if isinstance(workflow_run, dict) else ""
-                  created_at = artifact.get("created_at")
-                  if not artifact_id.isascii() or not artifact_id.isdigit() or not run_id.isascii() or not run_id.isdigit() or not isinstance(created_at, str):
-                      continue
-                  candidates.append((created_at, int(artifact_id), run_id, artifact_id))
-          candidates_path.write_text(
-              "".join(f"{run_id}\t{artifact_id}\n" for _, _, run_id, artifact_id in sorted(candidates, reverse=True)),
-              encoding="utf-8",
-          )
-          PY
-            fi
-          fi
           printf 'already_sent=%s\n' "$already_sent" >> "$GITHUB_OUTPUT"
           printf 'duplicate_check=%s\n' "$duplicate_check" >> "$GITHUB_OUTPUT"
           printf 'sent_exists=%s\n' "$sent_exists" >> "$GITHUB_OUTPUT"
@@ -364,169 +327,6 @@ jobs:
           PY
           printf 'final_state=hard_failure\n' >> "$GITHUB_OUTPUT"
           printf 'exit_code=1\n' >> "$GITHUB_OUTPUT"
-
-      - name: Extract prior candidate state
-        id: prior
-        if: ${{ steps.context.outputs.mode == 'postmarket' && steps.duplicate.outputs.delivery_action == 'deliver' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MODE: ${{ steps.context.outputs.mode }}
-          PRIOR_REPORT_KEY: ${{ steps.context.outputs.prior_report_artifact }}
-          REPORT_KEY: ${{ steps.context.outputs.report_key }}
-        run: |
-          set -euo pipefail
-          prior_report=""
-          prior_report_warning=""
-          candidates_file=".workflow-artifacts/prior-artifact-candidates.tsv"
-          if [ "$MODE" = "postmarket" ] && [ -f "$candidates_file" ]; then
-            while IFS=$'\t' read -r run_id artifact_id; do
-              if ! [[ "$run_id" =~ ^[0-9]+$ && "$artifact_id" =~ ^[0-9]+$ ]]; then
-                continue
-              fi
-              download_root=".prior-report-download/$artifact_id"
-              mkdir -p "$download_root"
-              if ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name "$PRIOR_REPORT_KEY" --dir "$download_root" >/dev/null 2>&1; then
-                continue
-              fi
-              PRIOR_DOWNLOAD_ROOT="$download_root" python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          root = Path(os.environ["PRIOR_DOWNLOAD_ROOT"]).resolve()
-          output = Path(".prior-report.json").resolve()
-          expected_key = __import__("os").environ["PRIOR_REPORT_KEY"].removeprefix("report-")
-          expected_date = __import__("os").environ["REPORT_KEY"].rsplit("-", 1)[0]
-          required = (
-              "schema_version",
-              "report_key",
-              "mode",
-              "trading_date",
-              "generated_at",
-              "final_state",
-              "test_email",
-              "candidate_state",
-          )
-          for path in sorted(root.rglob("manifest.json")):
-              resolved = path.resolve()
-              if not resolved.is_relative_to(root):
-                  continue
-              try:
-                  payload = json.loads(resolved.read_text(encoding="utf-8"))
-              except (OSError, UnicodeError, json.JSONDecodeError):
-                  continue
-              if not isinstance(payload, dict) or any(key not in payload for key in required):
-                  continue
-              if (
-                  payload["schema_version"] != 1
-                  or payload["report_key"] != expected_key
-                  or payload["mode"] != "premarket"
-                  or payload["trading_date"] != expected_date
-                  or payload["final_state"] != "sent"
-                  or payload["test_email"] is not False
-                  or not isinstance(payload["candidate_state"], list)
-              ):
-                  continue
-              output.write_text(
-                  json.dumps({key: payload[key] for key in required}, ensure_ascii=False),
-                  encoding="utf-8",
-              )
-              break
-          PY
-              if [ -f .prior-report.json ]; then
-                prior_report=".prior-report.json"
-                break
-              fi
-            done < "$candidates_file"
-          fi
-          if [ -z "$prior_report" ]; then
-            prior_report_warning=prior_premarket_report_unavailable
-          fi
-          printf 'prior_report=%s\n' "$prior_report" >> "$GITHUB_OUTPUT"
-          printf 'prior_report_warning=%s\n' "$prior_report_warning" >> "$GITHUB_OUTPUT"
-
-      - name: Extract prior market snapshot
-        id: prior_market
-        if: ${{ steps.context.outputs.mode == 'premarket' && steps.duplicate.outputs.delivery_action == 'deliver' }}
-        env:
-          GH_TOKEN: ${{ github.token }}
-          MARKET_SNAPSHOT_ARTIFACT: ${{ steps.data_session.outputs.artifact }}
-          EXPECTED_SESSION: ${{ steps.data_session.outputs.date }}
-          EXPECTED_BRANCH: ${{ github.event.repository.default_branch }}
-        run: |
-          set -euo pipefail
-          prior_market_snapshot=""
-          mkdir -p .workflow-artifacts/prior-market
-          : > .workflow-artifacts/prior-market-candidates.tsv
-          if gh api --paginate --slurp "/repos/$GITHUB_REPOSITORY/actions/artifacts?name=$MARKET_SNAPSHOT_ARTIFACT&per_page=100" > .workflow-artifacts/prior-market-metadata.json 2>/dev/null; then
-            MARKET_SNAPSHOT_ARTIFACT="$MARKET_SNAPSHOT_ARTIFACT" EXPECTED_BRANCH="$EXPECTED_BRANCH" python - <<'PY'
-          import json
-          import os
-          from pathlib import Path
-
-          pages = json.loads(Path(".workflow-artifacts/prior-market-metadata.json").read_text(encoding="utf-8"))
-          expected = os.environ["MARKET_SNAPSHOT_ARTIFACT"]
-          expected_branch = os.environ["EXPECTED_BRANCH"]
-          candidates = []
-          for page in pages if isinstance(pages, list) else []:
-              for artifact in page.get("artifacts", ()) if isinstance(page, dict) else ():
-                  run = artifact.get("workflow_run") if isinstance(artifact, dict) else None
-                  if (
-                      isinstance(artifact, dict)
-                      and artifact.get("name") == expected
-                      and artifact.get("expired") is False
-                      and isinstance(run, dict)
-                      and run.get("head_branch") == expected_branch
-                      and str(artifact.get("id", "")).isdigit()
-                      and str(run.get("id", "")).isdigit()
-                      and isinstance(artifact.get("created_at"), str)
-                  ):
-                      candidates.append((artifact["created_at"], int(artifact["id"]), str(run["id"])))
-          Path(".workflow-artifacts/prior-market-candidates.tsv").write_text(
-              "".join(f"{run_id}\t{artifact_id}\n" for _, artifact_id, run_id in sorted(candidates, reverse=True)[:5]),
-              encoding="utf-8",
-          )
-          PY
-          fi
-          while IFS=$'\t' read -r run_id artifact_id; do
-            if ! [[ "$run_id" =~ ^[0-9]+$ && "$artifact_id" =~ ^[0-9]+$ ]]; then
-              continue
-            fi
-            download_root=".workflow-artifacts/prior-market/$artifact_id"
-            mkdir -p "$download_root"
-            if ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name "$MARKET_SNAPSHOT_ARTIFACT" --dir "$download_root" >/dev/null 2>&1; then
-              continue
-            fi
-            if PRIOR_MARKET_ROOT="$download_root" EXPECTED_SESSION="$EXPECTED_SESSION" python - <<'PY'
-          import os
-          import shutil
-          from datetime import date, datetime
-          from pathlib import Path
-          from zoneinfo import ZoneInfo
-
-          from src.collaborative_report.market_data import read_a_share_snapshot_archive
-
-          root = Path(os.environ["PRIOR_MARKET_ROOT"]).resolve()
-          expected = date.fromisoformat(os.environ["EXPECTED_SESSION"])
-          for candidate in root.rglob("market-snapshot.json"):
-              resolved = candidate.resolve(strict=True)
-              if not resolved.is_relative_to(root):
-                  continue
-              read_a_share_snapshot_archive(
-                  resolved,
-                  expected_session=expected,
-                  observed_at=datetime.now(ZoneInfo("Asia/Shanghai")),
-              )
-              shutil.copyfile(resolved, ".workflow-artifacts/prior-market-snapshot.json")
-              raise SystemExit(0)
-          raise SystemExit(1)
-          PY
-            then
-              prior_market_snapshot=".workflow-artifacts/prior-market-snapshot.json"
-              break
-            fi
-          done < .workflow-artifacts/prior-market-candidates.tsv
-          printf 'path=%s\n' "$prior_market_snapshot" >> "$GITHUB_OUTPUT"
 
       - name: Extract prior sector state
         id: prior_sector
@@ -707,9 +507,7 @@ jobs:
           PREVIEW_ONLY: ${{ steps.context.outputs.preview_only }}
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           ALREADY_SENT: ${{ steps.duplicate.outputs.already_sent }}
-          PRIOR_REPORT: ${{ steps.prior.outputs.prior_report }}
           PRIOR_SECTOR_STATE_PATH: ${{ steps.prior_sector.outputs.prior_sector_state_path }}
-          PRIOR_MARKET_SNAPSHOT_PATH: ${{ steps.prior_market.outputs.path }}
           EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD || secrets.QQEMAIL }}
           EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
@@ -775,14 +573,8 @@ jobs:
           if [ "$ALREADY_SENT" = "true" ]; then
             args+=(--already-sent)
           fi
-          if [ -n "$PRIOR_REPORT" ]; then
-            args+=(--prior-report "$PRIOR_REPORT")
-          fi
           if [ "$MODE" = "postmarket" ] && [ -n "$PRIOR_SECTOR_STATE_PATH" ]; then
             args+=(--prior-sector-report "$PRIOR_SECTOR_STATE_PATH")
-          fi
-          if [ "$MODE" = "premarket" ] && [ -n "$PRIOR_MARKET_SNAPSHOT_PATH" ]; then
-            args+=(--prior-market-snapshot "$PRIOR_MARKET_SNAPSHOT_PATH")
           fi
           if [ "$MODE" = "postmarket" ]; then
             args+=(--market-snapshot-output ".workflow-artifacts/market-snapshot.json")
@@ -1034,7 +826,6 @@ jobs:
           DUPLICATE_CHECK: ${{ steps.duplicate.outputs.duplicate_check }}
           DELIVERY_ACTION: ${{ steps.duplicate.outputs.delivery_action }}
           BLOCK_REASON: ${{ steps.duplicate.outputs.block_reason }}
-          PRIOR_WARNING: ${{ steps.prior.outputs.prior_report_warning }}
           PRIOR_SECTOR_WARNING: ${{ steps.prior_sector.outputs.prior_sector_warning }}
         run: |
           {
@@ -1050,9 +841,6 @@ jobs:
             fi
             if [ -n "$BLOCK_REASON" ]; then
               printf -- '- delivery status: %s\n' "$BLOCK_REASON"
-            fi
-            if [ -n "$PRIOR_WARNING" ]; then
-              printf -- '- prior state: %s\n' "$PRIOR_WARNING"
             fi
             if [ -n "$PRIOR_SECTOR_WARNING" ]; then
               printf -- '- prior sector state: %s\n' "$PRIOR_SECTOR_WARNING"

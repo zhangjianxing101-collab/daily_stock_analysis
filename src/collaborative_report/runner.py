@@ -1004,8 +1004,28 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
             risks.append("板块拥挤风险偏高")
         if not risks:
             risks.append("仍需核验盘后数据")
+        if not breadth_usable:
+            outlook = "下一交易日方向无法可靠判断；先核实市场广度，暂以观望为主。"
+        elif market_degraded or sector_degraded or sector_conflict:
+            outlook = (
+                f"条件性展望：当前市场{direction}，但市场或板块证据不完整或冲突；"
+                "下一交易日须观察广度与板块方向是否一致，未确认前保持谨慎。"
+            )
+        elif direction == "偏强" and resonance == "同步偏强":
+            outlook = (
+                "条件性展望：若下一交易日市场广度和板块共振继续偏强，可关注强势延续；"
+                "任一转弱则判断失效。"
+            )
+        elif direction == "偏弱" or resonance == "同步偏弱":
+            outlook = "条件性展望：下一交易日优先防范弱势延续；广度及板块同步改善后重新评估。"
+        else:
+            outlook = (
+                f"条件性展望：当前市场{direction}、板块{resonance}；"
+                "下一交易日以广度和板块是否同步转强或转弱作为方向确认条件。"
+            )
         result_payload = {
             "今日方向判断": direction,
+            "下一交易日展望": outlook,
             "策略信号": "观望" if watch else ("顺势关注" if direction == "偏强" else "谨慎应对"),
             "风险等级": risk,
             "是否建议观望": watch,
@@ -1024,6 +1044,7 @@ def _decision_summary(modules: Mapping[str, ModuleResult], observed_at: datetime
             observed_at,
             {
                 "今日方向判断": "数据不足，建议观望", "策略信号": "观望", "风险等级": "高",
+                "下一交易日展望": "数据不足，无法可靠判断下一交易日方向；建议观望并复核数据。",
                 "是否建议观望": True,
                 "操作建议": (
                     "仅供研究参考，任何操作均需人工确认，不构成自动下单或收益保证。"
@@ -2481,7 +2502,7 @@ def run_report(
     prior_sector_previous: dict[tuple[str, str], Mapping[str, object]] = {}
     prior_sector_types: set[str] = set()
     sector_history_artifact_unavailable = False
-    if normalized_mode is ReportMode.POSTMARKET:
+    if normalized_mode is ReportMode.POSTMARKET and prior_report is not None:
         try:
             prior_candidates = _load_prior_state(
                 Path(prior_report) if prior_report is not None else None,

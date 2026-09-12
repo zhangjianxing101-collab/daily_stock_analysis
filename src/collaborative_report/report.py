@@ -26,7 +26,6 @@ _DISCLAIMER_LINES = (
     "所有价格均为分析参考，需核验数据时效与市场状态。",
     "盘前参考价不代表成交价。",
 )
-_NO_MORNING_STATUS = "暂无早盘候选记录，状态不可用"
 _FEATURED_TITLE = "板块龙头精选观察（最多5只）"
 _MODULE_TITLES = {
     "global": "Global Markets and Gold Background / 全球与黄金背景",
@@ -644,12 +643,9 @@ def _plain_text(
         lines.append("")
     for section in trailing_sections:
         append_module(section)
-    if mode is ReportMode.POSTMARKET:
+    if mode is ReportMode.POSTMARKET and morning_rows:
         lines.append("早盘候选跟踪")
-        if morning_rows:
-            lines.extend(f"{code} {name}：{status}" for code, name, status in morning_rows)
-        else:
-            lines.append(_NO_MORNING_STATUS)
+        lines.extend(f"{code} {name}：{status}" for code, name, status in morning_rows)
         lines.append("")
     lines.append(_FEATURED_TITLE)
     if not featured_candidates:
@@ -755,7 +751,6 @@ def render_report(
         featured_title=_FEATURED_TITLE,
         featured_candidates=featured_views,
         morning_rows=morning_rows,
-        no_morning_status=_NO_MORNING_STATUS,
         disclaimer_lines=_DISCLAIMER_LINES,
     )
     text = _plain_text(

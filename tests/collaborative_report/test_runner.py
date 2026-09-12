@@ -1385,8 +1385,11 @@ def test_missing_or_corrupt_prior_state_is_degradable(tmp_path, deps, content) -
     )
 
     assert result.exit_code == EXIT_SUCCESS
-    assert result.modules["morning_candidates"].status == "unavailable"
-    assert "早盘候选状态不可用" in result.modules["morning_candidates"].warnings
+    if prior is None:
+        assert "morning_candidates" not in result.modules
+    else:
+        assert result.modules["morning_candidates"].status == "unavailable"
+        assert "早盘候选状态不可用" in result.modules["morning_candidates"].warnings
 
 
 @pytest.mark.parametrize(
@@ -2883,8 +2886,10 @@ def test_market_overview_has_safe_breadth_semantics_and_decision_summary(tmp_pat
     assert market["市场温度"] == "偏热"
     summary = result.modules["decision_summary"]
     assert set(summary.payload) == {
-        "今日方向判断", "策略信号", "风险等级", "是否建议观望", "操作建议", "板块共振", "关键风险",
+        "今日方向判断", "下一交易日展望", "策略信号", "风险等级", "是否建议观望",
+        "操作建议", "板块共振", "关键风险",
     }
+    assert "下一交易日" in summary.payload["下一交易日展望"]
     assert "人工确认" in summary.payload["操作建议"]
     assert deps.mail_sender.assert_not_called() is None
 
@@ -3107,6 +3112,7 @@ def test_partial_core_modules_force_conservative_decision(degraded_module) -> No
     assert summary.payload["是否建议观望"] is True
     assert summary.payload["风险等级"] == "高"
     assert summary.payload["策略信号"] == "观望"
+    assert "证据不完整" in summary.payload["下一交易日展望"]
 
 
 def test_concept_sector_failure_does_not_suppress_industry_module(tmp_path, deps) -> None:
