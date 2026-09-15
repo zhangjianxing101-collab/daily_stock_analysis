@@ -29,7 +29,7 @@ from src.collaborative_report.ai_bridge import enrich_codes
 from src.collaborative_report.market_data import read_a_share_snapshot_archive
 from src.collaborative_report.report import RenderedReport, module_rows
 
-_ARTIFACT = re.compile(r"^test-report-(\d{4}-\d{2}-\d{2})-postmarket$")
+_ARTIFACT = re.compile(r"^(?:test-)?report-(\d{4}-\d{2}-\d{2})-postmarket$")
 _REQUIRED_TEXT = (
     "决策摘要",
     "市场宽度",
@@ -97,6 +97,19 @@ def _named_artifact(metadata: object, name: str) -> tuple[int, str]:
     return artifact_id, artifact_name
 
 
+def _named_report_artifact(metadata: object, report_date: date) -> tuple[int, str]:
+    matches: list[tuple[str, int, str]] = []
+    for item in _artifact_candidates(metadata):
+        artifact_name = item.get("name")
+        match = _ARTIFACT.fullmatch(artifact_name) if isinstance(artifact_name, str) else None
+        if match and match.group(1) == report_date.isoformat():
+            matches.append((item["created_at"], item["id"], artifact_name))
+    if not matches:
+        raise ValueError("archived artifact unavailable")
+    _, artifact_id, artifact_name = max(matches)
+    return artifact_id, artifact_name
+
+
 def _extract_archive(payload: bytes, destination: Path) -> None:
     if len(payload) > _MAX_ARCHIVE_BYTES:
         raise ValueError("archived report invalid")
@@ -128,7 +141,10 @@ def _download_artifact(repository: str, artifact_id: int, destination: Path) -> 
 def _report_attempt(
     root: Path, artifact_name: str, *, allow_prepared: bool = False
 ) -> tuple[str, Path, dict[str, Any]]:
-    report_key = artifact_name.removeprefix("test-report-")
+    match = _ARTIFACT.fullmatch(artifact_name)
+    if match is None:
+        raise ValueError("archived report invalid")
+    report_key = f"{match.group(1)}-postmarket"
     states = {"previewed", "prepared"} if allow_prepared else {"previewed"}
     valid: list[tuple[datetime, Path, dict[str, Any]]] = []
     for path in root.rglob("manifest.json"):
@@ -435,7 +451,7 @@ def main() -> int:
             report_date = date.fromisoformat(_ARTIFACT.fullmatch(artifact_name).group(1))
         else:
             report_date = args.report_date
-            artifact_id, artifact_name = _named_artifact(metadata, f"test-report-{report_date.isoformat()}-postmarket")
+            artifact_id, artifact_name = _named_report_artifact(metadata, report_date)
         snapshot_id, _ = _named_artifact(metadata, f"market-snapshot-{report_date.isoformat()}")
         with tempfile.TemporaryDirectory() as temporary:
             report_root, snapshot_root = Path(temporary) / "report", Path(temporary) / "snapshot"

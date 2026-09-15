@@ -4,7 +4,13 @@ from pathlib import Path
 
 import pytest
 
-from scripts.send_archived_collaborative_report import _featured_codes, _latest_artifact, _named_artifact, _validated_report
+from scripts.send_archived_collaborative_report import (
+    _featured_codes,
+    _latest_artifact,
+    _named_artifact,
+    _named_report_artifact,
+    _validated_report,
+)
 
 
 def test_latest_artifact_selects_newest_valid_prior_preview() -> None:
@@ -37,6 +43,27 @@ def test_named_artifact_selects_exact_newest_archive() -> None:
 
     assert _named_artifact(metadata, "market-snapshot-2026-09-14") == (
         11, "market-snapshot-2026-09-14",
+    )
+
+
+def test_named_report_artifact_accepts_production_report_name() -> None:
+    metadata = [{"artifacts": [
+        {
+            "id": 10, "name": "test-report-2026-09-14-postmarket",
+            "expired": False, "created_at": "2026-09-14T08:00:00Z",
+        },
+        {
+            "id": 11, "name": "report-2026-09-14-postmarket",
+            "expired": False, "created_at": "2026-09-14T09:00:00Z",
+        },
+        {
+            "id": 12, "name": "report-2026-09-15-postmarket",
+            "expired": False, "created_at": "2026-09-15T09:00:00Z",
+        },
+    ]}]
+
+    assert _named_report_artifact(metadata, date(2026, 9, 14)) == (
+        11, "report-2026-09-14-postmarket",
     )
 
 
@@ -78,7 +105,7 @@ def test_validated_report_requires_substantive_preview(tmp_path: Path) -> None:
     (attempt / "report.txt").write_text(sections + "\n" + "内容" * 2_000, encoding="utf-8")
     (attempt / "report.html").write_text("<body>" + "内容" * 3_000 + "</body>", encoding="utf-8")
 
-    key, report = _validated_report(tmp_path, "test-report-2026-09-09-postmarket")
+    key, report = _validated_report(tmp_path, "report-2026-09-09-postmarket")
 
     assert key == report_key
     assert report.subject == "补发核验｜A股收盘日报 2026-09-09"
