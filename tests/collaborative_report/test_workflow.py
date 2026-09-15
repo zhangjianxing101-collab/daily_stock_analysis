@@ -279,6 +279,8 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
     assert 'force="true"' in context["run"]
     assert context["run"].index('force="true"') < context["run"].index('case "${FORCE_INPUT:-false}"')
     assert "date +%F" in context["run"]
+    assert '[[ "$RESEND_DATE_INPUT" > "$trading_date" ]]' in context["run"]
+    assert '! [[ "$RESEND_DATE_INPUT" < "$trading_date" ]]' not in context["run"]
     assert "args=(" in runner["run"]
     assert 'args+=(--mode "$MODE")' in runner["run"]
     assert 'args+=(--output-dir "$OUTPUT_DIR")' in runner["run"]

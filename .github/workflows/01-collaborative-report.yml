@@ -32,7 +32,7 @@ on:
         default: false
         required: false
       resend_date:
-        description: Exact archived postmarket date to repair and resend (YYYY-MM-DD; test email only)
+        description: Exact saved postmarket date to repair and resend (YYYY-MM-DD; test email only)
         type: string
         default: ''
         required: false
@@ -123,7 +123,10 @@ jobs:
             if [ "$EVENT_NAME" != "workflow_dispatch" ] || [ "$force" != "true" ] || [ "$test_email" != "true" ] || [ "$preview_only" != "false" ] || [ "$reconcile_sent" != "false" ]; then
               exit 1
             fi
-            if ! [[ "$RESEND_DATE_INPUT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || ! [[ "$RESEND_DATE_INPUT" < "$trading_date" ]]; then
+            # A failed same-day production run already has immutable report and
+            # snapshot artifacts. Permit repairing that saved report as a test
+            # email, while continuing to reject future dates.
+            if ! [[ "$RESEND_DATE_INPUT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || [[ "$RESEND_DATE_INPUT" > "$trading_date" ]]; then
               exit 1
             fi
             trading_date="$RESEND_DATE_INPUT"
