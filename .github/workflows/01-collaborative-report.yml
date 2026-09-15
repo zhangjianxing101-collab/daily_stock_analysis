@@ -31,6 +31,11 @@ on:
         type: boolean
         default: false
         required: false
+      resend_date:
+        description: Exact archived postmarket date to repair and resend (YYYY-MM-DD; test email only)
+        type: string
+        default: ''
+        required: false
 
 permissions:
   contents: read
@@ -69,6 +74,7 @@ jobs:
           TEST_EMAIL_INPUT: ${{ inputs.test_email }}
           PREVIEW_ONLY_INPUT: ${{ inputs.preview_only }}
           RECONCILE_SENT_INPUT: ${{ inputs.reconcile_sent }}
+          RESEND_DATE_INPUT: ${{ inputs.resend_date }}
         run: |
           set -euo pipefail
 
@@ -112,6 +118,17 @@ jobs:
           if [ "$test_email" = "true" ] && [ "$preview_only" = "true" ]; then exit 1; fi
 
           trading_date="$(TZ=Asia/Shanghai date +%F)"
+          historical_resend=false
+          if [ -n "${RESEND_DATE_INPUT:-}" ]; then
+            if [ "$EVENT_NAME" != "workflow_dispatch" ] || [ "$force" != "true" ] || [ "$test_email" != "true" ] || [ "$preview_only" != "false" ] || [ "$reconcile_sent" != "false" ]; then
+              exit 1
+            fi
+            if ! [[ "$RESEND_DATE_INPUT" =~ ^[0-9]{4}-[0-9]{2}-[0-9]{2}$ ]] || ! [[ "$RESEND_DATE_INPUT" < "$trading_date" ]]; then
+              exit 1
+            fi
+            trading_date="$RESEND_DATE_INPUT"
+            historical_resend=true
+          fi
           report_key="$trading_date-$mode"
           printf 'mode=%s\n' "$mode" >> "$GITHUB_OUTPUT"
           printf 'force=%s\n' "$force" >> "$GITHUB_OUTPUT"
@@ -120,13 +137,20 @@ jobs:
           printf 'reconcile_sent=%s\n' "$reconcile_sent" >> "$GITHUB_OUTPUT"
           printf 'trading_date=%s\n' "$trading_date" >> "$GITHUB_OUTPUT"
           printf 'report_key=%s\n' "$report_key" >> "$GITHUB_OUTPUT"
+          printf 'historical_resend=%s\n' "$historical_resend" >> "$GITHUB_OUTPUT"
 
       - name: Resolve report data session
         id: data_session
         env:
           MODE: ${{ steps.context.outputs.mode }}
           TRADING_DATE: ${{ steps.context.outputs.trading_date }}
+          HISTORICAL_RESEND: ${{ steps.context.outputs.historical_resend }}
         run: |
+          if [ "$HISTORICAL_RESEND" = "true" ]; then
+            printf 'date=%s\n' "$TRADING_DATE" >> "$GITHUB_OUTPUT"
+            printf 'artifact=market-snapshot-%s\n' "$TRADING_DATE" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
           python - <<'PY' >> "$GITHUB_OUTPUT"
           import os
           from datetime import date, datetime
@@ -330,7 +354,7 @@ jobs:
 
       - name: Extract prior sector state
         id: prior_sector
-        if: ${{ steps.duplicate.outputs.delivery_action == 'deliver' }}
+        if: ${{ steps.context.outputs.historical_resend != 'true' && steps.duplicate.outputs.delivery_action == 'deliver' }}
         env:
           GH_TOKEN: ${{ github.token }}
           CURRENT_TRADING_DATE: ${{ steps.context.outputs.trading_date }}
@@ -481,16 +505,55 @@ jobs:
         if: ${{ github.event_name == 'workflow_dispatch' && steps.context.outputs.mode == 'postmarket' && steps.context.outputs.force == 'true' && steps.context.outputs.test_email == 'true' && steps.context.outputs.preview_only == 'false' && steps.duplicate.outputs.delivery_action == 'deliver' }}
         env:
           GH_TOKEN: ${{ github.token }}
+          HISTORICAL_RESEND: ${{ steps.context.outputs.historical_resend }}
+          TRADING_DATE: ${{ steps.context.outputs.trading_date }}
           EMAIL_SENDER: ${{ vars.EMAIL_SENDER || secrets.EMAIL_SENDER }}
           EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD || secrets.QQEMAIL }}
           EMAIL_RECEIVERS: ${{ vars.EMAIL_RECEIVERS || secrets.EMAIL_RECEIVERS }}
+          ANSPIRE_API_KEYS: ${{ secrets.ANSPIRE_API_KEYS }}
+          GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+          DEEPSEEK_API_KEYS: ${{ secrets.DEEPSEEK_API_KEYS }}
+          AIHUBMIX_KEY: ${{ secrets.AIHUBMIX_KEY }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_API_KEYS: ${{ secrets.OPENAI_API_KEYS }}
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ANTHROPIC_API_KEYS: ${{ secrets.ANTHROPIC_API_KEYS }}
+          LITELLM_API_KEY: ${{ secrets.LITELLM_API_KEY }}
+          LLM_PRIMARY_API_KEY: ${{ secrets.LLM_PRIMARY_API_KEY }}
+          LLM_PRIMARY_API_KEYS: ${{ secrets.LLM_PRIMARY_API_KEYS }}
+          LLM_GEMINI_API_KEY: ${{ secrets.LLM_GEMINI_API_KEY }}
+          LLM_GEMINI_API_KEYS: ${{ secrets.LLM_GEMINI_API_KEYS }}
+          LLM_DEEPSEEK_API_KEY: ${{ secrets.LLM_DEEPSEEK_API_KEY }}
+          LLM_DEEPSEEK_API_KEYS: ${{ secrets.LLM_DEEPSEEK_API_KEYS }}
+          LLM_ANSPIRE_API_KEY: ${{ secrets.LLM_ANSPIRE_API_KEY }}
+          LLM_ANSPIRE_API_KEYS: ${{ secrets.LLM_ANSPIRE_API_KEYS }}
+          LLM_OPENAI_API_KEY: ${{ secrets.LLM_OPENAI_API_KEY }}
+          LLM_OPENAI_API_KEYS: ${{ secrets.LLM_OPENAI_API_KEYS }}
+          LLM_ANTHROPIC_API_KEY: ${{ secrets.LLM_ANTHROPIC_API_KEY }}
+          LLM_ANTHROPIC_API_KEYS: ${{ secrets.LLM_ANTHROPIC_API_KEYS }}
+          GENERATION_BACKEND: ${{ vars.GENERATION_BACKEND || 'litellm' }}
+          LITELLM_MODEL: ${{ vars.LITELLM_MODEL || 'gemini/gemini-2.5-flash' }}
+          GEMINI_MODEL: ${{ vars.GEMINI_MODEL || 'gemini-2.5-flash' }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL || 'gpt-4.1-mini' }}
+          ANTHROPIC_MODEL: ${{ vars.ANTHROPIC_MODEL || 'claude-3-5-sonnet-20241022' }}
+          LLM_PRIMARY_MODELS: ${{ vars.LLM_PRIMARY_MODELS || 'gemini-2.5-flash' }}
+          LLM_GEMINI_MODELS: ${{ vars.LLM_GEMINI_MODELS || 'gemini-2.5-flash' }}
+          LLM_DEEPSEEK_MODELS: ${{ vars.LLM_DEEPSEEK_MODELS || 'deepseek-chat' }}
+          LLM_ANSPIRE_MODELS: ${{ vars.LLM_ANSPIRE_MODELS || 'Doubao-Seed-2.0-lite' }}
+          LLM_OPENAI_MODELS: ${{ vars.LLM_OPENAI_MODELS || 'gpt-4.1-mini' }}
+          LLM_ANTHROPIC_MODELS: ${{ vars.LLM_ANTHROPIC_MODELS || 'claude-3-5-sonnet-20241022' }}
         run: |
           printf 'final_state=hard_failure\nrunner_exit=1\nreport_key=unavailable\n' >> "$GITHUB_OUTPUT"
           set +e
-          python scripts/send_archived_collaborative_report.py \
-            --repository "$GITHUB_REPOSITORY" \
-            --before "${{ steps.context.outputs.trading_date }}" \
-            --output-dir .workflow-artifacts
+          args=(--repository "$GITHUB_REPOSITORY" --output-dir .workflow-artifacts)
+          if [ "$HISTORICAL_RESEND" = "true" ]; then
+            args+=(--report-date "$TRADING_DATE")
+          else
+            args+=(--before "$TRADING_DATE")
+          fi
+          python scripts/send_archived_collaborative_report.py "${args[@]}"
           archived_exit=$?
           if [ "$archived_exit" -ne 0 ]; then
             printf 'runner_exit=%s\n' "$archived_exit" >> "$GITHUB_OUTPUT"
@@ -499,7 +562,7 @@ jobs:
 
       - name: Run collaborative report
         id: runner
-        if: ${{ (steps.archived.outcome == 'skipped' || steps.archived.outputs.final_state != 'test_sent') && steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.context.outputs.preview_only == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
+        if: ${{ steps.context.outputs.historical_resend != 'true' && (steps.archived.outcome == 'skipped' || steps.archived.outputs.final_state != 'test_sent') && steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.context.outputs.preview_only == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
         env:
           MODE: ${{ steps.context.outputs.mode }}
           FORCE: ${{ steps.context.outputs.force }}
@@ -760,6 +823,15 @@ jobs:
         with:
           name: ${{ steps.runner.outputs.report_artifact_name }}
           path: reports/collaborative/${{ steps.runner.outputs.report_channel }}/${{ steps.context.outputs.report_key }}
+          retention-days: 7
+
+      - name: Upload repaired archived report
+        if: ${{ always() && steps.context.outputs.historical_resend == 'true' && steps.archived.outputs.final_state == 'test_sent' }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: repaired-test-report-${{ steps.context.outputs.report_key }}
+          path: .workflow-artifacts/repaired-archived-report
+          include-hidden-files: true
           retention-days: 7
 
       - name: Upload completed-session market snapshot

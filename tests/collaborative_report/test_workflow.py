@@ -239,6 +239,8 @@ def test_workflow_trigger_permissions_concurrency_and_toolchain_contract() -> No
     assert inputs["test_email"]["default"] == "false"
     assert inputs["reconcile_sent"]["type"] == "boolean"
     assert inputs["reconcile_sent"]["default"] == "false"
+    assert inputs["resend_date"]["type"] == "string"
+    assert inputs["resend_date"]["default"] == ""
     assert workflow["permissions"] == {"contents": "read", "actions": "read"}
     assert workflow["concurrency"] == {
         "group": "collaborative-report-postmarket",
@@ -268,6 +270,7 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
         "TEST_EMAIL_INPUT": "${{ inputs.test_email }}",
         "PREVIEW_ONLY_INPUT": "${{ inputs.preview_only }}",
         "RECONCILE_SENT_INPUT": "${{ inputs.reconcile_sent }}",
+        "RESEND_DATE_INPUT": "${{ inputs.resend_date }}",
     }
     assert '"30 8 * * 1-5") mode="postmarket"' in context["run"]
     assert 'postmarket) mode="$MANUAL_MODE"' in context["run"]
@@ -290,6 +293,7 @@ def test_workflow_validates_context_uses_safe_argument_arrays_and_preserves_runn
     assert 'exit "$RUNNER_EXIT"' in final_gate["run"]
     assert "inputs." not in all_run_content
     assert "github.event." not in all_run_content
+    assert "historical_resend=true" in context["run"]
 
 
 def test_workflow_preserves_non_trading_day_skip_and_saves_close_snapshot() -> None:
@@ -709,6 +713,7 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
         "Upload production delivery claim",
         "Upload safe provider quality counts",
         "Upload completed-session market snapshot",
+        "Upload repaired archived report",
     }
     assert by_name["Upload private report"]["with"]["name"] == "${{ steps.runner.outputs.report_artifact_name }}"
     assert by_name["Upload diagnostic manifest"]["with"]["name"] == "diagnostic-${{ steps.context.outputs.report_key }}"
@@ -716,6 +721,9 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
     assert by_name["Upload production delivery claim"]["with"]["name"] == "claim-${{ steps.context.outputs.report_key }}"
     assert by_name["Upload completed-session market snapshot"]["with"]["name"] == "${{ steps.data_session.outputs.artifact }}"
     assert by_name["Upload completed-session market snapshot"]["with"]["path"] == ".workflow-artifacts/market-snapshot.json"
+    assert by_name["Upload repaired archived report"]["with"]["name"] == (
+        "repaired-test-report-${{ steps.context.outputs.report_key }}"
+    )
     assert all(step["with"]["retention-days"] == ("3" if step["name"] == "Upload safe provider quality counts" else "7")
                for step in uploads)
     probe = _step(workflow, "Probe provider quality for previews")

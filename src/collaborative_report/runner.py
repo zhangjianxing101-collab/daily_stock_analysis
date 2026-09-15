@@ -31,7 +31,7 @@ from .market_data import (
 )
 from .models import Candidate, ModuleResult, Position, ReportMode
 from .news_intel import fetch_market_news
-from .report import RenderedReport, render_report
+from .report import RenderedReport, featured_candidates, render_report
 from .risk import evaluate_position, suggested_board_lots
 from .screener import ScreeningResult, prefilter_universe, rank_with_ths_evidence, screen_aggressive
 from .sector_analysis import SectorAnalysis, SectorRow, analyze_sectors
@@ -2929,8 +2929,9 @@ def run_report(
             "gold", session.now_shanghai, "黄金模块暂不可用", exc, gold_failure_stage,
         )
 
+    ai_candidates = featured_candidates(screening.short_term, screening.swing)
     ai_codes = _select_ai_codes(
-        (*screening.short_term, *screening.swing),
+        ai_candidates,
         tuple(portfolio_codes),
         suppressed_codes,
     )

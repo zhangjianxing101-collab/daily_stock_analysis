@@ -166,7 +166,7 @@ def _fraction_percent(value: Any, digits: int = 2) -> str:
     return "不可用" if normalized is None else f"{normalized * 100:.{digits}f}%"
 
 
-def _module_rows(name: str, payload: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
+def module_rows(name: str, payload: Mapping[str, Any]) -> tuple[tuple[str, str], ...]:
     if name == "market":
         rows: list[tuple[str, str]] = []
         for key, value in payload.items():
@@ -305,10 +305,13 @@ def _module_rows(name: str, payload: Mapping[str, Any]) -> tuple[tuple[str, str]
     return tuple((str(key), _display_value(value)) for key, value in payload.items())
 
 
+_module_rows = module_rows
+
+
 def _module_view(title: str, result: ModuleResult | None) -> _ModuleView:
     if result is None:
         return _ModuleView(title, "unavailable", "暂无", (), ("数据暂不可用",))
-    rows = _module_rows(result.name, result.payload)
+    rows = module_rows(result.name, result.payload)
     warnings = tuple(dict.fromkeys(str(warning) for warning in result.warnings))
     return _ModuleView(title, result.status, _format_timestamp(result.observed_at), rows, warnings)
 
@@ -548,7 +551,7 @@ def _morning_rows(items: Sequence[Mapping[str, Any]]) -> tuple[tuple[str, str, s
     )
 
 
-def _featured_candidates(
+def featured_candidates(
     short_term: Sequence[Candidate],
     swing: Sequence[Candidate],
     *,
@@ -584,6 +587,10 @@ def _featured_candidates(
         if len(selected) >= limit:
             break
     return tuple(selected)
+
+
+# Backward-compatible internal alias for existing callers and tests.
+_featured_candidates = featured_candidates
 
 
 def _plain_text(
@@ -732,7 +739,7 @@ def render_report(
     )
     featured_views = tuple(
         _candidate_view(item, target_session, generated_at)
-        for item in _featured_candidates(short_term_candidates, swing_candidates)
+        for item in featured_candidates(short_term_candidates, swing_candidates)
     )
     morning_rows = _morning_rows(morning_candidates)
     subject = build_subject(normalized_mode, report_date, prefix=subject_prefix)
