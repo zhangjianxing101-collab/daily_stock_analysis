@@ -356,7 +356,7 @@ def normalize_a_share_thscode(code: object) -> str:
     prefix = normalized[:3]
     if prefix in {"600", "601", "603", "605", "688", "689"}:
         return f"{normalized}.SH"
-    if prefix in {"000", "001", "002", "003", "300", "301"}:
+    if prefix in {"000", "001", "002", "003", "300", "301", "302"}:
         return f"{normalized}.SZ"
     if prefix.startswith(("43", "83", "87", "88", "92")):
         return f"{normalized}.BJ"

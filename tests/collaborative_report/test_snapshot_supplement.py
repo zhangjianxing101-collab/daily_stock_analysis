@@ -59,6 +59,20 @@ def test_fetch_validates_bound_identity_and_optional_metrics() -> None:
     ]
 
 
+def test_fetch_supports_302_series_shenzhen_codes() -> None:
+    calls: list[dict[str, object]] = []
+
+    def transport(**kwargs: object) -> TencentQuoteResponse:
+        calls.append(kwargs)
+        return TencentQuoteResponse(200, quote("sz302132", "302132"))
+
+    result = TencentSnapshotSupplementClient(transport=transport, clock=lambda: RECEIPT).fetch(["302132"])
+
+    assert calls == [{"url": "https://qt.gtimg.cn/q=sz302132", "timeout_seconds": 8.0}]
+    assert result.frame["code"].tolist() == ["302132"]
+    assert result.missing_count == 0
+
+
 @pytest.mark.parametrize(
     "payload",
     [

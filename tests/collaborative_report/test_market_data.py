@@ -150,6 +150,7 @@ def test_snapshot_archive_rejects_rows_lost_during_normalization(tmp_path) -> No
         ("688001", "688001.SH"),
         ("000001", "000001.SZ"),
         ("300001", "300001.SZ"),
+        ("302132", "302132.SZ"),
         ("430047", "430047.BJ"),
         ("830001", "830001.BJ"),
         ("920001", "920001.BJ"),
@@ -371,7 +372,7 @@ def test_ths_supplement_skips_unsupported_code_without_losing_supported_coverage
         {
             "timestamp": int(stamp.timestamp() * 1000),
             "total": 2,
-            "item": [ths_snapshot_item("600000"), ths_snapshot_item("302001")],
+            "item": [ths_snapshot_item("600000"), ths_snapshot_item("999999")],
         },
         None,
     )
@@ -385,7 +386,7 @@ def test_ths_supplement_skips_unsupported_code_without_losing_supported_coverage
     fetcher.assert_called_once_with(("600000",))
     assert data.frame.attrs["screening_complete_count"] == 1
     assert data.frame.set_index("code").loc["600000", "name"] == "Stock"
-    assert pd.isna(data.frame.set_index("code").loc["302001", "name"])
+    assert pd.isna(data.frame.set_index("code").loc["999999", "name"])
     assert "snapshot_screening_fields_incomplete" in data.warnings
 
 
