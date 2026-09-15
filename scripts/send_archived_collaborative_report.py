@@ -110,6 +110,18 @@ def _named_report_artifact(metadata: object, report_date: date) -> tuple[int, st
     return artifact_id, artifact_name
 
 
+def _artifact_run_id(metadata: object, artifact_id: int) -> int:
+    for item in _artifact_candidates(metadata):
+        if item["id"] != artifact_id:
+            continue
+        workflow_run = item.get("workflow_run")
+        run_id = workflow_run.get("id") if isinstance(workflow_run, dict) else None
+        if type(run_id) is int:
+            return run_id
+        break
+    raise ValueError("archived artifact run unavailable")
+
+
 def _extract_archive(payload: bytes, destination: Path) -> None:
     if len(payload) > _MAX_ARCHIVE_BYTES:
         raise ValueError("archived report invalid")
@@ -127,15 +139,22 @@ def _extract_archive(payload: bytes, destination: Path) -> None:
         bundle.extractall(destination)
 
 
-def _download_artifact(repository: str, artifact_id: int, destination: Path) -> None:
-    payload = subprocess.run(
-        ["gh", "api", f"/repos/{repository}/actions/artifacts/{artifact_id}/zip"],
+def _download_artifact(
+    repository: str, run_id: int, artifact_name: str, destination: Path
+) -> None:
+    destination.mkdir(parents=True, exist_ok=True)
+    subprocess.run(
+        [
+            "gh", "run", "download", str(run_id),
+            "--repo", repository,
+            "--name", artifact_name,
+            "--dir", str(destination),
+        ],
         check=True,
-        stdout=subprocess.PIPE,
+        stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
         timeout=60,
-    ).stdout
-    _extract_archive(payload, destination)
+    )
 
 
 def _report_attempt(
@@ -444,8 +463,10 @@ def main() -> int:
         "warning_codes": [],
     }
     exit_code = 1
+    stage = "metadata"
     try:
         metadata = _github_json(f"/repos/{args.repository}/actions/artifacts?per_page=100")
+        stage = "artifact_selection"
         if args.report_date is None:
             artifact_id, artifact_name = _latest_artifact(metadata, before=args.before)
             report_date = date.fromisoformat(_ARTIFACT.fullmatch(artifact_name).group(1))
@@ -453,11 +474,21 @@ def main() -> int:
             report_date = args.report_date
             artifact_id, artifact_name = _named_report_artifact(metadata, report_date)
         snapshot_id, _ = _named_artifact(metadata, f"market-snapshot-{report_date.isoformat()}")
+        report_run_id = _artifact_run_id(metadata, artifact_id)
+        snapshot_run_id = _artifact_run_id(metadata, snapshot_id)
         with tempfile.TemporaryDirectory() as temporary:
             report_root, snapshot_root = Path(temporary) / "report", Path(temporary) / "snapshot"
-            _download_artifact(args.repository, artifact_id, report_root)
-            _download_artifact(args.repository, snapshot_id, snapshot_root)
+            stage = "artifact_download"
+            _download_artifact(args.repository, report_run_id, artifact_name, report_root)
+            _download_artifact(
+                args.repository,
+                snapshot_run_id,
+                f"market-snapshot-{report_date.isoformat()}",
+                snapshot_root,
+            )
+            stage = "repair"
             _repair_archived_report(report_root, artifact_name, snapshot_root)
+            stage = "validation"
             report_key, rendered = _validated_report(report_root, artifact_name)
             repaired_output = args.output_dir / "repaired-archived-report"
             repaired_output.mkdir(parents=True, exist_ok=True)
@@ -466,11 +497,12 @@ def main() -> int:
                 shutil.copy2(attempt / name, repaired_output / name)
             from src.collaborative_report.runner import _production_mail_sender
 
+            stage = "email"
             _production_mail_sender(rendered, test_email=True)
         diagnostic.update(report_key=report_key, final_state="test_sent")
         exit_code = 0
     except Exception:
-        diagnostic["warning_codes"] = ["archived_report_send_failed"]
+        diagnostic["warning_codes"] = [f"archived_report_{stage}_failed"]
     args.output_dir.mkdir(parents=True, exist_ok=True)
     (args.output_dir / "diagnostic-manifest.json").write_text(
         json.dumps(diagnostic, ensure_ascii=False, sort_keys=True) + "\n",

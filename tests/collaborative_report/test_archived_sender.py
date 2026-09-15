@@ -5,6 +5,8 @@ from pathlib import Path
 import pytest
 
 from scripts.send_archived_collaborative_report import (
+    _artifact_run_id,
+    _download_artifact,
     _featured_codes,
     _latest_artifact,
     _named_artifact,
@@ -65,6 +67,48 @@ def test_named_report_artifact_accepts_production_report_name() -> None:
     assert _named_report_artifact(metadata, date(2026, 9, 14)) == (
         11, "report-2026-09-14-postmarket",
     )
+
+
+def test_artifact_run_id_reads_originating_workflow_run() -> None:
+    metadata = [{"artifacts": [{
+        "id": 11,
+        "name": "report-2026-09-15-postmarket",
+        "expired": False,
+        "created_at": "2026-09-15T09:00:00Z",
+        "workflow_run": {"id": 34952185768},
+    }]}]
+
+    assert _artifact_run_id(metadata, 11) == 34952185768
+
+
+def test_artifact_run_id_rejects_missing_workflow_run() -> None:
+    metadata = [{"artifacts": [{
+        "id": 11,
+        "name": "report-2026-09-15-postmarket",
+        "expired": False,
+        "created_at": "2026-09-15T09:00:00Z",
+    }]}]
+
+    with pytest.raises(ValueError, match="artifact run unavailable"):
+        _artifact_run_id(metadata, 11)
+
+
+def test_download_artifact_uses_exact_run_and_name(monkeypatch, tmp_path: Path) -> None:
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+
+    monkeypatch.setattr("scripts.send_archived_collaborative_report.subprocess.run", fake_run)
+
+    destination = tmp_path / "artifact"
+    _download_artifact("owner/repo", 123, "report-2026-09-15-postmarket", destination)
+
+    assert calls[0][0] == [
+        "gh", "run", "download", "123", "--repo", "owner/repo",
+        "--name", "report-2026-09-15-postmarket", "--dir", str(destination),
+    ]
+    assert destination.is_dir()
 
 
 def test_featured_codes_are_bounded_and_deduplicated() -> None:
