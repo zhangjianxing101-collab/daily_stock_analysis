@@ -33,7 +33,7 @@ _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _A_SHARE_CODE = re.compile(r"^[0-9]{6}$")
 _TENCENT_LINE = re.compile(r'(?<![A-Za-z0-9_])v_([a-z]{2}[0-9]{6})="([^"]*)";')
 _SUPPORTED_PREFIXES = frozenset({
-    "000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689",
+    "000", "001", "002", "003", "300", "301", "302", "600", "601", "603", "605", "688", "689",
 })
 _SUPPORTED_BSE_PREFIXES = ("43", "83", "87", "88", "92")
 _FRAME_COLUMNS = (
