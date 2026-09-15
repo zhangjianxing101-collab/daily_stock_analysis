@@ -41,6 +41,26 @@ _REQUIRED_TEXT = (
 )
 _SHANGHAI = ZoneInfo("Asia/Shanghai")
 _MAX_ARCHIVE_BYTES = 50_000_000
+_AI_DISPLAY_FIELDS = (
+    "conclusion",
+    "operation_advice",
+    "action_label",
+    "action",
+    "risk_warning",
+    "news_summary",
+    "fundamental_analysis",
+)
+_CANDIDATE_LINE = re.compile(
+    r"(?m)^(?P<horizon>短线|波段)\d+：(?P<code>\d{6}) (?P<name>[^；\n]+)；"
+    r"收盘 (?P<close>[^；\n]+)；评分 (?P<score>[^；\n]+)；行业 (?P<sector>[^；\n]+)；"
+    r"规则 (?P<rules>.+)$"
+)
+_BACKTEST_LINE = re.compile(
+    r"(?m)^(?P<code>\d{6}) (?P<name>[^｜\n]+)｜(?P<horizon>短线|波段)：.*?；"
+    r"交易 (?P<trades>\d+) 次；胜率 (?P<win_rate>-?[\d.]+)%；"
+    r"累计收益 (?P<total_return>-?[\d.]+)%；最大回撤 (?P<drawdown>-?[\d.]+)%；"
+    r"最大连续亏损 (?P<losses>\d+) 次"
+)
 
 
 def _github_json(path: str) -> object:
@@ -211,7 +231,7 @@ def _validated_report(root: Path, artifact_name: str) -> tuple[str, RenderedRepo
     if len(candidates) < 3 or len(html) < 5_000 or len(text) < 3_000:
         raise ValueError("archived report incomplete")
     subject = f"补发核验｜A股收盘日报 {report_key.removesuffix('-postmarket')}"
-    notice = "本邮件补发已保存的当日收盘工件；市值补全及AI补全时间已在对应章节单独披露。"
+    notice = "本邮件补发已保存的当日收盘工件；市值补全、AI补全或量化规则回退时间已在对应章节单独披露。"
     return report_key, RenderedReport(
         subject,
         html.replace("<body>", f"<body><p><strong>{notice}</strong></p>", 1),
@@ -225,6 +245,77 @@ def _featured_codes(text: str) -> tuple[str, ...]:
     except IndexError:
         raise ValueError("archived report incomplete") from None
     return tuple(dict.fromkeys(re.findall(r"(?m)^(\d{6})\s+", section)))[:5]
+
+
+def _archived_quantitative_fallback(text: str, codes: tuple[str, ...]) -> dict[str, dict[str, str]]:
+    """Build transparent analysis from screening and backtest evidence already in the report."""
+
+    candidates = {match.group("code"): match.groupdict() for match in _CANDIDATE_LINE.finditer(text)}
+    backtests = {
+        (match.group("code"), match.group("horizon")): match.groupdict()
+        for match in _BACKTEST_LINE.finditer(text)
+    }
+    fallback: dict[str, dict[str, str]] = {}
+    for code in codes:
+        candidate = candidates.get(code)
+        if candidate is None:
+            continue
+        result = backtests.get((code, candidate["horizon"]))
+        if result is None:
+            risk = "对应周期回测数据缺失，不具备统计验证基础。"
+            advice = "仅观察，等待价格和成交量再次确认；任何操作需人工确认。"
+            confidence = "低"
+        else:
+            trades = int(result["trades"])
+            win_rate = float(result["win_rate"])
+            total_return = float(result["total_return"])
+            drawdown = float(result["drawdown"])
+            losses = int(result["losses"])
+            risk = (
+                f"{candidate['horizon']}回测{trades}次，胜率{win_rate:.2f}%，累计收益"
+                f"{total_return:+.2f}%，最大回撤{drawdown:.2f}%，最大连续亏损{losses}次。"
+            )
+            if trades < 3:
+                advice = "回测样本不足，仅观察，等待更多交易样本；任何操作需人工确认。"
+                confidence = "低"
+            elif drawdown > 10 or losses >= 3 or total_return <= 0:
+                advice = "回测风险不达标，仅列入观察，不追涨；等待趋势与成交量确认，任何操作需人工确认。"
+                confidence = "低"
+            else:
+                advice = "可列入条件观察；仅在板块强度延续且价格信号确认后人工决策，不自动下单。"
+                confidence = "中"
+        fallback[code] = {
+            "name": candidate["name"],
+            "conclusion": (
+                f"量化规则回退（非AI模型结论）：筛选评分{candidate['score']}，"
+                f"所属{candidate['sector']}，收盘{candidate['close']}。"
+            ),
+            "operation_advice": advice,
+            "confidence_level": confidence,
+            "risk_warning": risk,
+            "news_summary": "本次历史修复未取得该股票的可验证公司级新闻证据。",
+            "fundamental_analysis": "本次历史修复未取得该股票的可验证基本面结论。",
+        }
+    return fallback
+
+
+def _merge_archived_ai_analysis(
+    text: str, codes: tuple[str, ...], payload: Mapping[str, Any]
+) -> tuple[dict[str, dict[str, Any]], tuple[str, ...]]:
+    names = dict(re.findall(r"(?m)^(\d{6})\s+([^（：\n]+)", text))
+    fallback = _archived_quantitative_fallback(text, codes)
+    merged: dict[str, dict[str, Any]] = {}
+    fallback_codes: list[str] = []
+    for code in codes:
+        value = payload.get(code)
+        if isinstance(value, Mapping) and any(
+            value.get(field) not in (None, "", (), []) for field in _AI_DISPLAY_FIELDS
+        ):
+            merged[code] = {"name": names.get(code, "名称不可用"), **dict(value)}
+        elif code in fallback:
+            merged[code] = fallback[code]
+            fallback_codes.append(code)
+    return merged, tuple(fallback_codes)
 
 
 def _historical_market_style(snapshot_path: Path) -> tuple[Mapping[str, Any], datetime, int]:
@@ -329,17 +420,17 @@ def _repair_archived_report(report_root: Path, artifact_name: str, snapshot_root
         raise ValueError("archived report incomplete")
     generated_at = datetime.fromisoformat(manifest["generated_at"])
     ai = enrich_codes(codes, observed_at=generated_at)
-    if ai.status not in {"ok", "partial"} or len(ai.payload) < 3:
-        raise ValueError("archived AI analysis unavailable")
-    names = dict(re.findall(r"(?m)^(\d{6})\s+([^（：\n]+)", text))
-    ai_payload = {
-        code: {"name": names.get(code, "名称不可用"), **dict(value)}
-        for code, value in ai.payload.items()
-        if isinstance(value, Mapping)
-    }
+    ai_payload, fallback_codes = _merge_archived_ai_analysis(text, codes, ai.payload)
     ai_rows = module_rows("ai", ai_payload)
     if len(ai_rows) < 3:
         raise ValueError("archived AI analysis unavailable")
+    ai_status = "partial" if fallback_codes or ai.status != "ok" else "ok"
+    ai_warnings = list(ai.warnings)
+    if fallback_codes:
+        ai_warnings.append(
+            "AI服务未返回完整结果；缺失标的已使用报告内筛选与回测数据生成量化规则回退，"
+            "该内容不是AI模型结论"
+        )
     cap_time = market_cap_at.astimezone(_SHANGHAI).strftime("%Y-%m-%d %H:%M CST")
     style_warning = (
         f"市场风格使用{report_date.isoformat()}收盘涨跌幅，并以{cap_time} Tencent总市值反推当日市值；"
@@ -362,9 +453,9 @@ def _repair_archived_report(report_root: Path, artifact_name: str, snapshot_root
     ai_lines = [
         f"分析上下文截止：{generated_at.astimezone(_SHANGHAI).strftime('%Y-%m-%d %H:%M CST')}",
         f"补全执行时间：{datetime.now(_SHANGHAI).strftime('%Y-%m-%d %H:%M CST')}",
-        f"模块状态：{ai.status}",
+        f"模块状态：{ai_status}",
         *(f"{label}：{value}" for label, value in ai_rows),
-        *(f"警告：{warning}" for warning in ai.warnings),
+        *(f"警告：{warning}" for warning in ai_warnings),
     ]
     text = _replace_text_section(text, "AI分析", "资金分配", ai_lines)
     risk = "历史回测显示多只候选最大回撤超过10%且连续亏损超过3次；板块持续性仍属首次观察，任何操作需人工确认。"
@@ -403,7 +494,7 @@ def _repair_archived_report(report_root: Path, artifact_name: str, snapshot_root
             f"分析上下文截止：{generated_at.astimezone(_SHANGHAI).strftime('%Y-%m-%d %H:%M CST')}；"
             f"补全执行时间：{datetime.now(_SHANGHAI).strftime('%Y-%m-%d %H:%M CST')}"
         ),
-        warning="；".join(ai.warnings),
+        warning="；".join(ai_warnings),
     )
     _replace_html_section(
         document,
@@ -419,7 +510,7 @@ def _repair_archived_report(report_root: Path, artifact_name: str, snapshot_root
     statuses = manifest.get("module_statuses")
     if not isinstance(statuses, dict):
         raise ValueError("archived report invalid")
-    statuses.update(ai=ai.status, market="partial", decision_summary="partial", delivery_readiness="ok")
+    statuses.update(ai=ai_status, market="partial", decision_summary="partial", delivery_readiness="ok")
     sources = manifest.get("source_timestamps")
     if isinstance(sources, dict):
         sources.update(market_cap_supplement=market_cap_at.isoformat(), ai_repair=datetime.now(_SHANGHAI).isoformat())
@@ -427,7 +518,9 @@ def _repair_archived_report(report_root: Path, artifact_name: str, snapshot_root
     if isinstance(warnings, list):
         manifest["warning_codes"] = [
             item for item in warnings if item not in {"ai_warning_1", "delivery_readiness_warning_1"}
-        ] + ["historical_market_cap_supplement"]
+        ] + ["historical_market_cap_supplement"] + (
+            ["archived_ai_quantitative_fallback"] if fallback_codes else []
+        )
     manifest["final_state"] = "previewed"
     manifest["historical_repair"] = {
         "schema_version": 1,
@@ -435,6 +528,8 @@ def _repair_archived_report(report_root: Path, artifact_name: str, snapshot_root
         "market_cap_source": "Tencent",
         "market_cap_coverage": coverage,
         "ai_codes": list(ai_payload),
+        "ai_live_codes": [code for code in ai_payload if code not in fallback_codes],
+        "quantitative_fallback_codes": list(fallback_codes),
     }
     text_path.write_text(text, encoding="utf-8")
     html_path.write_text(

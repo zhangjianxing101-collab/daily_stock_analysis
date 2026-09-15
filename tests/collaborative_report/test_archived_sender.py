@@ -5,14 +5,53 @@ from pathlib import Path
 import pytest
 
 from scripts.send_archived_collaborative_report import (
+    _archived_quantitative_fallback,
     _artifact_run_id,
     _download_artifact,
     _featured_codes,
     _latest_artifact,
+    _merge_archived_ai_analysis,
     _named_artifact,
     _named_report_artifact,
     _validated_report,
 )
+
+
+_ARCHIVED_ANALYSIS_TEXT = """
+筛选状态
+短线1：300569 天能重工；收盘 5.22；评分 100.0；行业 风电零部件；规则 ma5>ma10>ma20、leading_sector
+短线2：300850 新强联；收盘 30.09；评分 100.0；行业 风电零部件；规则 ma5>ma10>ma20、leading_sector
+波段1：301630 同宇新材；收盘 197.57；评分 95.0；行业 电子化学品；规则 ma20>ma50且close>ma20
+回测摘要
+300569 天能重工｜短线：区间 2025-10-31 至 2026-09-15；交易 8 次；胜率 25.00%；累计收益 -0.23%；最大回撤 9.35%；最大连续亏损 3 次；期末权益 ¥19,954.10
+300850 新强联｜短线：区间 2025-10-31 至 2026-09-15；交易 6 次；胜率 66.67%；累计收益 3.15%；最大回撤 3.32%；最大连续亏损 1 次；期末权益 ¥20,629.07
+301630 同宇新材｜波段：区间 2025-10-31 至 2026-09-15；交易 0 次；胜率 0.00%；累计收益 0.00%；最大回撤 0.00%；最大连续亏损 0 次；期末权益 ¥20,000.00
+"""
+
+
+def test_archived_quantitative_fallback_uses_screening_and_matching_backtest() -> None:
+    output = _archived_quantitative_fallback(
+        _ARCHIVED_ANALYSIS_TEXT, ("300569", "300850", "301630")
+    )
+
+    assert output["300569"]["name"] == "天能重工"
+    assert "累计收益-0.23%" in output["300569"]["risk_warning"]
+    assert "回测风险不达标" in output["300569"]["operation_advice"]
+    assert output["300850"]["confidence_level"] == "中"
+    assert "回测样本不足" in output["301630"]["operation_advice"]
+    assert "非AI模型结论" in output["301630"]["conclusion"]
+
+
+def test_merge_archived_ai_analysis_preserves_live_results_and_fills_missing() -> None:
+    merged, fallback_codes = _merge_archived_ai_analysis(
+        _ARCHIVED_ANALYSIS_TEXT,
+        ("300569", "300850", "301630"),
+        {"300850": {"conclusion": "真实AI结论", "operation_advice": "继续观察"}},
+    )
+
+    assert merged["300850"]["conclusion"] == "真实AI结论"
+    assert "量化规则回退" in merged["300569"]["conclusion"]
+    assert fallback_codes == ("300569", "301630")
 
 
 def test_latest_artifact_selects_newest_valid_prior_preview() -> None:
@@ -153,7 +192,7 @@ def test_validated_report_requires_substantive_preview(tmp_path: Path) -> None:
 
     assert key == report_key
     assert report.subject == "补发核验｜A股收盘日报 2026-09-09"
-    assert "市值补全及AI补全时间" in report.text
+    assert "市值补全、AI补全或量化规则回退时间" in report.text
 
 
 def test_validated_report_rejects_thin_content(tmp_path: Path) -> None:
