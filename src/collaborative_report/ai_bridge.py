@@ -15,7 +15,7 @@ from .models import ModuleResult
 
 
 _EMPTY_PAYLOAD = MappingProxyType({})
-DEFAULT_AI_CHILD_TIMEOUT_SECONDS = 300.0
+DEFAULT_AI_CHILD_TIMEOUT_SECONDS = 600.0
 _PROJECTED_FIELDS = (
     "action",
     "action_label",

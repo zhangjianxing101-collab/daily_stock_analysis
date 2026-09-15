@@ -50,7 +50,8 @@ When optional position sizing is enabled, any held position without a validated
 price suppresses all new-position sizing. Position sizing is disabled by default
 for the current market-and-sector research scope.
 
-Production snapshots supplement THS names, volume ratios and turnover percentages
+Production snapshots supplement THS names, volume ratios, turnover percentages, and
+total market capitalization
 from the project's public Tencent quote source before screening the full universe.
 THS traded amount is never interpreted as turnover percentage. Supplements require
 exact identities, no future timestamps, finite metrics, and price agreement within
@@ -72,11 +73,15 @@ the local runner for compatibility but is not part of scheduled delivery.
 Preview runs additionally produce bounded `provider-quality` diagnostics containing
 only counts and parsed dates. Raw responses, stderr and credentials are not uploaded.
 
-The market overview derives style only when every quoted stock has a finite,
-positive total-market-cap value. It compares the equal-weight returns of the
+The market overview derives style when at least 70% of quoted stocks have finite,
+positive total-market-cap values. It compares the equal-weight returns of the
 largest and smallest 30% of the verified snapshot and reports both group averages
 beside `大盘占优`, `小盘占优`, or `均衡`. A 0.5 percentage-point spread is required
 before declaring either size group dominant.
+
+Candidate AI enrichment runs in an isolated child process and has a ten-minute
+deadline within the workflow's thirty-minute job limit. A timeout remains a hard
+report-completeness blocker; the report never substitutes placeholder analysis.
 
 Post-close limit-up and limit-down counts come from AKShare's documented
 Eastmoney daily pools (`stock_zt_pool_em` and `stock_zt_pool_dtgc_em`) for the
@@ -203,6 +208,8 @@ the original publisher or an official disclosure before any manual decision.
 ## Manual operation
 
 Use **Run workflow** for a manual `postmarket` report. The workflow serializes scheduled and manual runs while preserving `cancel-in-progress: false`. For a manual test email, set `force` to true when outside its normal window and set `test_email` to true. A test email is marked as a test and never creates a production delivery marker.
+
+Outside the current delivery window, the archived test-email path checks the saved report's core module statuses and market style before sending. A preview artifact with blocked delivery readiness, unavailable AI, or missing market style is not an acceptable sample, even when it contains all headings and candidate names. In that case the workflow fails closed without sending email; it does not silently substitute current market data for the historical session.
 
 Use a production manual run only after verifying the secrets and variables. A normal sent report creates `sent-<report-key>`; a later fresh GitHub job uses that durable marker as the cross-run duplicate guard and passes `--already-sent` to the runner as an external completed identity. Before any production runner call, the workflow queries unexpired `sent-<report-key>`, `in-doubt-<report-key>`, and `claim-<report-key>` artifacts in that order. A sent marker wins; otherwise an in-doubt marker or unresolved claim fails closed before mail delivery and writes only the redacted diagnostic artifact. Test email bypasses all production marker lookup and never creates a production marker. Within a single run or a locally durable output directory, the runner's local delivery ledger is the delivery state machine and a second barrier; it is ephemeral on GitHub-hosted runners and is not cross-run state.
 

@@ -499,7 +499,7 @@ jobs:
 
       - name: Run collaborative report
         id: runner
-        if: ${{ steps.archived.outcome == 'skipped' && steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.context.outputs.preview_only == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
+        if: ${{ (steps.archived.outcome == 'skipped' || steps.archived.outputs.final_state != 'test_sent') && steps.duplicate.outputs.delivery_action == 'deliver' && (steps.context.outputs.test_email == 'true' || steps.context.outputs.preview_only == 'true' || steps.duplicate.outputs.already_sent == 'true' || steps.claim.outcome == 'success') }}
         env:
           MODE: ${{ steps.context.outputs.mode }}
           FORCE: ${{ steps.context.outputs.force }}
@@ -820,8 +820,8 @@ jobs:
         env:
           REPORT_KEY: ${{ steps.context.outputs.report_key }}
           MODE: ${{ steps.context.outputs.mode }}
-          FINAL_STATE: ${{ steps.archived.outputs.final_state || steps.runner.outputs.final_state || steps.duplicate.outputs.blocked_final_state || steps.claim_failure.outputs.final_state || steps.reconcile.outputs.final_state }}
-          RUNNER_EXIT: ${{ steps.archived.outputs.runner_exit || steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
+          FINAL_STATE: ${{ steps.runner.outputs.final_state || steps.archived.outputs.final_state || steps.duplicate.outputs.blocked_final_state || steps.claim_failure.outputs.final_state || steps.reconcile.outputs.final_state }}
+          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.archived.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
           ARCHIVED_REPORT_KEY: ${{ steps.archived.outputs.report_key }}
           DUPLICATE_CHECK: ${{ steps.duplicate.outputs.duplicate_check }}
           DELIVERY_ACTION: ${{ steps.duplicate.outputs.delivery_action }}
@@ -850,7 +850,7 @@ jobs:
       - name: Fail when the runner failed
         if: ${{ always() }}
         env:
-          RUNNER_EXIT: ${{ steps.archived.outputs.runner_exit || steps.runner.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
+          RUNNER_EXIT: ${{ steps.runner.outputs.runner_exit || steps.archived.outputs.runner_exit || steps.duplicate.outputs.blocked_exit || steps.claim_failure.outputs.exit_code || steps.reconcile.outputs.exit_code || '0' }}
         run: |
           set -euo pipefail
           if [ "$RUNNER_EXIT" -ne 0 ]; then

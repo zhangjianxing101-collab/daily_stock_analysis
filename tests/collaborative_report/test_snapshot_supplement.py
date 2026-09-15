@@ -24,6 +24,7 @@ def quote(symbol: str, code: str, **overrides: str) -> str:
     fields[30] = "20260904150000"
     fields[35] = "10.25/123/4567"
     fields[38] = "2.5"
+    fields[45] = "123.4"
     fields[49] = "1.2"
     for index, value in overrides.items():
         fields[int(index)] = value
@@ -52,6 +53,7 @@ def test_fetch_validates_bound_identity_and_optional_metrics() -> None:
             "turnover": 2.5,
             "volume": 12300,
             "amount": 4567.0,
+            "total_mv": 123.4,
             "source_timestamp": datetime(2026, 9, 4, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai")),
         }
     ]
