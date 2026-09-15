@@ -4,7 +4,7 @@ from pathlib import Path
 
 import pytest
 
-from scripts.send_archived_collaborative_report import _latest_artifact, _validated_report
+from scripts.send_archived_collaborative_report import _featured_codes, _latest_artifact, _named_artifact, _validated_report
 
 
 def test_latest_artifact_selects_newest_valid_prior_preview() -> None:
@@ -26,6 +26,27 @@ def test_latest_artifact_selects_newest_valid_prior_preview() -> None:
     assert _latest_artifact(metadata, before=date(2026, 9, 10)) == (
         11, "test-report-2026-09-09-postmarket",
     )
+
+
+def test_named_artifact_selects_exact_newest_archive() -> None:
+    metadata = [{"artifacts": [
+        {"id": 10, "name": "market-snapshot-2026-09-14", "expired": False, "created_at": "2026-09-14T08:00:00Z"},
+        {"id": 11, "name": "market-snapshot-2026-09-14", "expired": False, "created_at": "2026-09-14T09:00:00Z"},
+        {"id": 12, "name": "market-snapshot-2026-09-15", "expired": False, "created_at": "2026-09-15T09:00:00Z"},
+    ]}]
+
+    assert _named_artifact(metadata, "market-snapshot-2026-09-14") == (
+        11, "market-snapshot-2026-09-14",
+    )
+
+
+def test_featured_codes_are_bounded_and_deduplicated() -> None:
+    text = "\n".join((
+        "", "板块龙头精选观察（最多5只）", "600001 甲", "600002 乙", "600001 甲",
+        "600003 丙", "600004 丁", "600005 戊", "600006 己", "下一交易日短线池",
+    ))
+
+    assert _featured_codes(text) == ("600001", "600002", "600003", "600004", "600005")
 
 
 def test_validated_report_requires_substantive_preview(tmp_path: Path) -> None:
@@ -50,6 +71,8 @@ def test_validated_report_requires_substantive_preview(tmp_path: Path) -> None:
         "600003 示例三（1-4周，评分 70）",
         "AI分析",
         "600001 示例一：结论: 仅供研究观察",
+        "600002 示例二：建议: 仅供研究观察",
+        "600003 示例三：风险: 需人工确认",
         "资金分配",
     ))
     (attempt / "report.txt").write_text(sections + "\n" + "内容" * 2_000, encoding="utf-8")
@@ -59,7 +82,7 @@ def test_validated_report_requires_substantive_preview(tmp_path: Path) -> None:
 
     assert key == report_key
     assert report.subject == "补发核验｜A股收盘日报 2026-09-09"
-    assert "未使用当前行情重算历史结果" in report.text
+    assert "市值补全及AI补全时间" in report.text
 
 
 def test_validated_report_rejects_thin_content(tmp_path: Path) -> None:
