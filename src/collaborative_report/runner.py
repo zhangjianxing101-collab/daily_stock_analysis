@@ -90,6 +90,7 @@ _DATA_FAILURE_CODES = {
     "THS snapshot contains duplicate codes": "ths_snapshot_duplicate_codes",
     "THS snapshot contains invalid values": "ths_snapshot_values_invalid",
     "snapshot provider unavailable": "snapshot_provider_unavailable",
+    "snapshot provider timed out": "snapshot_provider_timeout",
     "snapshot provider returned empty data": "snapshot_provider_empty",
     "provider acquisition clock invalid": "provider_clock_invalid",
     "market calendar unavailable": "market_calendar_unavailable",
@@ -643,14 +644,15 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
         raw_market_values = frame["total_mv"]
         try:
             market_values = tuple(float(value) for value in pd.to_numeric(raw_market_values, errors="coerce"))
-            market_values_complete = (
-                len(market_values) == len(frame)
-                and not any(isinstance(value, (bool, np.bool_)) for value in raw_market_values.tolist())
-                and all(math.isfinite(value) and value > 0 for value in market_values)
+            ranked = sorted(
+                (market_value, change)
+                for raw_value, market_value, change in zip(raw_market_values.tolist(), market_values, changes)
+                if not isinstance(raw_value, (bool, np.bool_))
+                and math.isfinite(market_value)
+                and market_value > 0
             )
-            if market_values_complete:
-                group_size = max(len(frame) * 3 // 10, 1)
-                ranked = sorted(zip(market_values, changes), key=lambda item: item[0])
+            if len(ranked) >= max(math.ceil(len(frame) * 0.7), 2):
+                group_size = max(len(ranked) * 3 // 10, 1)
                 small_return = math.fsum(item[1] for item in ranked[:group_size]) / group_size
                 large_return = math.fsum(item[1] for item in ranked[-group_size:]) / group_size
                 spread = large_return - small_return
@@ -658,6 +660,7 @@ def _market_payload(dataset: MarketDataset, *, authoritative: bool) -> Mapping[s
                 style_evidence = {
                     "大盘组平均涨跌幅": large_return,
                     "小盘组平均涨跌幅": small_return,
+                    "市值字段覆盖记录": len(ranked),
                 }
         except (TypeError, ValueError, OverflowError):
             pass

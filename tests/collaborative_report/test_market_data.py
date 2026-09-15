@@ -1,4 +1,5 @@
 import traceback
+import subprocess
 from datetime import date, datetime, timedelta, timezone
 import sys
 from types import SimpleNamespace
@@ -9,6 +10,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src.collaborative_report import market_data
 from src.collaborative_report.market_data import (
     MarketDataGateway,
     MarketDataset,
@@ -218,7 +220,8 @@ def test_ths_quarantine_does_not_hide_malformed_values(bad) -> None:
 def test_ths_supplement_requires_independent_time_identity_and_price_agreement(fault) -> None:
     stamp = datetime(2026, 8, 19, 15, 0, tzinfo=ZoneInfo("Asia/Shanghai"))
     record = {"code": "600000", "name": "Stock", "price": 10.0,
-              "volume_ratio": 1.2, "turnover": 2.3, "source_timestamp": stamp}
+              "volume_ratio": 1.2, "turnover": 2.3, "total_mv": 500.0,
+              "source_timestamp": stamp}
     if fault == "future":
         record["source_timestamp"] = OBSERVED_AT + timedelta(seconds=1)
     elif fault == "stale":
@@ -243,6 +246,7 @@ def test_ths_supplement_requires_independent_time_identity_and_price_agreement(f
     if fault in (None, "boundary"):
         assert data.frame.loc[0, "name"] == "Stock"
         assert data.frame.loc[0, "turnover"] == 2.3
+        assert data.frame.loc[0, "total_mv"] == 500.0
         assert data.frame.loc[0, "amount"] == 10000.0
         assert data.source.endswith("+tencent")
         assert data.frame.attrs["screening_complete_count"] == 1
@@ -627,6 +631,42 @@ def test_ths_specialty_helpers_return_market_datasets_without_report_integration
     assert datasets[0].frame.to_dict("records") == [
         {"thscode": "600000.SH", "report": "2026-1", "ability": "growth", "index_id": "profit_yoy", "value": "1.2"}
     ]
+
+
+def test_default_akshare_snapshot_runs_in_bounded_worker(monkeypatch) -> None:
+    raw = pd.DataFrame({"代码": ["000001"], "名称": ["平安银行"], "最新价": [10.0]})
+    run = Mock(return_value=subprocess.CompletedProcess([], 0, raw.to_json(orient="split").encode()))
+    monkeypatch.setattr(market_data.subprocess, "run", run)
+
+    result = MarketDataGateway(clock=lambda: OBSERVED_AT).get_a_share_snapshot()
+
+    assert result.frame.iloc[0]["code"] == "000001"
+    assert result.source == "akshare.stock_zh_a_spot_em"
+    assert run.call_args.kwargs["timeout"] == 90
+    assert run.call_args.kwargs["stderr"] == subprocess.DEVNULL
+
+
+def test_default_akshare_snapshot_timeout_is_distinct(monkeypatch) -> None:
+    monkeypatch.setattr(
+        market_data.subprocess,
+        "run",
+        Mock(side_effect=subprocess.TimeoutExpired("worker", 90)),
+    )
+
+    with pytest.raises(ValueError, match="^snapshot provider timed out$"):
+        MarketDataGateway(clock=lambda: OBSERVED_AT).get_a_share_snapshot()
+
+
+@pytest.mark.parametrize("output", [b"not json", b"", b"\xff"])
+def test_default_akshare_snapshot_rejects_bad_worker_output(monkeypatch, output) -> None:
+    monkeypatch.setattr(
+        market_data.subprocess,
+        "run",
+        Mock(return_value=subprocess.CompletedProcess([], 0, output)),
+    )
+
+    with pytest.raises(ValueError, match="^snapshot provider unavailable$"):
+        MarketDataGateway(clock=lambda: OBSERVED_AT).get_a_share_snapshot()
 
 
 def test_normalize_a_share_snapshot_maps_chinese_columns_and_numeric_values() -> None:

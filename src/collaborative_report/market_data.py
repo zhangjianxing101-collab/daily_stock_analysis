@@ -8,6 +8,9 @@ import json
 import logging
 import os
 from pathlib import Path
+import subprocess
+import sys
+from io import StringIO
 from typing import Any, Callable, Mapping, Sequence
 from zoneinfo import ZoneInfo
 
@@ -101,6 +104,8 @@ _XSHG_OPEN = time(9, 30)
 _XSHG_CLOSE = time(15, 0)
 _SNAPSHOT_ARCHIVE_SCHEMA_VERSION = 1
 _SNAPSHOT_ARCHIVE_MAX_BYTES = 16 * 1024 * 1024
+_AKSHARE_SNAPSHOT_WORKER = Path(__file__).with_name("snapshot_worker.py").resolve()
+_AKSHARE_SNAPSHOT_TIMEOUT_SECONDS = 90
 logger = logging.getLogger(__name__)
 _THS_FAILURE_CODES = {
     ThsAuthenticationError: "ths_authentication_failed",
@@ -125,6 +130,30 @@ _RECOVERABLE_THS_ERRORS = (
     ThsPermissionError,
     ThsRateLimitError,
 )
+
+
+def _bounded_akshare_snapshot() -> pd.DataFrame:
+    try:
+        completed = subprocess.run(
+            [sys.executable, str(_AKSHARE_SNAPSHOT_WORKER)],
+            check=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            timeout=_AKSHARE_SNAPSHOT_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired:
+        raise ValueError("snapshot provider timed out") from None
+    except (OSError, subprocess.SubprocessError):
+        raise ValueError("snapshot provider unavailable") from None
+    if len(completed.stdout) > _SNAPSHOT_ARCHIVE_MAX_BYTES:
+        raise ValueError("snapshot provider unavailable")
+    try:
+        frame = pd.read_json(StringIO(completed.stdout.decode("utf-8")), orient="split", dtype=False)
+    except (UnicodeError, ValueError, TypeError):
+        raise ValueError("snapshot provider unavailable") from None
+    if not isinstance(frame, pd.DataFrame):
+        raise ValueError("snapshot provider unavailable")
+    return frame
 
 
 @dataclass(frozen=True)
@@ -779,6 +808,12 @@ class MarketDataGateway:
                         or abs(price - float(row["price"])) > 0.01 + 1e-9):
                     continue
                 result.loc[index, ["name", "volume_ratio", "turnover"]] = [name, ratio, turnover]
+                try:
+                    total_mv = float(other.get("total_mv"))
+                    if np.isfinite(total_mv) and total_mv > 0:
+                        result.loc[index, "total_mv"] = total_mv
+                except (TypeError, ValueError, OverflowError):
+                    pass
                 timestamps.append(identity)
             except (TypeError, ValueError, OverflowError):
                 continue
@@ -849,11 +884,11 @@ class MarketDataGateway:
             fallback_warnings = ("THS unavailable; existing snapshot source used",)
         try:
             if self._snapshot_fetcher is None:
-                import akshare
-
-                raw = akshare.stock_zh_a_spot_em()
+                raw = _bounded_akshare_snapshot()
             else:
                 raw = self._snapshot_fetcher()
+        except ValueError:
+            raise
         except Exception:
             raise ValueError("snapshot provider unavailable") from None
         if raw is None or raw.empty:

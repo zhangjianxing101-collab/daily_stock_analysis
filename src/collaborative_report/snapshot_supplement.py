@@ -36,7 +36,10 @@ _SUPPORTED_PREFIXES = frozenset({
     "000", "001", "002", "003", "300", "301", "600", "601", "603", "605", "688", "689",
 })
 _SUPPORTED_BSE_PREFIXES = ("43", "83", "87", "88", "92")
-_FRAME_COLUMNS = ("code", "name", "price", "volume_ratio", "turnover", "volume", "amount", "source_timestamp")
+_FRAME_COLUMNS = (
+    "code", "name", "price", "volume_ratio", "turnover", "volume", "amount", "total_mv",
+    "source_timestamp",
+)
 
 _WARNING_BATCH_UNAVAILABLE = "Tencent supplemental quote batch unavailable"
 _WARNING_FAILURE_LIMIT = "Tencent supplemental quote requests stopped after consecutive failures"
@@ -175,6 +178,7 @@ def _parse_batch(
         price = _positive_finite(fields[3])
         volume_ratio = _finite_nonnegative(fields[49])
         turnover = _finite_nonnegative(fields[38])
+        total_mv = _positive_finite(fields[45])
         source_timestamp = _source_timestamp(fields[30], receipt)
         if (
             not name
@@ -194,6 +198,7 @@ def _parse_batch(
                 "turnover": turnover,
                 "volume": _optional_volume(fields),
                 "amount": _optional_amount(fields),
+                "total_mv": total_mv,
                 "source_timestamp": source_timestamp,
             }
         )

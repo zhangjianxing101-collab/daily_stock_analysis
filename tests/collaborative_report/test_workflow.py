@@ -592,6 +592,19 @@ def test_production_claim_is_mandatory_before_runner_and_blocks_crash_retries() 
     assert "EMAIL_" not in _step(workflow, "Prepare production delivery claim")["run"]
 
 
+def test_rejected_archived_test_report_falls_back_to_fresh_runner() -> None:
+    workflow = _workflow()
+    runner = _step(workflow, "Run collaborative report")
+    summary = _step(workflow, "Write safe workflow summary")
+    failure = _step(workflow, "Fail when the runner failed")
+
+    assert "steps.archived.outcome == 'skipped'" in runner["if"]
+    assert "steps.archived.outputs.final_state != 'test_sent'" in runner["if"]
+    assert summary["env"]["FINAL_STATE"].startswith("${{ steps.runner.outputs.final_state || steps.archived.outputs.final_state")
+    assert summary["env"]["RUNNER_EXIT"].startswith("${{ steps.runner.outputs.runner_exit || steps.archived.outputs.runner_exit")
+    assert failure["env"]["RUNNER_EXIT"].startswith("${{ steps.runner.outputs.runner_exit || steps.archived.outputs.runner_exit")
+
+
 def test_newer_test_artifact_cannot_obscure_an_older_production_prior_report() -> None:
     report_key = "2026-08-20-premarket"
     artifacts = [

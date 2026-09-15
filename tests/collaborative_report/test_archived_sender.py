@@ -40,13 +40,17 @@ def test_validated_report_requires_substantive_preview(tmp_path: Path) -> None:
         "generated_at": "2026-09-09T16:30:00+08:00",
         "final_state": "previewed",
         "test_email": False,
+        "module_statuses": {"ai": "ok", "market": "ok"},
     }), encoding="utf-8")
     sections = "\n".join((
-        "决策摘要", "市场宽度", "行业板块", "概念板块", "市场新闻与事件线索",
+        "决策摘要", "市场宽度", "市场风格：均衡", "行业板块", "概念板块", "市场新闻与事件线索",
         "下一交易日短线池", "下一交易日波段池",
         "600001 示例一（1-5个交易日，评分 90）",
         "600002 示例二（1-4周，评分 80）",
         "600003 示例三（1-4周，评分 70）",
+        "AI分析",
+        "600001 示例一：结论: 仅供研究观察",
+        "资金分配",
     ))
     (attempt / "report.txt").write_text(sections + "\n" + "内容" * 2_000, encoding="utf-8")
     (attempt / "report.html").write_text("<body>" + "内容" * 3_000 + "</body>", encoding="utf-8")
@@ -72,6 +76,43 @@ def test_validated_report_rejects_thin_content(tmp_path: Path) -> None:
     }), encoding="utf-8")
     (attempt / "report.txt").write_text("空报告", encoding="utf-8")
     (attempt / "report.html").write_text("<body>空报告</body>", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="archived report incomplete"):
+        _validated_report(tmp_path, "test-report-2026-09-09-postmarket")
+
+
+@pytest.mark.parametrize("statuses,style,blocked", [
+    ({"ai": "unavailable", "market": "partial"}, "均衡", False),
+    ({"ai": "ok", "market": "partial", "delivery_readiness": "unavailable"}, "均衡", True),
+    ({"ai": "ok", "market": "partial"}, "不可用", False),
+    ({"ai": "ok", "market": "ok"}, "均衡", False),
+])
+def test_validated_report_rejects_incomplete_core_sections(
+    tmp_path: Path, statuses: dict[str, str], style: str, blocked: bool,
+) -> None:
+    attempt = tmp_path / "attempts" / "one"
+    attempt.mkdir(parents=True)
+    (attempt / "manifest.json").write_text(json.dumps({
+        "schema_version": 1,
+        "report_key": "2026-09-09-postmarket",
+        "mode": "postmarket",
+        "trading_date": "2026-09-09",
+        "generated_at": "2026-09-09T16:30:00+08:00",
+        "final_state": "previewed",
+        "test_email": False,
+        "module_statuses": statuses,
+    }), encoding="utf-8")
+    text = "\n".join((
+        "决策摘要", "市场宽度", f"市场风格：{style}", "行业板块", "概念板块",
+        "市场新闻与事件线索", "下一交易日短线池", "下一交易日波段池",
+        "600001 示例一（1-5个交易日，评分 90）",
+        "600002 示例二（1-4周，评分 80）",
+        "600003 示例三（1-4周，评分 70）",
+        "status：blocked" if blocked else "status：ready",
+        "内容" * 2_000,
+    ))
+    (attempt / "report.txt").write_text(text, encoding="utf-8")
+    (attempt / "report.html").write_text("<body>" + "内容" * 3_000 + "</body>", encoding="utf-8")
 
     with pytest.raises(ValueError, match="archived report incomplete"):
         _validated_report(tmp_path, "test-report-2026-09-09-postmarket")

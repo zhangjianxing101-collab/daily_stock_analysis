@@ -98,9 +98,21 @@ def _validated_report(root: Path, artifact_name: str) -> tuple[str, RenderedRepo
             valid.append((generated, manifest_path.parent, payload))
     if not valid:
         raise ValueError("archived report invalid")
-    _, attempt, _ = max(valid, key=lambda item: item[0])
+    _, attempt, manifest = max(valid, key=lambda item: item[0])
     html = (attempt / "report.html").read_text(encoding="utf-8")
     text = (attempt / "report.txt").read_text(encoding="utf-8")
+    statuses = manifest.get("module_statuses")
+    ai_section = text.split("\nAI分析\n", 1)[1].split("\n资金分配\n", 1)[0] if "\nAI分析\n" in text else ""
+    if (
+        not isinstance(statuses, dict)
+        or statuses.get("delivery_readiness") not in (None, "ok")
+        or statuses.get("ai") not in ("ok", "partial")
+        or statuses.get("market") not in ("ok", "partial")
+        or "status：blocked" in text
+        or not re.search(r"(?m)^市场风格：(?!不可用|\s*$).+", text)
+        or not re.search(r"(?m)^\d{6} .+：.*(?:结论:|建议:|风险:|新闻:|基本面:)", ai_section)
+    ):
+        raise ValueError("archived report incomplete")
     if any(section not in text for section in _REQUIRED_TEXT):
         raise ValueError("archived report incomplete")
     candidate_codes = set(re.findall(r"(?m)^(\d{6})\s+.+（(?:1-5个交易日|1-4周)，评分", text))
