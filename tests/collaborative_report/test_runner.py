@@ -893,6 +893,31 @@ def test_ai_failure_preserves_deterministic_candidates_and_delivery(tmp_path, de
     deps.mail_sender.assert_called_once()
 
 
+def test_postmarket_ai_failure_uses_quantitative_fallback_and_marks_evidence_limited(
+    tmp_path, deps,
+) -> None:
+    result = run_report(
+        ReportMode.POSTMARKET,
+        deps=replace(deps, ai_enricher=Mock(side_effect=RuntimeError("provider unavailable"))),
+        force=True,
+        test_email=True,
+        output_dir=tmp_path,
+    )
+
+    assert result.final_state is FinalState.TEST_SENT
+    assert result.modules["ai"].status == "partial"
+    assert result.modules["ai"].payload[CANDIDATE_CODE]["conclusion"].startswith(
+        "量化规则回退（非AI模型结论）"
+    )
+    assert "ai_quantitative_fallback" in result.modules["ai"].warnings
+    readiness = result.modules["delivery_readiness"]
+    assert readiness.status == "partial"
+    assert readiness.payload["版面状态"] == "ready"
+    assert readiness.payload["证据状态"] == "limited"
+    assert "ai_quantitative_fallback" in readiness.payload["evidence_limit_codes"]
+    deps.mail_sender.assert_called_once()
+
+
 def test_ths_evidence_reorders_only_existing_candidates_and_is_reported(tmp_path, deps) -> None:
     class EvidenceGateway(FakeGateway):
         def get_ths_hot_stock_list(self):
@@ -2231,6 +2256,19 @@ def test_load_prior_sector_state_returns_sanitized_valid_state(tmp_path) -> None
     assert loaded[0] is not raw_state[0]
     raw_state[0]["name"] = "篡改"
     assert loaded[0]["name"] == "半导体"
+
+
+def test_load_prior_sector_state_accepts_standalone_validated_state(tmp_path) -> None:
+    raw_state = serialized_sector_state()
+    payload = prior_sector_manifest(state=raw_state)
+    payload.pop("final_state")
+    payload.pop("test_email")
+    payload["sector_state_status"] = "validated"
+    path = tmp_path / "sector-state.json"
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    session = ReportSession(ReportMode.POSTMARKET, NOW, NOW.date(), True, "2026-08-19-postmarket")
+
+    assert _load_prior_sector_state(path, session) == tuple(raw_state)
 
 
 @pytest.mark.parametrize(

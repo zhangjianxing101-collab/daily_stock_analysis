@@ -80,8 +80,18 @@ beside `大盘占优`, `小盘占优`, or `均衡`. A 0.5 percentage-point sprea
 before declaring either size group dominant.
 
 Candidate AI enrichment runs in an isolated child process and has a ten-minute
-deadline within the workflow's thirty-minute job limit. A timeout remains a hard
-report-completeness blocker; the report never substitutes placeholder analysis.
+deadline within the workflow's thirty-minute job limit. When the provider returns
+no usable result, the postmarket report may use a deterministic quantitative
+fallback built only from the same report's screening and matching-period backtest.
+The fallback is labeled as non-AI, carries low or medium confidence, never invents
+company news or fundamentals, and never places an order. If neither AI output nor
+a valid quantitative fallback exists, delivery remains blocked.
+
+The delivery check separates layout completeness from evidence completeness. A
+report can be `ready_with_caveats` when all required sections are present but AI,
+sector history, company fundamentals, or source-verified news remain limited. The
+corresponding stable evidence-limit codes are shown in the report and manifest;
+`ready` alone is reserved for complete evidence within the implemented checks.
 
 Post-close limit-up and limit-down counts come from AKShare's documented
 Eastmoney daily pools (`stock_zt_pool_em` and `stock_zt_pool_dtgc_em`) for the
@@ -129,11 +139,15 @@ activity at or above the 90th percentile and breadth below 50%, `medium` when ac
 is at or above the 75th percentile and breadth is at least 50%, and otherwise `low`.
 Crowding is unavailable when breadth or activity is missing.
 
-For rotation comparison, the workflow considers at most five unexpired production
-artifacts named `report-YYYY-MM-DD-postmarket`, newest earlier trading date first. It
-accepts only a completed `sent`, non-test postmarket manifest whose identity and date
-match, then passes a reduced file containing only sector state and required provenance.
-Preview, test, failed, current-day, future-dated and malformed artifacts are ignored.
+For rotation comparison, the workflow considers at most eight unexpired state or
+report artifacts, newest earlier trading date first. Each successful postmarket
+analysis writes a dedicated `sector-state-YYYY-MM-DD-postmarket` artifact for 14 days,
+independent of email delivery. The workflow prefers this state, then a completed
+production report, and finally a main-branch historical-repair report used to bootstrap
+an otherwise missing state chain. It validates report identity, dates, provenance,
+state shape, and the trusted `main` branch before passing a reduced state-only file to
+the runner. Ordinary previews, test reports, current-day, future-dated, feature-branch,
+empty and malformed artifacts are ignored.
 If no valid state is available, both board families remain usable but are labeled as a
 first observation and the fixed `prior_postmarket_sector_state_unavailable` warning is
 recorded.
@@ -209,7 +223,12 @@ the original publisher or an official disclosure before any manual decision.
 
 Use **Run workflow** for a manual `postmarket` report. The workflow serializes scheduled and manual runs while preserving `cancel-in-progress: false`. For a manual test email, set `force` to true when outside its normal window and set `test_email` to true. A test email is marked as a test and never creates a production delivery marker.
 
-Outside the current delivery window, the archived test-email path checks the saved report's core module statuses and market style before sending. A preview artifact with blocked delivery readiness, unavailable AI, or missing market style is not an acceptable sample, even when it contains all headings and candidate names. In that case the workflow fails closed without sending email; it does not silently substitute current market data for the historical session.
+Outside the current delivery window, the archived test-email path checks the saved
+report's core module statuses and market style before sending. Missing AI output is
+filled only by the same transparent screening-and-backtest fallback used above. A
+report with blocked delivery readiness, no valid AI or quantitative analysis, or
+missing market style is not an acceptable sample. The workflow does not silently
+substitute current prices for the historical session.
 
 Use a production manual run only after verifying the secrets and variables. A normal sent report creates `sent-<report-key>`; a later fresh GitHub job uses that durable marker as the cross-run duplicate guard and passes `--already-sent` to the runner as an external completed identity. Before any production runner call, the workflow queries unexpired `sent-<report-key>`, `in-doubt-<report-key>`, and `claim-<report-key>` artifacts in that order. A sent marker wins; otherwise an in-doubt marker or unresolved claim fails closed before mail delivery and writes only the redacted diagnostic artifact. Test email bypasses all production marker lookup and never creates a production marker. Within a single run or a locally durable output directory, the runner's local delivery ledger is the delivery state machine and a second barrier; it is ephemeral on GitHub-hosted runners and is not cross-run state.
 
@@ -221,6 +240,15 @@ For an unresolved claim, check QQ mailbox delivery and relevant delivery logs fi
 
 ## Privacy and retention
 
-The private production report artifact is named `report-<report-key>` and can contain portfolio analysis; a test email uses the separate `test-report-<report-key>` name. Both are available only to repository users with Actions artifact access. Earlier postmarket sector lookup is bounded and writes only the validated sector-state subset to the runner. The diagnostic artifact is redacted and contains only report state, module statuses, source timestamps, and warning codes. Workflow logs and the concise summary do not print the report HTML, report text, mailbox values, portfolio values, credentials, remote errors, or raw model responses. All artifacts expire after seven days.
+The private production report artifact is named `report-<report-key>` and can contain
+portfolio analysis; a test email uses the separate `test-report-<report-key>` name.
+Both are available only to repository users with Actions artifact access. The dedicated
+state artifact contains only validated public sector-ranking fields and required
+provenance; it expires after 14 days. Other report and diagnostic artifacts expire
+after seven days. Earlier postmarket sector lookup is bounded and writes only the
+validated sector-state subset to the runner. The diagnostic artifact is redacted and
+contains only report state, module statuses, source timestamps, and warning codes.
+Workflow logs and the concise summary do not print report bodies, mailbox values,
+portfolio values, credentials, remote errors, or raw model responses.
 
 If an authorization code, mailbox, portfolio value, or AI key leaks, revoke or rotate it immediately in its provider, replace the encrypted GitHub Secret, audit workflow runs and repository history, and then send a new manual test email. Never reuse a QQ login password as an SMTP authorization code.

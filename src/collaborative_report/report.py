@@ -39,7 +39,7 @@ _MODULE_TITLES = {
     "ths_market_evidence": "同花顺市场证据",
     "ths_financial_evidence": "同花顺基本面证据",
     "decision_summary": "决策摘要",
-    "delivery_readiness": "报告完整性检查",
+    "delivery_readiness": "报告交付与证据检查",
     "news": "市场新闻与事件线索",
 }
 _SECTOR_TITLES = {
@@ -313,6 +313,8 @@ def _module_view(title: str, result: ModuleResult | None) -> _ModuleView:
         return _ModuleView(title, "unavailable", "暂无", (), ("数据暂不可用",))
     rows = module_rows(result.name, result.payload)
     warnings = tuple(dict.fromkeys(str(warning) for warning in result.warnings))
+    if result.name == "ai" and "ai_quantitative_fallback" in warnings:
+        title = "量化规则分析（AI不可用或不完整）"
     return _ModuleView(title, result.status, _format_timestamp(result.observed_at), rows, warnings)
 
 

@@ -381,7 +381,7 @@ jobs:
           metadata_path = Path(os.environ["METADATA_PATH"])
           candidates_path = Path(os.environ["CANDIDATES_PATH"])
           current_trading_date = date.fromisoformat(os.environ["CURRENT_TRADING_DATE"])
-          pattern = re.compile(r"^report-(\d{4}-\d{2}-\d{2})-postmarket$")
+          pattern = re.compile(r"^(sector-state|report|repaired-test-report)-(\d{4}-\d{2}-\d{2})-postmarket$")
           try:
               pages = json.loads(metadata_path.read_text(encoding="utf-8"))
           except (OSError, UnicodeError, json.JSONDecodeError):
@@ -397,7 +397,7 @@ jobs:
                   if match is None:
                       continue
                   try:
-                      trading_date = date.fromisoformat(match.group(1))
+                      trading_date = date.fromisoformat(match.group(2))
                   except ValueError:
                       continue
                   workflow_run = artifact.get("workflow_run")
@@ -406,21 +406,27 @@ jobs:
                   created_at = artifact.get("created_at")
                   if (
                       trading_date >= current_trading_date
-                      or trading_date.isoformat() != match.group(1)
+                      or trading_date.isoformat() != match.group(2)
                       or not artifact_id.isascii()
                       or not artifact_id.isdigit()
                       or not run_id.isascii()
                       or not run_id.isdigit()
                       or not isinstance(created_at, str)
+                      or workflow_run.get("head_branch") != "main"
                   ):
                       continue
-                  candidates.append((trading_date, created_at, int(artifact_id), run_id, artifact_id, artifact_name))
+                  artifact_kind = match.group(1)
+                  kind_priority = {"sector-state": 2, "report": 1, "repaired-test-report": 0}[artifact_kind]
+                  candidates.append((
+                      trading_date, kind_priority, created_at,
+                      int(artifact_id), run_id, artifact_id, artifact_name, artifact_kind,
+                  ))
 
           candidates_path.write_text(
               "".join(
-                  f"{run_id}\t{artifact_id}\t{artifact_name}\t{trading_date.isoformat()}\n"
-                  for trading_date, _, _, run_id, artifact_id, artifact_name
-                  in sorted(candidates, reverse=True)[:5]
+                  f"{run_id}\t{artifact_id}\t{artifact_name}\t{trading_date.isoformat()}\t{artifact_kind}\n"
+                  for trading_date, _, _, _, run_id, artifact_id, artifact_name, artifact_kind
+                  in sorted(candidates, reverse=True)[:8]
               ),
               encoding="utf-8",
           )
@@ -428,7 +434,7 @@ jobs:
           fi
 
           if [ -f "$candidates_path" ]; then
-            while IFS=$'\t' read -r run_id artifact_id artifact_name candidate_trading_date; do
+            while IFS=$'\t' read -r run_id artifact_id artifact_name candidate_trading_date artifact_kind; do
               if ! [[ "$run_id" =~ ^[0-9]+$ && "$artifact_id" =~ ^[0-9]+$ ]]; then
                 continue
               fi
@@ -437,7 +443,7 @@ jobs:
               if ! gh run download "$run_id" --repo "$GITHUB_REPOSITORY" --name "$artifact_name" --dir "$download_root" >/dev/null 2>&1; then
                 continue
               fi
-              PRIOR_DOWNLOAD_ROOT="$download_root" CANDIDATE_TRADING_DATE="$candidate_trading_date" OUTPUT_PATH="$output_path" python - <<'PY'
+              PRIOR_DOWNLOAD_ROOT="$download_root" CANDIDATE_TRADING_DATE="$candidate_trading_date" ARTIFACT_KIND="$artifact_kind" OUTPUT_PATH="$output_path" python - <<'PY'
           import json
           import os
           from datetime import date
@@ -447,7 +453,9 @@ jobs:
           output = Path(os.environ["OUTPUT_PATH"]).resolve()
           current_trading_date = date.fromisoformat(os.environ["CURRENT_TRADING_DATE"])
           expected_trading_date = date.fromisoformat(os.environ["CANDIDATE_TRADING_DATE"])
-          for path in sorted(root.rglob("manifest.json")):
+          artifact_kind = os.environ["ARTIFACT_KIND"]
+          filename = "sector-state.json" if artifact_kind == "sector-state" else "manifest.json"
+          for path in sorted(root.rglob(filename)):
               try:
                   resolved = path.resolve(strict=True)
                   if not resolved.is_relative_to(root) or resolved.stat().st_size > 1_000_000:
@@ -462,8 +470,17 @@ jobs:
                   trading_date = date.fromisoformat(trading_date_text)
               except (TypeError, ValueError):
                   continue
-              final_state = payload.get("final_state")
-              test_email = payload.get("test_email")
+              legacy_sent = payload.get("final_state") == "sent" and payload.get("test_email") is False
+              standalone_state = payload.get("sector_state_status") == "validated"
+              historical_repair = payload.get("historical_repair")
+              repaired_preview = (
+                  payload.get("final_state") == "previewed"
+                  and payload.get("test_email") is False
+                  and isinstance(historical_repair, dict)
+                  and historical_repair.get("schema_version") == 1
+                  and isinstance(payload.get("module_statuses"), dict)
+                  and payload["module_statuses"].get("delivery_readiness") in {"ok", "partial"}
+              )
               if not (
                   type(payload.get("schema_version")) is int
                   and payload["schema_version"] == 1
@@ -471,24 +488,24 @@ jobs:
                   and trading_date < current_trading_date
                   and payload.get("report_key") == f"{trading_date.isoformat()}-postmarket"
                   and payload.get("mode") == "postmarket"
-                  and final_state == "sent"
-                  and test_email is False
+                  and (
+                      (artifact_kind == "report" and legacy_sent)
+                      or (artifact_kind == "sector-state" and standalone_state)
+                      or (artifact_kind == "repaired-test-report" and repaired_preview)
+                  )
                   and isinstance(payload.get("generated_at"), str)
                   and isinstance(payload.get("sector_state"), list)
+                  and payload.get("sector_state")
               ):
                   continue
               sanitized = {
-                  key: payload[key]
-                  for key in (
-                      "schema_version",
-                      "report_key",
-                      "mode",
-                      "trading_date",
-                      "generated_at",
-                      "final_state",
-                      "test_email",
-                      "sector_state",
-                  )
+                  "schema_version": payload["schema_version"],
+                  "report_key": payload["report_key"],
+                  "mode": payload["mode"],
+                  "trading_date": payload["trading_date"],
+                  "generated_at": payload["generated_at"],
+                  "sector_state_status": "validated",
+                  "sector_state": payload["sector_state"],
               }
               output.write_text(json.dumps(sanitized, ensure_ascii=False), encoding="utf-8")
               break
@@ -720,6 +737,7 @@ jobs:
           }
           if error_code is not None:
               diagnostic["error_code"] = error_code
+          selected_manifest = None
           try:
               stderr = Path(".workflow-artifacts/runner-stderr.log").read_text(encoding="utf-8")
           except (OSError, UnicodeError):
@@ -735,8 +753,36 @@ jobs:
                       continue
                   for key in ("module_statuses", "source_timestamps", "warning_codes"):
                       diagnostic[key] = manifest.get(key, diagnostic[key])
+                  selected_manifest = manifest
                   break
           artifact_dir = Path(".workflow-artifacts")
+          sector_state_available = False
+          if (
+              report_available
+              and os.environ["MODE"] == "postmarket"
+              and isinstance(selected_manifest, dict)
+              and selected_manifest.get("schema_version") == 1
+              and selected_manifest.get("report_key") == report_key
+              and selected_manifest.get("mode") == "postmarket"
+              and selected_manifest.get("trading_date") == report_key.removesuffix("-postmarket")
+              and isinstance(selected_manifest.get("generated_at"), str)
+              and isinstance(selected_manifest.get("sector_state"), list)
+              and bool(selected_manifest["sector_state"])
+          ):
+              sector_manifest = {
+                  "schema_version": 1,
+                  "report_key": report_key,
+                  "mode": "postmarket",
+                  "trading_date": selected_manifest["trading_date"],
+                  "generated_at": selected_manifest["generated_at"],
+                  "sector_state_status": "validated",
+                  "sector_state": selected_manifest["sector_state"],
+              }
+              (artifact_dir / "sector-state.json").write_text(
+                  json.dumps(sector_manifest, ensure_ascii=False, sort_keys=True) + "\n",
+                  encoding="utf-8",
+              )
+              sector_state_available = True
           (artifact_dir / "diagnostic-manifest.json").write_text(
               json.dumps(diagnostic, ensure_ascii=False, sort_keys=True) + "\n",
               encoding="utf-8",
@@ -765,6 +811,7 @@ jobs:
               output.write(f"report_available={'true' if report_available else 'false'}\n")
               output.write(f"report_channel={channel}\n")
               output.write(f"report_artifact_name={'test-report' if channel == 'test' else 'report'}-{report_key}\n")
+              output.write(f"sector_state_available={'true' if sector_state_available else 'false'}\n")
               output.write(f"needs_reconcile={'true' if needs_reconcile else 'false'}\n")
               output.write(f"runner_exit={os.environ['RUNNER_EXIT']}\n")
           PY
@@ -836,6 +883,15 @@ jobs:
           path: .workflow-artifacts/repaired-archived-report
           include-hidden-files: true
           retention-days: 7
+
+      - name: Upload validated sector state
+        if: ${{ always() && (steps.runner.outputs.sector_state_available == 'true' || steps.archived.outputs.sector_state_available == 'true') }}
+        uses: actions/upload-artifact@v6
+        with:
+          name: sector-state-${{ steps.context.outputs.report_key }}
+          path: .workflow-artifacts/sector-state.json
+          include-hidden-files: true
+          retention-days: 14
 
       - name: Upload completed-session market snapshot
         if: ${{ always() && steps.context.outputs.mode == 'postmarket' && hashFiles('.workflow-artifacts/market-snapshot.json') != '' }}
