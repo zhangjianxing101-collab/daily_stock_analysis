@@ -68,6 +68,10 @@ _PRIOR_SECTOR_MANIFEST_MAX_BYTES = 1024 * 1024
 _SECTOR_STATE_MAX_ROWS = 40
 _SECTOR_STATE_MAX_ROWS_PER_TYPE = 20
 _AI_FEATURED_LIMIT = 5
+_AI_DISPLAY_FIELDS = (
+    "conclusion", "operation_advice", "action_label", "action",
+    "risk_warning", "news_summary", "fundamental_analysis",
+)
 _SECTOR_HISTORY_UNAVAILABLE_WARNING = "板块历史状态不可用，按首次观察处理"
 _SECTOR_SOURCE_TIMESTAMP_WARNING = "板块来源时间不可用，未持久化状态"
 _SECTOR_DATA_PARTIAL_WARNING = "板块数据覆盖不完整，仅供参考"
@@ -1189,6 +1193,160 @@ def _report_delivery_blockers(
     return tuple(blockers)
 
 
+def _report_evidence_limitations(
+    mode: ReportMode,
+    modules: Mapping[str, ModuleResult],
+) -> tuple[str, ...]:
+    """Return non-blocking evidence gaps separately from delivery blockers."""
+
+    if mode is not ReportMode.POSTMARKET:
+        return ()
+    limitations: list[str] = []
+    ai = modules.get("ai")
+    if ai is None or ai.status != "ok":
+        limitations.append("ai_analysis_partial")
+    if ai is not None and "ai_quantitative_fallback" in ai.warnings:
+        limitations.append("ai_quantitative_fallback")
+    for name in ("industry_sectors", "concept_sectors"):
+        module = modules.get(name)
+        if module is None or _SECTOR_HISTORY_UNAVAILABLE_WARNING in module.warnings:
+            limitations.append("sector_history_unavailable")
+            break
+    financial = modules.get("ths_financial_evidence")
+    financial_payload = (
+        financial.payload if financial is not None and isinstance(financial.payload, Mapping) else {}
+    )
+    if (
+        financial is None
+        or financial.status != "ok"
+        or financial_payload.get("来源时间") in (None, "", "unavailable")
+    ):
+        limitations.append("candidate_fundamentals_incomplete")
+    news = modules.get("news")
+    if news is None or news.status != "ok" or news.warnings:
+        limitations.append("news_requires_source_verification")
+    screening = modules.get("screening")
+    if screening is None or screening.status != "ok":
+        limitations.append("screening_partial")
+    return tuple(dict.fromkeys(limitations))
+
+
+def _fallback_metric(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    normalized = float(value)
+    return normalized if math.isfinite(normalized) else None
+
+
+def _quantitative_ai_fallback(
+    candidates: Sequence[Candidate],
+    backtests: Mapping[str, Any],
+    codes: Sequence[str],
+) -> dict[str, dict[str, Any]]:
+    """Build explicit non-AI conclusions from current screening and backtests."""
+
+    by_code = {candidate.code: candidate for candidate in candidates}
+    payload: dict[str, dict[str, Any]] = {}
+    for code in codes:
+        candidate = by_code.get(code)
+        if candidate is None:
+            continue
+        strategies = backtests.get(code)
+        strategy_key = "short" if candidate.horizon == "1-5个交易日" else "swing"
+        result = strategies.get(strategy_key) if isinstance(strategies, Mapping) else None
+        if not isinstance(result, Mapping):
+            advice = "对应周期回测数据缺失，仅观察；任何操作需人工确认。"
+            risk = "对应周期没有可验证的回测结果。"
+            confidence = "低"
+        else:
+            trades = _fallback_metric(result.get("trade_count"))
+            win_rate = _fallback_metric(result.get("win_rate"))
+            total_return = _fallback_metric(result.get("total_return"))
+            drawdown = _fallback_metric(result.get("max_drawdown"))
+            losses = _fallback_metric(result.get("consecutive_losses"))
+            metrics = []
+            if trades is not None:
+                metrics.append(f"交易{int(trades)}次")
+            if win_rate is not None:
+                metrics.append(f"胜率{win_rate * 100:.2f}%")
+            if total_return is not None:
+                metrics.append(f"累计收益{total_return * 100:+.2f}%")
+            if drawdown is not None:
+                metrics.append(f"最大回撤{drawdown * 100:.2f}%")
+            if losses is not None:
+                metrics.append(f"最大连续亏损{int(losses)}次")
+            risk = "；".join(metrics) + "。" if metrics else "回测指标不完整。"
+            if trades is None or trades < 3:
+                advice = "回测样本不足，仅观察，等待更多交易样本；任何操作需人工确认。"
+                confidence = "低"
+            elif (
+                drawdown is None
+                or losses is None
+                or total_return is None
+                or drawdown > 0.10
+                or losses >= 3
+                or total_return <= 0
+            ):
+                advice = "回测风险不达标，仅列入观察，不追涨；任何操作需人工确认。"
+                confidence = "低"
+            else:
+                advice = (
+                    "可列入条件观察；仅在板块和价格信号同时确认后人工决策，"
+                    "不自动下单。"
+                )
+                confidence = "中"
+        payload[code] = {
+            "name": candidate.name,
+            "conclusion": (
+                f"量化规则回退（非AI模型结论）：筛选评分{candidate.score:.1f}，"
+                f"所属{candidate.industry_sector or '板块待补充'}，收盘{candidate.close:.2f}。"
+            ),
+            "operation_advice": advice,
+            "confidence_level": confidence,
+            "risk_warning": risk,
+            "news_summary": "本次未取得该股票的可验证公司级新闻证据。",
+            "fundamental_analysis": "本次未取得该股票的可验证基本面结论。",
+            "data_sources": ("screening", "backtest"),
+        }
+    return payload
+
+
+def _merge_ai_with_quantitative_fallback(
+    result: ModuleResult,
+    *,
+    candidates: Sequence[Candidate],
+    backtests: Mapping[str, Any],
+    codes: Sequence[str],
+) -> ModuleResult:
+    live = result.payload if isinstance(result.payload, Mapping) else {}
+    fallback = _quantitative_ai_fallback(candidates, backtests, codes)
+    names = {candidate.code: candidate.name for candidate in candidates}
+    merged: dict[str, Any] = {}
+    fallback_codes: list[str] = []
+    for code in codes:
+        value = live.get(code)
+        if isinstance(value, Mapping) and any(
+            value.get(field) not in (None, "", (), []) for field in _AI_DISPLAY_FIELDS
+        ):
+            merged[code] = {"name": names.get(code, "名称不可用"), **dict(value)}
+        elif code in fallback:
+            merged[code] = fallback[code]
+            fallback_codes.append(code)
+    warnings = list(result.warnings)
+    if fallback_codes:
+        warnings.extend((
+            "ai_quantitative_fallback",
+            "AI服务未返回完整结果；缺失标的使用筛选与回测数据生成量化规则回退，"
+            "该内容不是AI模型结论",
+        ))
+    status = (
+        "ok"
+        if merged and not fallback_codes and result.status == "ok"
+        else ("partial" if merged else "unavailable")
+    )
+    return ModuleResult("ai", status, result.observed_at, merged, tuple(dict.fromkeys(warnings)))
+
+
 def _finite_close(value: Any) -> bool:
     return (
         isinstance(value, (int, float))
@@ -1833,7 +1991,7 @@ def _unique_json_object(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple[Mapping[str, Any], ...]:
-    """Load one earlier sent postmarket sector snapshot without exposing its payload on failure."""
+    """Load one earlier validated postmarket sector snapshot without exposing failures."""
 
     try:
         if path is None or not path.is_file():
@@ -1857,10 +2015,14 @@ def _load_prior_sector_state(path: Path | None, session: ReportSession) -> tuple
         parsed_date = date.fromisoformat(trading_date)
         if parsed_date.isoformat() != trading_date or parsed_date >= session.trading_date:
             raise ValueError
+        legacy_sent_report = (
+            payload.get("final_state") == FinalState.SENT.value
+            and payload.get("test_email") is False
+        )
+        standalone_state = payload.get("sector_state_status") == "validated"
         if (
             payload.get("mode") != ReportMode.POSTMARKET.value
-            or payload.get("final_state") != FinalState.SENT.value
-            or payload.get("test_email") is not False
+            or not (legacy_sent_report or standalone_state)
             or payload.get("report_key") != f"{trading_date}-{ReportMode.POSTMARKET.value}"
             or not isinstance(payload.get("sector_state"), list)
         ):
@@ -2938,16 +3100,41 @@ def run_report(
     try:
         ai_result = active.ai_enricher(ai_codes, observed_at=session.now_shanghai)
         if isinstance(ai_result.payload, Mapping):
-            ai_payload = {
-                code: ({"name": candidate_names.get(code, "名称不可用"), **dict(value)} if isinstance(value, Mapping) else value)
-                for code, value in ai_result.payload.items()
-            }
             ai_result = ModuleResult(
-                ai_result.name, ai_result.status, ai_result.observed_at, ai_payload, ai_result.warnings,
+                ai_result.name,
+                ai_result.status,
+                ai_result.observed_at,
+                {
+                    code: (
+                        {"name": candidate_names.get(code, "名称不可用"), **dict(value)}
+                        if isinstance(value, Mapping) else value
+                    )
+                    for code, value in ai_result.payload.items()
+                },
+                ai_result.warnings,
             )
-        modules["ai"] = ai_result
+        modules["ai"] = (
+            _merge_ai_with_quantitative_fallback(
+                ai_result,
+                candidates=(*screening.short_term, *screening.swing),
+                backtests=backtest_payload,
+                codes=ai_codes,
+            )
+            if normalized_mode is ReportMode.POSTMARKET
+            else ai_result
+        )
     except Exception:
-        modules["ai"] = _unavailable("ai", session.now_shanghai, "AI分析暂不可用")
+        unavailable_ai = _unavailable("ai", session.now_shanghai, "AI分析暂不可用")
+        modules["ai"] = (
+            _merge_ai_with_quantitative_fallback(
+                unavailable_ai,
+                candidates=(*screening.short_term, *screening.swing),
+                backtests=backtest_payload,
+                codes=ai_codes,
+            )
+            if normalized_mode is ReportMode.POSTMARKET
+            else unavailable_ai
+        )
 
     portfolio_payload: dict[str, Any] = {}
     portfolio_warnings: list[str] = []
@@ -3053,13 +3240,37 @@ def run_report(
     ):
         return _failure("snapshot_source_expired", report_key=session.report_key, modules=modules)
     delivery_blockers = _report_delivery_blockers(normalized_mode, modules)
+    evidence_limitations = _report_evidence_limitations(normalized_mode, modules)
     if delivery_blockers:
         modules["delivery_readiness"] = ModuleResult(
             "delivery_readiness",
             "unavailable",
             generated_at,
-            {"status": "blocked", "reason_codes": delivery_blockers},
+            {
+                "版面状态": "blocked",
+                "证据状态": "limited",
+                "交付状态": "blocked",
+                "reason_codes": delivery_blockers,
+                "evidence_limit_codes": evidence_limitations,
+            },
             ("报告核心内容不完整，已阻止邮件发送",),
+        )
+    else:
+        modules["delivery_readiness"] = ModuleResult(
+            "delivery_readiness",
+            "partial" if evidence_limitations else "ok",
+            generated_at,
+            {
+                "版面状态": "ready",
+                "证据状态": "limited" if evidence_limitations else "complete",
+                "交付状态": "ready_with_caveats" if evidence_limitations else "ready",
+                "reason_codes": (),
+                "evidence_limit_codes": evidence_limitations,
+            },
+            (
+                ("报告可交付，但证据存在限制；请结合限制代码人工复核",)
+                if evidence_limitations else ()
+            ),
         )
     try:
         rendered = active.renderer(

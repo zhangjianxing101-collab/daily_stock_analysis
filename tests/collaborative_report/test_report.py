@@ -111,6 +111,23 @@ def test_premarket_report_contains_required_sections_levels_warnings_and_disclai
         assert expected in rendered.text
 
 
+def test_quantitative_fallback_is_not_titled_as_ai_analysis() -> None:
+    rendered = render_report(
+        ReportMode.POSTMARKET,
+        date(2026, 8, 19),
+        modules={
+            "ai": module(
+                "ai",
+                {"600001": {"name": "示例股份", "conclusion": "量化规则回退（非AI模型结论）"}},
+                "ai_quantitative_fallback",
+                status="partial",
+            ),
+        },
+    )
+
+    assert "量化规则分析（AI不可用或不完整）" in rendered.text
+
+
 def test_postmarket_report_contains_required_sections_and_optional_morning_status() -> None:
     rendered = render_report(
         ReportMode.POSTMARKET,

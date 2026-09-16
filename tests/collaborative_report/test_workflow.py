@@ -110,26 +110,34 @@ def _select_valid_prior_artifact(artifacts: list[dict], manifests: dict[int, obj
 def _production_prior_sector_candidates(artifacts: list[dict], current_trading_date: str) -> list[dict]:
     """Model the bounded metadata gate for an earlier postmarket sector state."""
 
-    pattern = re.compile(r"^report-(\d{4}-\d{2}-\d{2})-postmarket$")
+    pattern = re.compile(r"^(sector-state|report|repaired-test-report)-(\d{4}-\d{2}-\d{2})-postmarket$")
     candidates = []
     for artifact in artifacts:
         match = pattern.fullmatch(str(artifact.get("name", "")))
         workflow_run = artifact.get("workflow_run")
         if (
             match is None
-            or match.group(1) >= current_trading_date
+            or match.group(2) >= current_trading_date
             or artifact.get("expired") is not False
             or not str(artifact.get("id", "")).isdigit()
             or not isinstance(workflow_run, dict)
             or not str(workflow_run.get("id", "")).isdigit()
+            or workflow_run.get("head_branch") != "main"
         ):
             continue
         candidates.append(artifact)
     return sorted(
         candidates,
-        key=lambda item: (str(item["name"]), str(item.get("created_at", "")), int(item["id"])),
+        key=lambda item: (
+            pattern.fullmatch(str(item["name"])).group(2),
+            {"sector-state": 2, "report": 1, "repaired-test-report": 0}[
+                pattern.fullmatch(str(item["name"])).group(1)
+            ],
+            str(item.get("created_at", "")),
+            int(item["id"]),
+        ),
         reverse=True,
-    )[:5]
+    )[:8]
 
 
 def _is_valid_prior_sector_manifest(payload: object, current_trading_date: str) -> bool:
@@ -142,10 +150,21 @@ def _is_valid_prior_sector_manifest(payload: object, current_trading_date: str) 
         and payload.get("schema_version") == 1
         and payload.get("report_key") == f"{trading_date}-postmarket"
         and payload.get("mode") == "postmarket"
-        and payload.get("final_state") == "sent"
-        and payload.get("test_email") is False
+        and (
+            (payload.get("final_state") == "sent" and payload.get("test_email") is False)
+            or payload.get("sector_state_status") == "validated"
+            or (
+                payload.get("final_state") == "previewed"
+                and payload.get("test_email") is False
+                and isinstance(payload.get("historical_repair"), dict)
+                and payload["historical_repair"].get("schema_version") == 1
+                and isinstance(payload.get("module_statuses"), dict)
+                and payload["module_statuses"].get("delivery_readiness") in {"ok", "partial"}
+            )
+        )
         and isinstance(payload.get("generated_at"), str)
         and isinstance(payload.get("sector_state"), list)
+        and bool(payload.get("sector_state"))
     )
 
 
@@ -340,19 +359,20 @@ def test_workflow_selects_latest_earlier_completed_postmarket_artifact() -> None
     step = _step(workflow, "Extract prior sector state")
     runner = _step(workflow, "Run collaborative report")
 
-    assert "report-" in step["run"]
+    assert "sector-state|report|repaired-test-report" in step["run"]
     assert "-postmarket" in step["run"]
-    assert "[:5]" in step["run"]
+    assert "[:8]" in step["run"]
     assert runner["env"]["PRIOR_SECTOR_STATE_PATH"] == "${{ steps.prior_sector.outputs.prior_sector_state_path }}"
     assert 'if [ "$MODE" = "postmarket" ] && [ -n "$PRIOR_SECTOR_STATE_PATH" ]; then' in runner["run"]
     assert 'args+=(--prior-sector-report "$PRIOR_SECTOR_STATE_PATH")' in runner["run"]
 
 
-def test_prior_sector_download_never_uses_preview_or_failed_artifacts() -> None:
+def test_prior_sector_download_uses_only_validated_state_or_sent_legacy_reports() -> None:
     script = _step(_workflow(), "Extract prior sector state")["run"]
 
-    assert 'final_state == "sent"' in script
-    assert "test_email is False" in script
+    assert 'payload.get("final_state") == "sent"' in script
+    assert 'payload.get("sector_state_status") == "validated"' in script
+    assert 'workflow_run.get("head_branch") != "main"' in script
     assert "trading_date < current_trading_date" in script
     assert "prior_postmarket_sector_state_unavailable" in script
     assert "2>/dev/null" in script
@@ -365,26 +385,50 @@ def test_prior_sector_metadata_selection_is_bounded_and_excludes_nonproduction_d
             "name": f"report-2026-09-{day:02d}-postmarket",
             "expired": False,
             "created_at": f"2026-09-{day:02d}T09:00:00Z",
-            "workflow_run": {"id": 1000 + index},
+            "workflow_run": {"id": 1000 + index, "head_branch": "main"},
         }
         for index, day in enumerate(range(1, 8), start=1)
     ]
     artifacts.extend(
         [
-            {"id": 20, "name": "report-2026-09-08-postmarket", "expired": False, "workflow_run": {"id": 1020}},
-            {"id": 21, "name": "test-report-2026-09-07-postmarket", "expired": False, "workflow_run": {"id": 1021}},
-            {"id": 22, "name": "report-2026-09-07-postmarket", "expired": True, "workflow_run": {"id": 1022}},
+            {"id": 20, "name": "report-2026-09-08-postmarket", "expired": False, "workflow_run": {"id": 1020, "head_branch": "main"}},
+            {"id": 21, "name": "test-report-2026-09-07-postmarket", "expired": False, "workflow_run": {"id": 1021, "head_branch": "main"}},
+            {"id": 22, "name": "report-2026-09-07-postmarket", "expired": True, "workflow_run": {"id": 1022, "head_branch": "main"}},
+            {
+                "id": 23,
+                "name": "sector-state-2026-09-07-postmarket",
+                "expired": False,
+                "created_at": "2026-09-07T10:00:00Z",
+                "workflow_run": {"id": 1023, "head_branch": "main"},
+            },
+            {
+                "id": 24,
+                "name": "sector-state-2026-09-07-postmarket",
+                "expired": False,
+                "created_at": "2026-09-07T11:00:00Z",
+                "workflow_run": {"id": 1024, "head_branch": "feature"},
+            },
+            {
+                "id": 25,
+                "name": "repaired-test-report-2026-09-07-postmarket",
+                "expired": False,
+                "created_at": "2026-09-07T12:00:00Z",
+                "workflow_run": {"id": 1025, "head_branch": "main"},
+            },
         ]
     )
 
     selected = _production_prior_sector_candidates(artifacts, "2026-09-08")
 
     assert [item["name"] for item in selected] == [
+        "sector-state-2026-09-07-postmarket",
         "report-2026-09-07-postmarket",
+        "repaired-test-report-2026-09-07-postmarket",
         "report-2026-09-06-postmarket",
         "report-2026-09-05-postmarket",
         "report-2026-09-04-postmarket",
         "report-2026-09-03-postmarket",
+        "report-2026-09-02-postmarket",
     ]
 
 
@@ -412,6 +456,37 @@ def test_prior_sector_manifest_rejects_nonproduction_or_invalid_state(overrides)
     payload.update(overrides)
 
     assert _is_valid_prior_sector_manifest(payload, "2026-09-08") is False
+
+
+def test_prior_sector_manifest_accepts_standalone_validated_state() -> None:
+    payload = {
+        "schema_version": 1,
+        "report_key": "2026-09-07-postmarket",
+        "mode": "postmarket",
+        "trading_date": "2026-09-07",
+        "generated_at": "2026-09-07T16:30:00+08:00",
+        "sector_state_status": "validated",
+        "sector_state": [{"sector_type": "industry"}],
+    }
+
+    assert _is_valid_prior_sector_manifest(payload, "2026-09-08") is True
+
+
+def test_prior_sector_manifest_accepts_verified_historical_repair() -> None:
+    payload = {
+        "schema_version": 1,
+        "report_key": "2026-09-07-postmarket",
+        "mode": "postmarket",
+        "trading_date": "2026-09-07",
+        "generated_at": "2026-09-07T16:30:00+08:00",
+        "final_state": "previewed",
+        "test_email": False,
+        "historical_repair": {"schema_version": 1},
+        "module_statuses": {"delivery_readiness": "partial"},
+        "sector_state": [{"sector_type": "industry"}],
+    }
+
+    assert _is_valid_prior_sector_manifest(payload, "2026-09-08") is True
 
 
 def test_external_marker_handoff_is_production_only_and_sent_marker_is_strict() -> None:
@@ -716,6 +791,7 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
         "Upload safe provider quality counts",
         "Upload completed-session market snapshot",
         "Upload repaired archived report",
+        "Upload validated sector state",
     }
     assert by_name["Upload private report"]["with"]["name"] == "${{ steps.runner.outputs.report_artifact_name }}"
     assert by_name["Upload diagnostic manifest"]["with"]["name"] == "diagnostic-${{ steps.context.outputs.report_key }}"
@@ -726,8 +802,15 @@ def test_workflow_artifacts_are_private_redacted_short_lived_and_marker_is_stric
     assert by_name["Upload repaired archived report"]["with"]["name"] == (
         "repaired-test-report-${{ steps.context.outputs.report_key }}"
     )
-    assert all(step["with"]["retention-days"] == ("3" if step["name"] == "Upload safe provider quality counts" else "7")
-               for step in uploads)
+    assert all(
+        step["with"]["retention-days"] == (
+            "3" if step["name"] == "Upload safe provider quality counts"
+            else "14" if step["name"] == "Upload validated sector state"
+            else "7"
+        )
+        for step in uploads
+    )
+    assert by_name["Upload validated sector state"]["with"]["path"] == ".workflow-artifacts/sector-state.json"
     probe = _step(workflow, "Probe provider quality for previews")
     assert probe["if"] == "${{ steps.context.outputs.preview_only == 'true' }}"
     assert set(probe["env"]) == {"THS_API_KEY"}

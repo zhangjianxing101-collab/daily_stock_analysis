@@ -217,7 +217,7 @@ def _validated_report(root: Path, artifact_name: str) -> tuple[str, RenderedRepo
     ai_section = text.split("\nAI分析\n", 1)[1].split("\n资金分配\n", 1)[0] if "\nAI分析\n" in text else ""
     if (
         not isinstance(statuses, dict)
-        or statuses.get("delivery_readiness") not in (None, "ok")
+        or statuses.get("delivery_readiness") not in (None, "ok", "partial")
         or statuses.get("ai") not in ("ok", "partial")
         or statuses.get("market") not in ("ok", "partial")
         or "status：blocked" in text
@@ -460,12 +460,30 @@ def _repair_archived_report(report_root: Path, artifact_name: str, snapshot_root
     text = _replace_text_section(text, "AI分析", "资金分配", ai_lines)
     risk = "历史回测显示多只候选最大回撤超过10%且连续亏损超过3次；板块持续性仍属首次观察，任何操作需人工确认。"
     text = re.sub(r"(?m)^关键风险：.*$", f"关键风险：{risk}", text, count=1)
+    evidence_limit_codes = ["historical_market_cap_supplement"]
+    if fallback_codes:
+        evidence_limit_codes.extend(("ai_analysis_partial", "ai_quantitative_fallback"))
+    if "板块历史状态不可用" in text:
+        evidence_limit_codes.append("sector_history_unavailable")
+    if "聚合新闻仅作事件线索" in text:
+        evidence_limit_codes.append("news_requires_source_verification")
+    if "来源时间：unavailable" in text:
+        evidence_limit_codes.append("candidate_fundamentals_incomplete")
+    evidence_limit_codes = list(dict.fromkeys(evidence_limit_codes))
     text = _replace_text_section(
         text,
         "报告完整性检查",
         "板块龙头精选观察（最多5只）",
-        ["数据时间：" + datetime.now(_SHANGHAI).strftime("%Y-%m-%d %H:%M CST"), "status：ready", "reason_codes：无"],
+        [
+            "数据时间：" + datetime.now(_SHANGHAI).strftime("%Y-%m-%d %H:%M CST"),
+            "版面状态：ready",
+            "证据状态：limited",
+            "交付状态：ready_with_caveats",
+            "reason_codes：无",
+            "evidence_limit_codes：" + "、".join(evidence_limit_codes),
+        ],
     )
+    text = text.replace("\n报告完整性检查\n", "\n报告交付与证据检查\n", 1)
 
     document = lxml_html.document_fromstring(html_path.read_text(encoding="utf-8"))
     market_body = _section(document, "市场宽度").xpath("./table/tbody")
@@ -499,9 +517,19 @@ def _repair_archived_report(report_root: Path, artifact_name: str, snapshot_root
     _replace_html_section(
         document,
         "报告完整性检查",
-        (("status", "ready"), ("reason_codes", "无")),
+        (
+            ("版面状态", "ready"),
+            ("证据状态", "limited"),
+            ("交付状态", "ready_with_caveats"),
+            ("reason_codes", "无"),
+            ("evidence_limit_codes", "、".join(evidence_limit_codes)),
+        ),
         metadata="数据时间：" + datetime.now(_SHANGHAI).strftime("%Y-%m-%d %H:%M CST"),
     )
+    readiness_heading = _section(document, "报告完整性检查").xpath("./h2")
+    if len(readiness_heading) != 1:
+        raise ValueError("archived report invalid")
+    readiness_heading[0].text = "报告交付与证据检查"
     risk_cells = _section(document, "决策摘要").xpath("./table/tbody/tr[td[1][normalize-space()='关键风险']]/td[2]")
     if len(risk_cells) != 1:
         raise ValueError("archived report invalid")
@@ -510,7 +538,7 @@ def _repair_archived_report(report_root: Path, artifact_name: str, snapshot_root
     statuses = manifest.get("module_statuses")
     if not isinstance(statuses, dict):
         raise ValueError("archived report invalid")
-    statuses.update(ai=ai_status, market="partial", decision_summary="partial", delivery_readiness="ok")
+    statuses.update(ai=ai_status, market="partial", decision_summary="partial", delivery_readiness="partial")
     sources = manifest.get("source_timestamps")
     if isinstance(sources, dict):
         sources.update(market_cap_supplement=market_cap_at.isoformat(), ai_repair=datetime.now(_SHANGHAI).isoformat())
@@ -558,6 +586,7 @@ def main() -> int:
         "warning_codes": [],
     }
     exit_code = 1
+    sector_state_available = False
     stage = "metadata"
     try:
         metadata = _github_json(f"/repos/{args.repository}/actions/artifacts?per_page=100")
@@ -587,9 +616,25 @@ def main() -> int:
             report_key, rendered = _validated_report(report_root, artifact_name)
             repaired_output = args.output_dir / "repaired-archived-report"
             repaired_output.mkdir(parents=True, exist_ok=True)
-            _, attempt, _ = _report_attempt(report_root, artifact_name)
+            _, attempt, repaired_manifest = _report_attempt(report_root, artifact_name)
             for name in ("report.html", "report.txt", "manifest.json"):
                 shutil.copy2(attempt / name, repaired_output / name)
+            sector_state = repaired_manifest.get("sector_state")
+            if isinstance(sector_state, list) and sector_state:
+                sector_manifest = {
+                    "schema_version": 1,
+                    "report_key": report_key,
+                    "mode": "postmarket",
+                    "trading_date": report_date.isoformat(),
+                    "generated_at": repaired_manifest["generated_at"],
+                    "sector_state_status": "validated",
+                    "sector_state": sector_state,
+                }
+                (args.output_dir / "sector-state.json").write_text(
+                    json.dumps(sector_manifest, ensure_ascii=False, sort_keys=True) + "\n",
+                    encoding="utf-8",
+                )
+                sector_state_available = True
             from src.collaborative_report.runner import _production_mail_sender
 
             stage = "email"
@@ -606,7 +651,9 @@ def main() -> int:
     if output := os.environ.get("GITHUB_OUTPUT"):
         with Path(output).open("a", encoding="utf-8") as handle:
             handle.write(
-                f"final_state={diagnostic['final_state']}\nrunner_exit={exit_code}\nreport_key={diagnostic['report_key']}\n"
+                f"final_state={diagnostic['final_state']}\nrunner_exit={exit_code}\n"
+                f"report_key={diagnostic['report_key']}\n"
+                f"sector_state_available={'true' if sector_state_available else 'false'}\n"
             )
     print(json.dumps(diagnostic, ensure_ascii=False, sort_keys=True))
     return exit_code
